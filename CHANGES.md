@@ -33,3 +33,4 @@
 - Data safety: SQLite column changes rewrite the original CREATE TABLE (UNIQUE, CHECK, COLLATE, AUTOINCREMENT, table constraints, partial and expression indexes, triggers kept; refused only for foreign-key parents, generated columns and renames other definitions use); SQLite database rename moves -wal/-shm with it and rolls back on failure; MySQL MODIFY/CHANGE keeps AUTO_INCREMENT, ON UPDATE, collation and comment (checked on MySQL 8.4 and MariaDB 11.8).
 - UI: the "Key columns" dialog scrolls when a table has many columns, so its buttons stay on screen.
 - UI: the inline cell editor no longer draws over the old cell text.
+- Data grid header shows the key icon (blue) for columns covered by a single-column unique index when they are not part of the PK (the PK checkbox cannot be changed on existing tables).

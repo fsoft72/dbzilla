@@ -126,15 +126,25 @@ pub fn can_next(offset: u64, loaded: usize, limit: u64, total: Total) -> bool {
 }
 
 /// Result columns enriched with key and type information from the structure.
+/// Columns with a single-column unique index (and no PK) are flagged with `UNIQUE_KEY`.
 pub fn merge_columns(result: &[ColumnMeta], structure: Option<&TableStructure>) -> Vec<ColumnMeta> {
     result
         .iter()
         .map(|c| match structure.and_then(|s| s.columns.iter().find(|x| x.name == c.name)) {
-            Some(s) => ColumnMeta { ordinal: c.ordinal, ..s.clone() },
+            Some(s) => {
+                let mut m = ColumnMeta { ordinal: c.ordinal, ..s.clone() };
+                if !m.is_pk && structure.is_some_and(|st| st.indexes.iter().any(|i| i.unique && i.columns.len() == 1 && i.columns[0] == m.name)) {
+                    m.extra.insert(UNIQUE_KEY.to_owned(), "1".to_owned());
+                }
+                m
+            }
             None => c.clone(),
         })
         .collect()
 }
+
+/// Marker stored in `ColumnMeta::extra` for columns covered by a single-column unique index.
+pub const UNIQUE_KEY: &str = "unique_key";
 
 /// Text of the selection in a copy format.
 pub fn selection_text(columns: &[ColumnMeta], rows: &[Row], sel: &grid::Selection, fmt: CopyFormat, cells_only: bool, env: &DataEnv) -> Option<String> {
@@ -405,6 +415,20 @@ mod tests {
         assert!(!can_next(0, 120, 300, Total::Unknown));
         assert!(can_next(0, 300, 300, Total::Exact(301)));
         assert!(!can_next(0, 300, 300, Total::Exact(300)));
+    }
+
+    /// A single-column unique index flags the column as a unique key, a PK does not.
+    #[test]
+    fn merging_flags_unique_columns() {
+        let st = TableStructure {
+            columns: vec![ColumnMeta { is_pk: true, ..col("id") }, col("email"), col("other")],
+            indexes: vec![dbzilla_core::model::IndexInfo { name: "u".into(), unique: true, columns: vec!["email".into()], condition: None }, dbzilla_core::model::IndexInfo { name: "n".into(), unique: false, columns: vec!["other".into()], condition: None }],
+            ..Default::default()
+        };
+        let merged = merge_columns(&[col("id"), col("email"), col("other")], Some(&st));
+        assert!(!merged[0].extra.contains_key(UNIQUE_KEY));
+        assert!(merged[1].extra.contains_key(UNIQUE_KEY));
+        assert!(!merged[2].extra.contains_key(UNIQUE_KEY));
     }
 
     /// Keys and types from the structure replace the result metadata.

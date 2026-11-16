@@ -276,9 +276,9 @@ fn header_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, c: usize, eve
         glyphs::paint(ui.painter(), icon, if k.desc { Ico::ChevronDown } else { Ico::ChevronUp }, theme::SECONDARY);
         right -= 20.0;
     }
-    if col.is_pk {
+    if col.is_pk || col.extra.contains_key(super::datatab::UNIQUE_KEY) {
         let icon = egui::Rect::from_center_size(egui::pos2(right, r.center().y), egui::vec2(20.0, 20.0));
-        glyphs::paint(ui.painter(), icon, Ico::Key, theme::TERTIARY);
+        glyphs::paint(ui.painter(), icon, Ico::Key, if col.is_pk { theme::TERTIARY } else { theme::SECONDARY });
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     if resp.clicked() {
