@@ -2238,9 +2238,13 @@ impl Workspace {
             let mut decision = None;
             widgets::modal(ctx, "Key columns", |ui| {
                 widgets::muted(ui, "Rows are updated and deleted using these columns in the WHERE clause.");
-                for (i, n) in k.names.iter().enumerate() {
-                    ui.checkbox(&mut k.selected[i], n);
-                }
+                // Long column lists scroll inside the dialog so the buttons stay on screen.
+                let max_h = (ctx.screen_rect().height() * 0.6).max(120.0);
+                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, n) in k.names.iter().enumerate() {
+                        ui.checkbox(&mut k.selected[i], n);
+                    }
+                });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if widgets::primary_button(ui, "Use these columns").clicked() {
