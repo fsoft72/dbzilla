@@ -460,7 +460,7 @@ impl Workspace {
             }
         }
         if let Some(d) = self.import_dialog.as_mut() {
-            match jobs::import_dialog(ctx, d, self.conn.driver) {
+            match jobs::import_dialog(ctx, d, self.conn.driver, self.repaint.clone().unwrap_or_else(|| Arc::new(|| {}))) {
                 Some(true) => match d.build(self.current_schema.as_deref().filter(|_| self.caps.schemas)) {
                     Ok(req) => {
                         let title = format!("Import of {}", std::path::Path::new(d.path.trim()).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()));
@@ -2715,7 +2715,7 @@ mod tests {
     }
 
     /// Polls the workspace until `done` holds (10 s limit).
-    fn wait(ws: &mut Workspace, done: impl Fn(&mut Workspace) -> bool) {
+    fn wait(ws: &mut Workspace, mut done: impl FnMut(&mut Workspace) -> bool) {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(10) {
             ws.poll();
@@ -3333,7 +3333,11 @@ mod tests {
         let mut imp = ImportDialog::new(&ws.objects, None);
         imp.path = file.to_string_lossy().into_owned();
         imp.new_name = "t_copy".into();
-        imp.load();
+        imp.load(Arc::new(|| {}));
+        wait(&mut ws, |_| {
+            imp.poll();
+            !imp.is_loading()
+        });
         assert!(imp.error.is_none(), "{:?}", imp.error);
         let req = imp.build(None).unwrap();
         ws.start_import("Import of t.csv".into(), req);

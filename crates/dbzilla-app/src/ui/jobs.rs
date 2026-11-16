@@ -151,9 +151,9 @@ impl JobCenter {
 /// What to import.
 pub enum ImportRequest {
     /// Rows of a CSV or JSON file.
-    Rows { table: TableRef, create: bool, parsed: Parsed, strategy: MatchStrategy, mode: InsertMode, key_columns: Vec<String> },
+    Rows { table: TableRef, create: bool, parsed: Arc<Parsed>, strategy: MatchStrategy, mode: InsertMode, key_columns: Vec<String> },
     /// An SQL dump.
-    Dump(String),
+    Dump(Arc<str>),
 }
 
 /// Runs an import request on a fresh connection.
@@ -340,13 +340,23 @@ pub enum ImportKind {
     SqlDump,
 }
 
+/// What the background reader produced.
+enum Loaded {
+    Rows(Arc<Parsed>),
+    Dump(Arc<str>),
+}
+
 /// Wizard state of an import.
 pub struct ImportDialog {
     pub path: String,
     pub kind: ImportKind,
     pub csv: CsvImportOptions,
-    pub parsed: Option<Parsed>,
-    pub sql_text: Option<String>,
+    pub parsed: Option<Arc<Parsed>>,
+    pub sql_text: Option<Arc<str>>,
+    /// NULL marker of CSV files; empty means no marker.
+    pub null_text: String,
+    /// A file being read and parsed in the background.
+    loading: Option<Receiver<Result<Loaded, String>>>,
     pub tables: Vec<TableRef>,
     pub target: Option<TableRef>,
     pub new_name: String,
@@ -360,11 +370,11 @@ impl ImportDialog {
     /// New dialog listing the tables of the database.
     pub fn new(objects: &[ObjectInfo], target: Option<TableRef>) -> Self {
         let tables = objects.iter().filter(|o| o.kind == ObjectKind::Table).map(|o| o.table.clone()).collect();
-        Self { path: String::new(), kind: ImportKind::Csv, csv: CsvImportOptions::default(), parsed: None, sql_text: None, tables, target, new_name: String::new(), strategy: MatchStrategy::NameAndOrder, mode: InsertMode::StopOnError, key_columns: String::new(), error: None }
+        Self { path: String::new(), kind: ImportKind::Csv, csv: CsvImportOptions::default(), parsed: None, sql_text: None, null_text: "NULL".into(), loading: None, tables, target, new_name: String::new(), strategy: MatchStrategy::NameAndOrder, mode: InsertMode::StopOnError, key_columns: String::new(), error: None }
     }
 
-    /// Reads and parses the chosen file.
-    pub fn load(&mut self) {
+    /// Reads and parses the chosen file on a background thread, so a huge file never freezes the window.
+    pub fn load(&mut self, repaint: Arc<dyn Fn() + Send + Sync>) {
         self.parsed = None;
         self.sql_text = None;
         self.error = None;
@@ -375,29 +385,49 @@ impl ImportDialog {
             "sql" => ImportKind::SqlDump,
             _ => ImportKind::Csv,
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => return self.error = Some(format!("Cannot read the file: {e}")),
-        };
-        let result = match self.kind {
-            ImportKind::Csv => parse_csv(&bytes, &self.csv).map(|p| self.parsed = Some(p)),
-            ImportKind::Json => parse_json(&bytes).map(|p| self.parsed = Some(p)),
-            ImportKind::SqlDump => dbzilla_io::import::decode_text(&bytes, &self.csv.encoding).map(|t| self.sql_text = Some(t)),
-        };
-        if let Err(e) = result {
-            self.error = Some(e.to_string());
-        }
         if self.new_name.is_empty() {
             self.new_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported").to_owned();
         }
+        let (kind, mut csv) = (self.kind, self.csv.clone());
+        csv.null_text = Some(self.null_text.clone()).filter(|t| !t.is_empty());
+        let (tx, rx) = channel();
+        self.loading = Some(rx);
+        std::thread::spawn(move || {
+            let result = std::fs::read(&path).map_err(|e| format!("Cannot read the file: {e}")).and_then(|bytes| match kind {
+                ImportKind::Csv => parse_csv(&bytes, &csv).map(|p| Loaded::Rows(Arc::new(p))),
+                ImportKind::Json => parse_json(&bytes).map(|p| Loaded::Rows(Arc::new(p))),
+                ImportKind::SqlDump => dbzilla_io::import::decode_text(&bytes, &csv.encoding).map(|t| Loaded::Dump(Arc::from(t))),
+            }
+            .map_err(|e| e.to_string()));
+            let _ = tx.send(result);
+            repaint();
+        });
+    }
+
+    /// True while a file is being read.
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// Takes the result of the background read, if it is ready.
+    pub fn poll(&mut self) {
+        let Some(rx) = &self.loading else { return };
+        match rx.try_recv() {
+            Ok(Ok(Loaded::Rows(p))) => self.parsed = Some(p),
+            Ok(Ok(Loaded::Dump(t))) => self.sql_text = Some(t),
+            Ok(Err(e)) => self.error = Some(e),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(_) => self.error = Some("The file reader stopped unexpectedly".into()),
+        }
+        self.loading = None;
     }
 
     /// Builds the request to run; the error is shown in the dialog.
     pub fn build(&self, default_schema: Option<&str>) -> Result<ImportRequest, String> {
         if let Some(text) = &self.sql_text {
-            return Ok(ImportRequest::Dump(text.clone()));
+            return Ok(ImportRequest::Dump(Arc::clone(text)));
         }
-        let parsed = self.parsed.clone().ok_or("Choose a file and press Load")?;
+        let parsed = self.parsed.as_ref().map(Arc::clone).ok_or("Choose a file and press Load")?;
         let (table, create) = match &self.target {
             Some(t) => (t.clone(), false),
             None => {
@@ -414,8 +444,9 @@ impl ImportDialog {
 }
 
 /// Draws the import dialog; returns `Some(true)` to start and `Some(false)` to close.
-pub fn import_dialog(ctx: &egui::Context, d: &mut ImportDialog, driver: DriverId) -> Option<bool> {
+pub fn import_dialog(ctx: &egui::Context, d: &mut ImportDialog, driver: DriverId, repaint: Arc<dyn Fn() + Send + Sync>) -> Option<bool> {
     let mut decision = None;
+    d.poll();
     widgets::modal(ctx, "Import data", |ui| {
         ui.set_width(520.0);
         widgets::field_label(ui, "File (CSV, JSON or SQL dump)");
@@ -425,11 +456,11 @@ pub fn import_dialog(ctx: &egui::Context, d: &mut ImportDialog, driver: DriverId
             if widgets::secondary_button(ui, "Browse").clicked() {
                 if let Some(p) = rfd::FileDialog::new().add_filter("Data files", &["csv", "json", "sql", "txt"]).pick_file() {
                     d.path = p.to_string_lossy().into_owned();
-                    d.load();
+                    d.load(repaint.clone());
                 }
             }
             if widgets::secondary_button(ui, "Load").clicked() {
-                d.load();
+                d.load(repaint.clone());
             }
         });
         if d.kind == ImportKind::Csv {
@@ -442,11 +473,16 @@ pub fn import_dialog(ctx: &egui::Context, d: &mut ImportDialog, driver: DriverId
                 ui.label("Encoding");
                 ui.add(egui::TextEdit::singleline(&mut d.csv.encoding).desired_width(90.0));
                 check(ui, &mut d.csv.header, "Header row");
+                ui.label("NULL text");
+                ui.add(egui::TextEdit::singleline(&mut d.null_text).desired_width(60.0));
             });
+        }
+        if d.is_loading() {
+            widgets::muted(ui, "Reading the file...");
         }
         if let Some(p) = &d.parsed {
             widgets::muted(ui, &format!("{} row(s), {} column(s)", p.rows.len(), p.headers.len()));
-            let shown = preview(p);
+            let shown = preview(p.as_ref());
             egui::ScrollArea::both().max_height(140.0).id_salt("import_preview").show(ui, |ui| {
                 egui::Grid::new("import_grid").striped(true).show(ui, |ui| {
                     for h in &shown.headers {
