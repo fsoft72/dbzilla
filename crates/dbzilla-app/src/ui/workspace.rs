@@ -1454,6 +1454,10 @@ impl Workspace {
 
     /// Applies filters to a table tab and reloads its first page.
     pub fn apply_filters(&mut self, id: TabId, filters: Vec<Filter>, or: bool) {
+        let several = |f: &Filter| f.enabled && f.column == dbzilla_core::filter::FilterColumn::Raw && dbzilla_core::splitter::split_statements(&f.value, DriverId::MySql).len() > 1;
+        if filters.iter().any(several) {
+            return self.notices.push((true, "A raw filter must be a single expression, not several statements".into()));
+        }
         if let Some(t) = self.table_tab_mut(id) {
             t.data.filters = filters;
             t.data.filters_or = or;
@@ -3373,6 +3377,19 @@ mod tests {
         ws.start_import("Import of dump.sql".into(), jobs::ImportRequest::Dump("DROP TABLE t".into()));
         assert!(ws.gate.as_ref().is_some_and(|g| g.statements[0].starts_with("DROP TABLE")), "the dump waits for confirmation");
         assert!(ws.jobs.jobs.is_empty(), "no job started yet");
+    }
+
+    /// Review item 6: a raw filter with several statements is refused with an explanation.
+    #[test]
+    fn raw_filter_with_several_statements_is_refused() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        let id = ws.active_tab_mut().unwrap().0;
+        let f = Filter { enabled: true, column: dbzilla_core::filter::FilterColumn::Raw, op: dbzilla_core::filter::FilterOp::Eq, value: "1=1; DELETE FROM t".into() };
+        ws.apply_filters(id, vec![f], false);
+        assert!(ws.notices.iter().any(|(err, m)| *err && m.contains("single expression")));
+        assert!(ws.active_tab_mut().unwrap().1.data.filters.is_empty(), "the filter was not applied");
     }
 }
 

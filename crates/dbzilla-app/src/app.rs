@@ -196,10 +196,18 @@ impl App {
         let Some(c) = self.store.get(id).cloned() else { return };
         match c.password_mode.clone() {
             PasswordMode::NoPassword => self.open_workspace(ctx, c, None),
-            PasswordMode::Keychain => match self.secrets.get(&secret_key(&c.id, "password")) {
-                Ok(p) => self.open_workspace(ctx, c, p),
-                Err(e) => self.toasts.err(format!("Cannot read the password: {e}")),
-            },
+            PasswordMode::Keychain => {
+                // the OS keychain can block (unlock prompt, D-Bus), so it is read off the UI thread
+                let (tx, rx) = channel();
+                let repaint = ctx.clone();
+                let secrets = self.secrets.clone();
+                let key = secret_key(&c.id, "password");
+                std::thread::spawn(move || {
+                    let _ = tx.send(secrets.get(&key).map(Option::unwrap_or_default).map_err(|e| format!("cannot read the password from the keychain: {e}")));
+                    repaint.request_repaint();
+                });
+                self.pending_commands.push(PendingCommand { conn: c, rx });
+            }
             PasswordMode::AskEveryTime => self.password_prompt = Some(PasswordPrompt { conn: c, value: String::new(), reveal: false }),
             PasswordMode::Command(cmd) => {
                 let (tx, rx) = channel();
@@ -265,8 +273,8 @@ impl App {
         });
         for (conn, r) in ready {
             match r {
-                Ok(pw) => self.open_workspace(ctx, conn, Some(pw)),
-                Err(e) => self.toasts.err(format!("The password command failed: {e}")),
+                Ok(pw) => self.open_workspace(ctx, conn, Some(pw).filter(|p| !p.is_empty())),
+                Err(e) => self.toasts.err(format!("Cannot get the password: {e}")),
             }
         }
     }

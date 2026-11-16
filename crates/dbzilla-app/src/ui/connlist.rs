@@ -62,7 +62,6 @@ pub enum ListAction {
     CopyUrl(String),
     Delete(String),
     ToggleGroup(String),
-    #[allow(dead_code)] // the group menu arrives with group management
     DeleteGroup(String),
 }
 
@@ -228,11 +227,17 @@ fn group_row(ui: &mut Ui, id: &str, name: &str, count: usize, collapsed: bool, d
             resp
         })
         .inner;
-    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if resp.clicked() {
         action = Some(ListAction::ToggleGroup(id.to_owned()));
     }
-    ui.interact(ui.min_rect(), egui::Id::new(("group_ctx", id)), Sense::hover());
-    let _ = &mut action;
+    resp.context_menu(|ui| {
+        crate::ui::widgets::flat_menu_style(ui);
+        if ui.add(egui::Button::new(egui::RichText::new("Delete group...").color(theme::ERROR))).clicked() {
+            action = Some(ListAction::DeleteGroup(id.to_owned()));
+            ui.close_menu();
+        }
+    });
     action
 }
 

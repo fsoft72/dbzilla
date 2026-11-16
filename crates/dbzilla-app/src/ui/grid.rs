@@ -210,7 +210,6 @@ pub enum GridEvent {
     CopyColumn(usize),
     EditCommit { row: usize, col: usize, text: String },
     SetValue { row: usize, col: usize, value: CellValue },
-    #[allow(dead_code)] // the grid context menu has no insert entry yet
     InsertRow,
     DuplicateRows,
     DeleteRows,
@@ -482,6 +481,7 @@ fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: us
                 }
             });
             });
+            pick(ui, "Insert row", GridEvent::InsertRow);
             pick(ui, "Duplicate row", GridEvent::DuplicateRows);
             ui.add_enabled_ui(can_edit_row(input, r), |ui| {
                 pick(ui, "Delete row", GridEvent::DeleteRows);

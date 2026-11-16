@@ -31,7 +31,7 @@ pub fn classify_type(type_name: &str) -> TypeClass {
 /// Bytes of a `0x...` hex text.
 fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
     let digits = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if digits.len() % 2 != 0 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !digits.len().is_multiple_of(2) || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("'{s}' is not hexadecimal bytes (0x...)"));
     }
     Ok((0..digits.len()).step_by(2).map(|i| u8::from_str_radix(&digits[i..i + 2], 16).unwrap_or(0)).collect())

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 /// Maximum number of undo steps kept.
 const MAX_UNDO: usize = 100;
+/// Cells (rows x columns) all undo snapshots together may hold; older steps go first.
+const MAX_UNDO_CELLS: usize = 2_000_000;
 /// Text shown for a cell set to its default.
 pub const DEFAULT_TEXT: &str = "DEFAULT";
 
@@ -112,6 +114,11 @@ impl Pending {
     fn snapshot(&mut self, rows: &[Row]) {
         self.undo.push((rows.to_vec(), self.meta.clone()));
         if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        // big pages must not multiply their memory by the number of steps
+        let cells = |v: &Vec<Snapshot>| v.iter().map(|(r, _)| r.len() * r.first().map_or(1, Vec::len)).sum::<usize>();
+        while self.undo.len() > 1 && cells(&self.undo) > MAX_UNDO_CELLS {
             self.undo.remove(0);
         }
         self.redo.clear();
@@ -351,6 +358,18 @@ mod tests {
     }
 
     /// Undo and redo walk through the history.
+    #[test]
+    fn undo_memory_is_bounded() {
+        let mut rows: Vec<Row> = (0..50_000).map(|i| vec![Value::I64(i), Value::Text("x".into()), Value::Null]).collect();
+        let mut p = Pending::default();
+        p.sync_len(rows.len());
+        for i in 0..30 {
+            p.edit_cell(&mut rows, i, 1, CellValue::Value(Value::Text("y".into())));
+        }
+        assert!(p.undo.len() <= MAX_UNDO_CELLS / (50_000 * 3) + 1, "{} steps kept", p.undo.len());
+        assert!(p.undo(&mut rows), "the most recent step can still be undone");
+    }
+
     #[test]
     fn undo_redo() {
         let (mut rs, mut p) = (rows(), Pending::default());
