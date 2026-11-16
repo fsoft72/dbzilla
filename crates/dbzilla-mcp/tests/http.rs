@@ -243,3 +243,26 @@ async fn safe_mode_of_the_connection_applies_to_mcp() {
     let (err, v) = call(&g, "full", "execute_query", json!({"connection_id":"db1","sql":"DELETE FROM t"})).await;
     assert!(err && v.as_str().unwrap().contains("password"), "{v}");
 }
+
+#[tokio::test]
+async fn foreign_origins_are_refused_and_batches_work() {
+    let f = start(false, true).await;
+    let port = f.port;
+    let token = f.secrets["ro"].clone();
+    let (evil, batch) = tokio::task::spawn_blocking(move || {
+        let post = |origin: Option<&str>, body: Value| {
+            let mut req = ureq::post(format!("http://127.0.0.1:{port}/mcp")).config().http_status_as_error(false).build().header("Authorization", format!("Bearer {token}"));
+            if let Some(o) = origin {
+                req = req.header("Origin", o);
+            }
+            let mut res = req.send_json(body).unwrap();
+            (res.status().as_u16(), res.body_mut().read_json::<Value>().unwrap_or(Value::Null))
+        };
+        (post(Some("http://evil.example"), json!({"jsonrpc":"2.0","id":1,"method":"ping"})).0, post(Some("http://localhost:3000"), json!([{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}])))
+    })
+    .await
+    .unwrap();
+    assert_eq!(evil, 403);
+    assert_eq!(batch.0, 200);
+    assert_eq!(batch.1.as_array().unwrap().len(), 2, "the notification gets no reply");
+}

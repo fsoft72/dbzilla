@@ -112,35 +112,57 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
     h.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
+/// True when the Origin header (sent by browsers) points at this machine; other origins are refused to stop DNS rebinding.
+fn origin_is_local(h: &HeaderMap) -> bool {
+    let Some(origin) = h.get("origin") else { return true };
+    let o = origin.to_str().unwrap_or("");
+    let host = o.split("://").nth(1).unwrap_or(o);
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|l| host == *l || host.starts_with(&format!("{l}:")))
+}
+
 /// HTTP entry point.
 async fn handle(State(st): State<Arc<McpState>>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !st.active.load(std::sync::atomic::Ordering::SeqCst) {
         return (StatusCode::SERVICE_UNAVAILABLE, "the MCP server was stopped").into_response();
     }
+    if !origin_is_local(&headers) {
+        return (StatusCode::FORBIDDEN, "requests from other origins are refused").into_response();
+    }
     let Some(rec) = bearer(&headers).and_then(|s| st.tokens.lock().ok()?.verify(s).cloned()) else {
         return (StatusCode::UNAUTHORIZED, "a valid Bearer token is required").into_response();
     };
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-    if req.get("id").is_none() {
-        return StatusCode::ACCEPTED.into_response();
+    if let Value::Array(batch) = req {
+        let mut replies = Vec::new();
+        for item in &batch {
+            replies.extend(process(&st, &rec.name, rec.permission, item).await);
+        }
+        return if replies.is_empty() { StatusCode::ACCEPTED.into_response() } else { Json(Value::Array(replies)).into_response() };
     }
-    let body = match method {
+    match process(&st, &rec.name, rec.permission, &req).await {
+        Some(body) => Json(body).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// Answers one JSON-RPC message; notifications (no id) get no answer.
+async fn process(st: &McpState, token: &str, perm: Permission, req: &Value) -> Option<Value> {
+    let id = req.get("id")?.clone();
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+    Some(match method {
         "initialize" => ok(&id, json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"dbzilla","version":env!("CARGO_PKG_VERSION")}})),
         "ping" => ok(&id, json!({})),
         "tools/list" => ok(&id, json!({"tools":tools()})),
         "tools/call" => {
             let name = req.pointer("/params/name").and_then(Value::as_str).unwrap_or("").to_owned();
             let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-            let result = call_tool(&st, &rec.name, rec.permission, &name, &args).await;
+            let result = call_tool(st, token, perm, &name, &args).await;
             ok(&id, match result {
                 Ok(v) => tool_result(v.to_string(), false),
                 Err(e) => tool_result(e, true),
             })
         }
         other => rpc_err(&id, -32601, &format!("unknown method '{other}'")),
-    };
-    Json(body).into_response()
+    })
 }
 
 /// String argument of a tool call.

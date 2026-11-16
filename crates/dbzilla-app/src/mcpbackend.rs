@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+/// Longest a client query may run, in seconds (SPEC 16).
+pub const QUERY_TIMEOUT_SECS: u64 = 300;
+/// How long the user has to answer an approval request, in seconds.
+pub const APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// Maximum activity lines kept in memory.
 pub const ACTIVITY_KEPT: usize = 200;
 
@@ -34,7 +38,7 @@ pub struct Shared {
 pub struct AppBackend {
     pub shared: Arc<Shared>,
     resolver: PasswordResolver,
-    conns: tokio::sync::Mutex<HashMap<String, Box<dyn Conn>>>,
+    conns: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Box<dyn Conn>>>>>,
     approvals: Mutex<Sender<PendingApproval>>,
     activity_file: PathBuf,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -68,7 +72,7 @@ impl Backend for AppBackend {
         let password = (self.resolver)(&c)?;
         let cfg = config_for(&c, password);
         let conn = driver_for(c.driver).map_err(|e| e.to_string())?.connect(&cfg).await.map_err(|e| format!("cannot connect: {e}"))?;
-        self.conns.lock().await.insert(id.to_owned(), conn);
+        self.conns.lock().await.insert(id.to_owned(), Arc::new(tokio::sync::Mutex::new(conn)));
         Ok(())
     }
 
@@ -82,9 +86,20 @@ impl Backend for AppBackend {
 
     async fn run(&self, id: &str, sql: &str, write: bool) -> Result<Value, String> {
         let driver = self.find(id)?.driver;
-        let mut g = self.conns.lock().await;
-        let conn = g.get_mut(id).ok_or_else(|| format!("the connection '{id}' is not open"))?;
-        if write { run_write(conn.as_mut(), sql).await } else { run_read_only(conn.as_mut(), driver, sql).await }
+        let conn = self.conns.lock().await.get(id).cloned().ok_or_else(|| format!("the connection '{id}' is not open"))?;
+        let mut guard = conn.lock().await;
+        let work = async {
+            if write { run_write(guard.as_mut(), sql).await } else { run_read_only(guard.as_mut(), driver, sql).await }
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(QUERY_TIMEOUT_SECS), work).await {
+            Ok(r) => r,
+            Err(_) => {
+                // the statement may still run on the server: drop this connection so the next call starts clean
+                drop(guard);
+                self.conns.lock().await.remove(id);
+                Err(format!("the statement ran longer than {QUERY_TIMEOUT_SECS} seconds; the connection was closed, open it again"))
+            }
+        }
     }
 
     async fn approve(&self, req: ApprovalRequest) -> bool {
@@ -94,7 +109,7 @@ impl Backend for AppBackend {
             return false;
         }
         (self.repaint)();
-        rx.await.unwrap_or(false)
+        tokio::time::timeout(std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS), rx).await.ok().and_then(Result::ok).unwrap_or(false)
     }
 
     fn log(&self, entry: Activity) {
@@ -134,6 +149,8 @@ pub struct McpHost {
     pub new_name: String,
     pub new_perm: dbzilla_mcp::perm::Permission,
     task: Option<(tokio::task::JoinHandle<()>, Running)>,
+    /// Settings that failed to start: not retried until they change.
+    failed: Option<Running>,
     approvals_rx: std::sync::mpsc::Receiver<PendingApproval>,
     approvals_tx: Sender<PendingApproval>,
     tokens_file: PathBuf,
@@ -145,7 +162,7 @@ impl McpHost {
     /// Creates a stopped host.
     pub fn new(tokens_file: PathBuf, activity_file: PathBuf, resolver: PasswordResolver) -> Self {
         let (approvals_tx, approvals_rx) = std::sync::mpsc::channel();
-        Self { shared: Arc::new(Shared { connections: Mutex::new(Vec::new()), activity: Mutex::new(Vec::new()) }), state: None, pending: Vec::new(), error: None, new_secret: None, new_name: String::new(), new_perm: dbzilla_mcp::perm::Permission::ReadOnly, task: None, approvals_rx, approvals_tx, tokens_file, activity_file, resolver }
+        Self { shared: Arc::new(Shared { connections: Mutex::new(Vec::new()), activity: Mutex::new(Vec::new()) }), state: None, pending: Vec::new(), error: None, new_secret: None, new_name: String::new(), new_perm: dbzilla_mcp::perm::Permission::ReadOnly, task: None, failed: None, approvals_rx, approvals_tx, tokens_file, activity_file, resolver }
     }
 
     /// True while the server runs.
@@ -156,9 +173,10 @@ impl McpHost {
     /// Starts or stops the server so it matches the settings.
     pub fn sync(&mut self, rt: &tokio::runtime::Handle, s: &dbzilla_store::settings::McpSettings, repaint: Arc<dyn Fn() + Send + Sync>) {
         let want = s.enabled.then_some(Running { port: s.port, approval_needed: s.approval_needed });
-        if self.task.as_ref().map(|(_, r)| r) == want.as_ref() {
+        if self.task.as_ref().map(|(_, r)| r) == want.as_ref() || (self.task.is_none() && self.failed.is_some() && self.failed == want) {
             return;
         }
+        self.failed = None;
         if let Some((h, _)) = self.task.take() {
             h.abort();
         }
@@ -169,7 +187,10 @@ impl McpHost {
         self.error = None;
         let tokens = match dbzilla_mcp::tokens::TokenStore::load(&self.tokens_file) {
             Ok(t) => t,
-            Err(e) => return self.error = Some(e),
+            Err(e) => {
+                self.failed = Some(run);
+                return self.error = Some(e);
+            }
         };
         let backend = Arc::new(AppBackend::new(self.shared.clone(), self.resolver.clone(), self.approvals_tx.clone(), self.activity_file.clone(), repaint));
         let state = Arc::new(dbzilla_mcp::server::McpState { backend, tokens: Mutex::new(tokens), approval_needed: run.approval_needed, active: std::sync::atomic::AtomicBool::new(true) });
@@ -178,7 +199,10 @@ impl McpHost {
                 self.state = Some(state);
                 self.task = Some((h, run));
             }
-            Err(e) => self.error = Some(format!("cannot listen on port {}: {e}", run.port)),
+            Err(e) => {
+                self.error = Some(format!("cannot listen on port {}: {e}", run.port));
+                self.failed = Some(run);
+            }
         }
     }
 
@@ -187,6 +211,8 @@ impl McpHost {
         while let Ok(p) = self.approvals_rx.try_recv() {
             self.pending.push(p);
         }
+        // requests nobody answered in time are dropped from the dialog
+        self.pending.retain(|p| !p.answer.is_closed());
     }
 }
 
@@ -245,4 +271,38 @@ mod tests {
         host.sync(rt.handle(), &McpSettings { enabled: false, port, approval_needed: true, auto_token_stdio: true }, Arc::new(|| {}));
         assert!(!host.running());
     }
+
+    /// Approvals whose client gave up are removed from the pending list.
+    #[test]
+    fn abandoned_approvals_disappear() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = McpHost::new(dir.path().join("t.json"), dir.path().join("a.jsonl"), Arc::new(|_| Ok(None)));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        host.approvals_tx.send(PendingApproval { req: ApprovalRequest { token: "t".into(), connection: "c".into(), sql: "DELETE FROM t".into(), kind: dbzilla_core::safemode::StatementKind::Write }, answer: tx }).unwrap();
+        host.poll();
+        assert_eq!(host.pending.len(), 1);
+        drop(rx);
+        host.poll();
+        assert!(host.pending.is_empty());
+    }
+
+    /// A port that cannot be bound is reported once and not retried every frame.
+    #[test]
+    fn failed_bind_is_not_retried_until_settings_change() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let mut host = McpHost::new(dir.path().join("t.json"), dir.path().join("a.jsonl"), Arc::new(|_| Ok(None)));
+        let on = McpSettings { enabled: true, port, approval_needed: true, auto_token_stdio: true };
+        host.sync(rt.handle(), &on, Arc::new(|| {}));
+        assert!(host.error.is_some() && !host.running());
+        host.error = None;
+        host.sync(rt.handle(), &on, Arc::new(|| {}));
+        assert!(host.error.is_none(), "same settings: no new attempt");
+        drop(taken);
+        host.sync(rt.handle(), &McpSettings { port, approval_needed: false, ..on }, Arc::new(|| {}));
+        assert!(host.running(), "changed settings try again: {:?}", host.error);
+    }
 }
+

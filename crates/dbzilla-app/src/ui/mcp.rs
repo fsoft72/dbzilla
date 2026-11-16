@@ -7,6 +7,8 @@ use dbzilla_mcp::perm::Permission;
 use dbzilla_store::settings::Settings;
 use eframe::egui::{self, RichText, Ui};
 
+/// Lowest port the server may use (below it are privileged ports).
+const MIN_PORT: u16 = 1024;
 /// Lines of the activity log shown.
 const ACTIVITY_SHOWN: usize = 30;
 
@@ -16,11 +18,21 @@ pub fn settings_tab(ui: &mut Ui, s: &mut Settings, host: &mut McpHost) -> bool {
     ui.checkbox(&mut s.mcp.enabled, "Enable the MCP server");
     ui.horizontal(|ui| {
         ui.label("Port");
-        let mut port = s.mcp.port.to_string();
-        if ui.add(egui::TextEdit::singleline(&mut port).desired_width(70.0)).changed() {
-            if let Ok(p) = port.parse::<u16>() {
+        let editing = ui.id().with("mcp_port");
+        let mut text = ui.data(|d| d.get_temp::<String>(editing)).unwrap_or_else(|| s.mcp.port.to_string());
+        let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(70.0));
+        let valid = text.parse::<u16>().is_ok_and(|p| p >= MIN_PORT);
+        if resp.lost_focus() {
+            // the server restarts only when the edit is finished, never per keystroke
+            if let (true, Ok(p)) = (valid, text.parse::<u16>()) {
                 s.mcp.port = p;
             }
+            ui.data_mut(|d| d.remove_temp::<String>(editing));
+        } else {
+            ui.data_mut(|d| d.insert_temp(editing, text.clone()));
+        }
+        if !valid {
+            ui.label(RichText::new(format!("use a port from {MIN_PORT} to 65535")).size(12.0).color(theme::ERROR));
         }
     });
     ui.checkbox(&mut s.mcp.approval_needed, "Ask me before a client runs a write or schema change");
