@@ -275,20 +275,22 @@ fn convert_batch(plan: &ImportPlan, parsed: &Parsed, start: usize, end: usize) -
 /// Creates the table when needed and inserts the rows in batches inside one transaction.
 pub async fn run_import(conn: &mut dyn Conn, driver: DriverId, plan: &ImportPlan, parsed: &Parsed, progress: ProgressFn<'_>, cancel: &AtomicBool) -> Result<ImportSummary, IoError> {
     let d = dialect_for(driver);
-    if let Some(cols) = &plan.create {
-        let columns = cols.iter().map(|(n, t)| ColumnDef { name: n.clone(), type_name: t.clone(), nullable: true, default: None, extra: None }).collect();
-        let ops = StructuralOp::CreateTable { table: plan.table.clone(), columns, primary_key: vec![], foreign_keys: vec![] };
-        let stmts = generate_ddl(&ops, d.as_ref()).map_err(|e| IoError::Format(e.to_string()))?;
-        conn.execute_batch(&stmts, false).await?;
-    }
     let dest: Vec<String> = plan.mapping.iter().flatten().map(|(c, _)| c.clone()).collect();
     if dest.is_empty() {
         return Err(IoError::Format("no column is mapped to import".into()));
     }
     conn.execute_batch(&[begin_sql(driver).to_owned()], false).await?;
+    let mut created = false;
     let total = parsed.rows.len();
     let mut done = 0usize;
     let result: Result<(), IoError> = async {
+        if let Some(cols) = &plan.create {
+            let columns = cols.iter().map(|(n, t)| ColumnDef { name: n.clone(), type_name: t.clone(), nullable: true, default: None, extra: None }).collect();
+            let ops = StructuralOp::CreateTable { table: plan.table.clone(), columns, primary_key: vec![], foreign_keys: vec![] };
+            let stmts = generate_ddl(&ops, d.as_ref()).map_err(|e| IoError::Format(e.to_string()))?;
+            conn.execute_batch(&stmts, false).await?;
+            created = true;
+        }
         while done < total {
             if cancel.load(Ordering::SeqCst) {
                 return Err(IoError::Cancelled);
@@ -310,6 +312,10 @@ pub async fn run_import(conn: &mut dyn Conn, driver: DriverId, plan: &ImportPlan
         }
         Err(e) => {
             let _ = conn.execute_batch(&["ROLLBACK".to_owned()], false).await;
+            if created {
+                // MySQL commits DDL implicitly, so the new table may have survived the rollback
+                let _ = conn.execute_batch(&[format!("DROP TABLE IF EXISTS {}", d.quote_table(&plan.table))], false).await;
+            }
             Err(e)
         }
     }

@@ -237,3 +237,17 @@ async fn export_never_overwrites_existing_files() {
     let sql = export(&db, dir.path(), &o, &[table("people")]).await;
     assert!(sql[0].ends_with("people-1.sql.gz"), "{sql:?}");
 }
+
+/// Review M12: a failed import into a new table leaves no empty table behind.
+#[tokio::test]
+async fn failed_import_into_a_new_table_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = new_db(dir.path(), "a.sqlite3", "SELECT 1;");
+    let mut c = open(&db).await;
+    let parsed = parse_csv(b"id\n1\nnot a number\n", &CsvImportOptions::default()).unwrap();
+    let cols = vec![("id".to_owned(), "INTEGER".to_owned())];
+    let plan = ImportPlan { table: TableRef::simple("fresh"), create: Some(cols.clone()), mapping: vec![Some(cols[0].clone())], mode: InsertMode::StopOnError, key_columns: vec![] };
+    assert!(run_import(c.as_mut(), DriverId::Sqlite, &plan, &parsed, &|_| {}, &AtomicBool::new(false)).await.is_err());
+    let tables = rows(&mut c, "SELECT count(*) FROM sqlite_master WHERE name = 'fresh'").await;
+    assert_eq!(tables[0][0], Value::I64(0));
+}

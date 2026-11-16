@@ -75,32 +75,10 @@ fn display_of(v: &CellValue) -> Value {
 
 /// Converts typed text to a cell value following the column type (FR-D-020).
 pub fn parse_edit(type_name: &str, text: &str) -> Result<CellValue, String> {
-    let t = type_name.to_lowercase();
-    let trimmed = text.trim();
-    let is_int = t.contains("int") || t.contains("serial");
-    let is_dec = t.contains("numeric") || t.contains("decimal") || t.contains("money");
-    let is_float = t.contains("float") || t.contains("double") || t.contains("real");
-    if is_int || is_dec || is_float {
-        if trimmed.is_empty() {
-            return Ok(CellValue::Null);
-        }
-        return if is_int {
-            trimmed.parse::<i64>().map(|n| CellValue::Value(Value::I64(n))).map_err(|_| format!("'{trimmed}' is not a whole number"))
-        } else if is_dec {
-            trimmed.parse::<f64>().map(|_| CellValue::Value(Value::Decimal(trimmed.to_owned()))).map_err(|_| format!("'{trimmed}' is not a number"))
-        } else {
-            trimmed.parse::<f64>().map(|n| CellValue::Value(Value::F64(n))).map_err(|_| format!("'{trimmed}' is not a number"))
-        };
-    }
-    if t == "bool" || t == "boolean" {
-        return match trimmed.to_lowercase().as_str() {
-            "true" | "t" | "1" | "yes" => Ok(CellValue::Value(Value::Bool(true))),
-            "false" | "f" | "0" | "no" => Ok(CellValue::Value(Value::Bool(false))),
-            "" => Ok(CellValue::Null),
-            other => Err(format!("'{other}' is not true or false")),
-        };
-    }
-    Ok(CellValue::Value(Value::Text(text.to_owned())))
+    use dbzilla_io::convert::to_value;
+    let value = to_value(type_name, Some(text))?;
+    // an emptied numeric or boolean cell means NULL, an emptied text cell stays an empty string
+    Ok(if value == Value::Null { CellValue::Null } else { CellValue::Value(value) })
 }
 
 impl Pending {
@@ -407,6 +385,8 @@ mod tests {
         assert_eq!(parse_edit("double precision", "2.5"), Ok(CellValue::Value(Value::F64(2.5))));
         assert_eq!(parse_edit("boolean", "t"), Ok(CellValue::Value(Value::Bool(true))));
         assert!(parse_edit("boolean", "maybe").is_err());
+        assert_eq!(parse_edit("point", "(1,2)"), Ok(CellValue::Value(Value::Text("(1,2)".into()))), "point is not an integer type");
+        assert_eq!(parse_edit("bigint unsigned", "18446744073709551615"), Ok(CellValue::Value(Value::U64(u64::MAX))));
         assert_eq!(parse_edit("text", ""), Ok(CellValue::Value(Value::Text(String::new()))));
         assert_eq!(parse_edit("varchar(20)", " x "), Ok(CellValue::Value(Value::Text(" x ".into()))));
     }
