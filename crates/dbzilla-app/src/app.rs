@@ -7,7 +7,7 @@ use crate::theme;
 use crate::ui::connform::{self, config_for, ConnForm, FormAction, TestState};
 use crate::ui::connlist::{self, ListAction, ListState};
 use crate::ui::settings::{self, SettingsTab};
-use crate::ui::workspace::{Workspace, WsStatus};
+use crate::ui::workspace::{Workspace, WsEnv, WsOutput};
 use crate::ui::{widgets, Toasts};
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::dialect::DriverId;
@@ -19,7 +19,7 @@ use dbzilla_store::paths::AppPaths;
 use dbzilla_store::secrets::{secret_key, KeyringStore, MemorySecretStore, SecretStore};
 use dbzilla_store::settings::Settings;
 use dbzilla_store::tags::TagStore;
-use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Stroke};
+use eframe::egui::{self, Align, Frame, Layout, Margin, Stroke};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
@@ -207,7 +207,7 @@ impl App {
         let repaint_ctx = ctx.clone();
         let session = spawn(self.rt.handle(), cfg, default_factory(), Arc::new(move || repaint_ctx.request_repaint()));
         session.send(Command::Connect(config_for(&conn, password)));
-        self.workspaces.push(Workspace { conn, session, status: WsStatus::Connecting });
+        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries));
         self.section = Section::Workspace(self.workspaces.len() - 1);
     }
 
@@ -246,9 +246,14 @@ impl App {
             return;
         }
         for a in self.keymap.triggered(ctx) {
-            match a {
-                Action::Settings => self.section = Section::Settings,
-                Action::OpenConnection => self.section = Section::Connections,
+            match (a, self.section) {
+                (Action::Settings, _) => self.section = Section::Settings,
+                (Action::OpenConnection, _) => self.section = Section::Connections,
+                (a, Section::Workspace(i)) => {
+                    if let Some(WsOutput::Run(_)) = self.workspaces.get_mut(i).and_then(|ws| ws.handle_action(a)) {
+                        // actions the workspace does not implement yet
+                    }
+                }
                 _ => {}
             }
         }
@@ -473,49 +478,21 @@ impl App {
         });
     }
 
-    /// Placeholder workspace screen until the full workspace lands.
+    /// The workspace screen of an open connection.
     fn workspace_section(&mut self, ctx: &egui::Context, i: usize) {
-        let frame = Frame::new().fill(theme::DEEP_DARK).inner_margin(Margin::symmetric(28, 22));
-        let mut close = false;
-        let mut reconnect = false;
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            let Some(ws) = self.workspaces.get(i) else { return };
-            ui.horizontal(|ui| {
-                widgets::icon_badge(ui, Ico::Database, theme::SECONDARY, 52.0);
-                ui.vertical(|ui| {
-                    widgets::heading(ui, &ws.conn.name);
-                    match &ws.status {
-                        WsStatus::Connecting => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                widgets::muted(ui, "Connecting...");
-                            });
-                        }
-                        WsStatus::Connected(v) => {
-                            ui.label(RichText::new(format!("Connected - {v}")).color(theme::OK));
-                        }
-                        WsStatus::Failed(e) | WsStatus::Disconnected(e) => {
-                            ui.label(RichText::new(e).color(theme::ERROR));
-                        }
-                    }
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::danger_button(ui, "Close").clicked() {
-                        close = true;
-                    }
-                    if widgets::secondary_button(ui, "Reconnect").clicked() {
-                        reconnect = true;
-                    }
-                });
-            });
-        });
-        if reconnect {
-            if let Some(ws) = self.workspaces.get_mut(i) {
-                ws.reconnect();
+        let Some(ws) = self.workspaces.get_mut(i) else { return };
+        let mut env = WsEnv { settings: &self.settings, keymap: &self.keymap, tags: &self.tags, toasts: &mut self.toasts };
+        let outputs = ws.show(ctx, &mut env);
+        for o in outputs {
+            match o {
+                WsOutput::Close => {
+                    let name = self.workspaces[i].conn.name.clone();
+                    self.confirm = Some(Confirm { title: "Close workspace".into(), body: format!("Close the connection '{name}'?"), button: "Close".into(), action: ConfirmAction::CloseWorkspace(i) });
+                }
+                WsOutput::Run(Action::Settings) => self.section = Section::Settings,
+                WsOutput::Run(Action::OpenConnection) => self.section = Section::Connections,
+                WsOutput::Run(_) => {}
             }
-        }
-        if close {
-            self.run_confirmed(ConfirmAction::CloseWorkspace(i));
         }
     }
 

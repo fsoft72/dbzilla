@@ -5,6 +5,7 @@
 
 mod app;
 mod cli;
+mod fuzzy;
 mod glyphs;
 mod keymap;
 mod theme;
