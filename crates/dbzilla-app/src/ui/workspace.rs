@@ -2,6 +2,7 @@
 
 use super::console::{self, ConsoleLog};
 use super::datatab::{self, DataAction, DataEnv, DataState, Total};
+use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
@@ -153,6 +154,7 @@ enum ReqKind {
     Commit,
     Sql,
     Ddl,
+    Search,
 }
 
 /// What a confirmed gate does.
@@ -271,6 +273,7 @@ pub struct Workspace {
     requested_structs: HashSet<String>,
     commit_log: HashMap<RequestId, (Vec<String>, Option<String>)>,
     ddl_after: HashMap<RequestId, DdlAfter>,
+    search: Option<SearchState>,
     op_dialog: Option<OpDialog>,
     fk_dialog: Option<FkDialog>,
     triggers_for: Option<TabId>,
@@ -333,6 +336,7 @@ impl Workspace {
             requested_structs: HashSet::new(),
             commit_log: HashMap::new(),
             ddl_after: HashMap::new(),
+            search: None,
             op_dialog: None,
             fk_dialog: None,
             triggers_for: None,
@@ -447,6 +451,13 @@ impl Workspace {
 
     /// A page failed.
     fn on_page_error(&mut self, req: RequestId, error: String) {
+        if let Some((_, ReqKind::Search)) = self.req_map.get(&req).copied() {
+            self.req_map.remove(&req);
+            if let Some(sr) = self.search.as_mut() {
+                sr.skip(error);
+            }
+            return self.search_step();
+        }
         let Some((id, _)) = self.req_map.remove(&req) else { return };
         if let Some(t) = self.table_tab_mut(id) {
             t.data.loading = false;
@@ -456,6 +467,13 @@ impl Workspace {
 
     /// A count or estimate arrived.
     fn on_total(&mut self, req: RequestId, total: Total) {
+        if let Some((_, ReqKind::Search)) = self.req_map.get(&req).copied() {
+            self.req_map.remove(&req);
+            if let (Some(sr), Total::Exact(n)) = (self.search.as_mut(), total) {
+                sr.record(n);
+            }
+            return self.search_step();
+        }
         let Some((id, _)) = self.req_map.remove(&req) else { return };
         if let Some(t) = self.table_tab_mut(id) {
             t.data.total = total;
@@ -547,6 +565,7 @@ impl Workspace {
                 }
             }
         }
+        let search_waiting = self.search.as_ref().is_some_and(|s| s.awaiting_structure.as_ref() == Some(&st.table));
         if let Some((table, kind)) = self.pending_copy.take() {
             if table == st.table {
                 self.clipboard_out = Some(copy_script(kind, &st, self.dialect.as_ref()));
@@ -556,6 +575,12 @@ impl Workspace {
             }
         }
         self.structures.insert(st.table.clone(), st);
+        if search_waiting {
+            if let Some(sr) = self.search.as_mut() {
+                sr.awaiting_structure = None;
+            }
+            self.search_count_current();
+        }
     }
 
     /// Facts about the open tabs for the opening rules.
@@ -600,6 +625,8 @@ impl Workspace {
             ws.next_tab_id += 1;
             let mut data = DataState::new(ws.page_size);
             data.filters = filters.clone();
+            data.bar.rows = filters.clone();
+            data.bar.open = !filters.is_empty();
             let is_view = ws.objects.iter().any(|o| o.table == table && matches!(o.kind, ObjectKind::View | ObjectKind::MaterializedView));
             if let Some(st) = ws.structures.get(&table) {
                 data.key_cols = default_key_columns(Some(st));
@@ -689,6 +716,17 @@ impl Workspace {
                 }
             }
             Action::ReloadWorkspace => self.load_schema(),
+            Action::ToggleFilters => {
+                if let Some((_, t)) = self.active_tab_mut() {
+                    t.data.bar.open = !t.data.bar.open;
+                } else if let Some((_, s)) = self.active_sql_mut() {
+                    s.find = if s.find.is_some() { None } else { Some(sqltab::FindState { focus: true, ..Default::default() }) };
+                }
+            }
+            Action::SearchInDatabase => {
+                let tables: Vec<TableRef> = self.objects.iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::View)).map(|o| o.table.clone()).collect();
+                self.search = Some(SearchState::new(&tables));
+            }
             Action::ShowData => self.set_view(TabView::Data),
             Action::ShowStructure => self.set_view(TabView::Structure),
             Action::NewSqlEditor => self.open_sql(String::new()),
@@ -1251,6 +1289,71 @@ impl Workspace {
         }
     }
 
+    /// Applies filters to a table tab and reloads its first page.
+    pub fn apply_filters(&mut self, id: TabId, filters: Vec<Filter>, or: bool) {
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.filters = filters;
+            t.data.filters_or = or;
+            t.data.offset = 0;
+            t.data.total = Total::Unknown;
+        }
+        self.fetch_tab(id);
+    }
+
+    /// Moves the search on: next table, or finish.
+    fn search_step(&mut self) {
+        let Some(sr) = self.search.as_mut() else { return };
+        let Some(table) = sr.next_table() else { return };
+        if self.structures.contains_key(&table) {
+            self.search_count_current();
+        } else {
+            sr.awaiting_structure = Some(table.clone());
+            self.session.send(Command::LoadStructure(table));
+        }
+    }
+
+    /// Counts the matches of the table being searched.
+    fn search_count_current(&mut self) {
+        let Some(sr) = self.search.as_mut() else { return };
+        let Some(table) = sr.current.clone() else { return };
+        let columns = self.structures.get(&table).map(|s| s.columns.clone()).unwrap_or_default();
+        let req = RequestId::next();
+        sr.req = Some(req);
+        let filter = sr.filter();
+        self.req_map.insert(req, (0, ReqKind::Search));
+        self.session.send(Command::CountExact { req, table, columns, filters: vec![filter], filters_or: false });
+    }
+
+    /// Reacts to the Search in Database dialog.
+    fn search_action(&mut self, a: SearchAction) {
+        match a {
+            SearchAction::Start => {
+                if let Some(sr) = self.search.as_mut() {
+                    sr.start();
+                }
+                self.search_step();
+            }
+            SearchAction::Pause => {
+                if let Some(sr) = self.search.as_mut() {
+                    sr.paused = true;
+                }
+            }
+            SearchAction::Resume => {
+                if let Some(sr) = self.search.as_mut() {
+                    sr.paused = false;
+                }
+                self.search_step();
+            }
+            SearchAction::Done => self.search = None,
+            SearchAction::Open(table) => {
+                if let Some(sr) = &self.search {
+                    let f = sr.filter();
+                    self.open_table_with(table, OpenMode::NewTab, vec![f]);
+                }
+            }
+        }
+    }
+
     /// Opens an editor for a table that does not exist yet.
     pub fn new_table(&mut self) {
         self.new_table_no += 1;
@@ -1512,9 +1615,15 @@ impl Workspace {
                 DataAction::Toast(m) => env.toasts.ok(m),
                 DataAction::Error(m) => env.toasts.err(m),
                 DataAction::ChooseKey => self.open_key_dialog(id),
+                DataAction::ApplyFilters { filters, or } => self.apply_filters(id, filters, or),
             }
         }
         self.modals(ctx);
+        if let Some(sr) = self.search.as_mut() {
+            if let Some(a) = dbsearch::show(ctx, sr) {
+                self.search_action(a);
+            }
+        }
         if let Some(text) = self.clipboard_out.take() {
             ctx.copy_text(text);
         }
@@ -2065,7 +2174,7 @@ impl TabViewer for Viewer<'_> {
         }
         match t.view {
             TabView::Data => {
-                let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table), is_view: t.is_view };
+                let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table), is_view: t.is_view, caps: self.caps };
                 for a in datatab::show(ui, &mut t.data, &env) {
                     self.data_actions.push((id, a));
                 }
@@ -2498,6 +2607,51 @@ mod tests {
         assert!(script.starts_with("CREATE TABLE t") && script.ends_with(';'), "{script}");
         ws.copy_script_for(TableRef::simple("t"), ScriptKind::SelectTop100);
         assert_eq!(ws.clipboard_out.as_deref(), Some("SELECT * FROM \"t\" LIMIT 100;"));
+    }
+
+    /// Filters narrow the page and the count; clearing restores everything.
+    #[test]
+    fn filters_apply_and_clear() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        let id = ws.active_tab_mut().unwrap().0;
+        let f = |op, v: &str| Filter { enabled: true, column: dbzilla_core::filter::FilterColumn::Column("name".into()), op, value: v.into() };
+        ws.apply_filters(id, vec![f(dbzilla_core::filter::FilterOp::Contains, "ALP")], false);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 1));
+        assert_eq!(name_of_row(&mut ws, 0), Value::Text("alpha".into()));
+        ws.apply_filters(id, vec![f(dbzilla_core::filter::FilterOp::Eq, "nope"), f(dbzilla_core::filter::FilterOp::Eq, "beta")], true);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 1));
+        assert_eq!(name_of_row(&mut ws, 0), Value::Text("beta".into()), "OR keeps rows matching any filter");
+        ws.apply_filters(id, vec![], false);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 2));
+    }
+
+    /// Search in Database scans every table and lists the ones with matches.
+    #[test]
+    fn search_in_database_finds_tables() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE u (id INTEGER PRIMARY KEY, note TEXT); INSERT INTO u VALUES (1,'nothing'),(2,'Alpine');").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "u"));
+        ws.handle_action(Action::SearchInDatabase);
+        {
+            let sr = ws.search.as_mut().unwrap();
+            sr.value = "alp".into();
+        }
+        ws.search_action(SearchAction::Start);
+        wait(&mut ws, |w| w.search.as_ref().is_some_and(|s| !s.running));
+        let sr = ws.search.as_ref().unwrap();
+        let mut found: Vec<(String, u64)> = sr.results.iter().map(|(t, n)| (t.name.clone(), *n)).collect();
+        found.sort();
+        assert_eq!(found, vec![("t".to_owned(), 1), ("u".to_owned(), 1)]);
+        assert!(sr.skipped.is_empty(), "{:?}", sr.skipped);
+        assert_eq!(sr.scanned, 2);
+        ws.search_action(SearchAction::Open(TableRef::simple("u")));
+        let loc = ws.dock.iter_all_tabs().last().map(|(l, _)| l).expect("the result tab");
+        ws.dock.set_focused_node_and_surface(loc);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| t.table.name == "u" && !t.data.loading && t.data.rows.len() == 1));
     }
 }
 

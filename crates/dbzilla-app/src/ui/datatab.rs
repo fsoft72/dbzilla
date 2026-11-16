@@ -1,11 +1,13 @@
 //! The Data tab of a table: paging, state and drawing (SPEC 8.2).
 
 use super::grid::{self, GridEvent, GridInput, GridState};
+use super::filters::{self, FilterAction, FilterBar};
 use super::pending::{parse_edit, Pending};
 use super::quicklook::{self, QuickLook};
 use super::widgets;
 use crate::glyphs::Ico;
 use crate::theme;
+use dbzilla_core::caps::Capabilities;
 use dbzilla_core::copyfmt::{format_rows, CopyContext, CopyFormat, CsvOptions};
 use dbzilla_core::dialect::Dialect;
 use dbzilla_core::filter::{Filter, FilterColumn, FilterOp};
@@ -49,6 +51,7 @@ pub struct DataState {
     /// Columns identifying a row for updates and deletes.
     pub key_cols: Vec<String>,
     pub committing: bool,
+    pub bar: FilterBar,
 }
 
 impl DataState {
@@ -75,6 +78,7 @@ impl DataState {
             pending: Pending::default(),
             key_cols: Vec::new(),
             committing: false,
+            bar: FilterBar::default(),
         }
     }
 }
@@ -88,6 +92,7 @@ pub enum DataAction {
     Toast(String),
     Error(String),
     ChooseKey,
+    ApplyFilters { filters: Vec<Filter>, or: bool },
 }
 
 /// Context needed to draw a data tab.
@@ -99,6 +104,7 @@ pub struct DataEnv<'a> {
     pub table: &'a TableRef,
     pub structure: Option<&'a TableStructure>,
     pub is_view: bool,
+    pub caps: &'a Capabilities,
 }
 
 /// First and last row numbers (1-based) of the loaded page; `None` when empty.
@@ -159,6 +165,20 @@ pub fn show(ui: &mut Ui, d: &mut DataState, env: &DataEnv) -> Vec<DataAction> {
     let mut actions = Vec::new();
     let columns = merge_columns(&d.columns, env.structure);
     d.pending.sync_len(d.rows.len());
+    if d.bar.open {
+        let mut bar_action = None;
+        egui::TopBottomPanel::top(ui.id().with("filter_bar")).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(egui::Margin::symmetric(10, 6))).show_inside(ui, |ui| {
+            bar_action = filters::show(ui, &mut d.bar, &columns, env.caps, env.dialect);
+        });
+        match bar_action {
+            Some(FilterAction::Apply { filters, or }) => actions.push(DataAction::ApplyFilters { filters, or }),
+            Some(FilterAction::Clear) => actions.push(DataAction::ApplyFilters { filters: Vec::new(), or: false }),
+            Some(FilterAction::VisibleColumns(names)) => {
+                d.grid.hidden = if names.is_empty() { Default::default() } else { columns.iter().enumerate().filter(|(_, c)| !names.iter().any(|n| n.eq_ignore_ascii_case(&c.name))).map(|(i, _)| i).collect() };
+            }
+            None => {}
+        }
+    }
     egui::TopBottomPanel::bottom(ui.id().with("data_bar")).exact_height(38.0).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(egui::Margin::symmetric(10, 4))).show_inside(ui, |ui| bottom_bar(ui, d, env, &columns, &mut actions));
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::DEEP_DARK)).show_inside(ui, |ui| {
         if let Some(e) = &d.error {
@@ -252,6 +272,19 @@ fn apply_event(ui: &Ui, d: &mut DataState, columns: &[ColumnMeta], env: &DataEnv
             d.pending.delete(&mut d.rows, &sel);
             d.grid.selection.clear();
         }
+        GridEvent::FilterColumn(c) => {
+            if let Some(col) = columns.get(c) {
+                d.bar.open = true;
+                d.bar.rows = vec![Filter { enabled: true, column: FilterColumn::Column(col.name.clone()), op: FilterOp::Eq, value: String::new() }];
+            }
+        }
+        GridEvent::QuickFilter { col, op, value } => {
+            if let Some(c) = columns.get(col) {
+                let f = filters::quick_filter(&c.name, op, &value);
+                d.bar.rows = vec![f.clone()];
+                actions.push(DataAction::ApplyFilters { filters: vec![f], or: false });
+            }
+        }
         GridEvent::CopyColumn(c) => {
             let text = d.rows.iter().filter_map(|r| r.get(c)).map(Value::to_display).collect::<Vec<_>>().join("\n");
             ui.ctx().copy_text(text);
@@ -319,6 +352,10 @@ fn bottom_bar(ui: &mut Ui, d: &mut DataState, env: &DataEnv, columns: &[ColumnMe
         if let Some(t) = d.elapsed {
             widgets::muted(ui, &format!("{} ms", t.as_millis()));
         }
+        if d.filters.iter().any(|f| f.enabled) && widgets::removable_chip(ui, "Filtered", "Clear the filters") {
+            d.bar.rows.clear();
+            actions.push(DataAction::ApplyFilters { filters: Vec::new(), or: false });
+        }
         if d.loading {
             ui.spinner();
         }
@@ -350,8 +387,10 @@ mod tests {
         ColumnMeta { name: name.into(), type_name: "text".into(), ..Default::default() }
     }
 
+    static CAPS_FOR_TESTS: std::sync::LazyLock<Capabilities> = std::sync::LazyLock::new(|| Capabilities::for_driver(DriverId::Sqlite));
+
     fn env<'a>(d: &'a dyn Dialect, csv: &'a CsvOptions, t: &'a TableRef) -> DataEnv<'a> {
-        DataEnv { dialect: d, csv, alternating: true, row_height: 24.0, table: t, structure: None, is_view: false }
+        DataEnv { dialect: d, csv, alternating: true, row_height: 24.0, table: t, structure: None, is_view: false, caps: &CAPS_FOR_TESTS }
     }
 
     /// Page bounds, previous offset and next availability.
@@ -425,7 +464,7 @@ mod tests {
                     ui.ctx().request_repaint();
                     return;
                 }
-                let env = DataEnv { dialect: d.as_ref(), csv: &csv, alternating: true, row_height: 24.0, table: &table, structure: None, is_view: false };
+                let env = DataEnv { dialect: d.as_ref(), csv: &csv, alternating: true, row_height: 24.0, table: &table, structure: None, is_view: false, caps: &CAPS_FOR_TESTS };
                 show(ui, st, &env);
             },
             state,

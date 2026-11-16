@@ -37,11 +37,12 @@ pub enum Action {
     DuplicateRow,
     Export,
     FocusSidebarSearch,
+    SearchInDatabase,
 }
 
 impl Action {
     /// Every action, for the command palette and the keymap editor.
-    pub const ALL: [Action; 31] = [
+    pub const ALL: [Action; 32] = [
         Action::OpenAnything,
         Action::OpenDatabase,
         Action::OpenConnection,
@@ -73,6 +74,7 @@ impl Action {
         Action::DuplicateRow,
         Action::Export,
         Action::FocusSidebarSearch,
+        Action::SearchInDatabase,
     ];
 
     /// Name shown in menus, tooltips and the palette.
@@ -109,6 +111,7 @@ impl Action {
             Action::DuplicateRow => "Duplicate Rows",
             Action::Export => "Export Tables",
             Action::FocusSidebarSearch => "Find Items in Sidebar",
+            Action::SearchInDatabase => "Search in Database",
         }
     }
 }

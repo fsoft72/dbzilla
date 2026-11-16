@@ -6,6 +6,7 @@ use crate::glyphs::{self, Ico};
 use crate::theme;
 use dbzilla_core::changes::CellValue;
 use dbzilla_core::copyfmt::CopyFormat;
+use dbzilla_core::filter::FilterOp;
 use dbzilla_core::model::{ColumnMeta, Row};
 use dbzilla_core::paging::SortKey;
 use dbzilla_core::value::Value;
@@ -212,6 +213,8 @@ pub enum GridEvent {
     InsertRow,
     DuplicateRows,
     DeleteRows,
+    FilterColumn(usize),
+    QuickFilter { col: usize, op: FilterOp, value: String },
 }
 
 /// Initial width of a column from its name.
@@ -298,6 +301,8 @@ fn header_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, c: usize, eve
             pick(ui, "Show all columns", GridEvent::ShowAllColumns);
         }
         pick(ui, "Copy all column values", GridEvent::CopyColumn(c));
+        ui.separator();
+        pick(ui, "Filter with column", GridEvent::FilterColumn(c));
     });
 }
 
@@ -448,6 +453,25 @@ fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: us
             }
         });
         pick(ui, "Copy all column values", GridEvent::CopyColumn(c));
+        ui.menu_button("Quick filter", |ui| {
+            let shown = input.rows.get(r).and_then(|row| row.get(c)).map(|v| if v.is_null() { String::new() } else { v.to_display() }).unwrap_or_default();
+            let is_null = input.rows.get(r).and_then(|row| row.get(c)).is_some_and(Value::is_null);
+            let entries: Vec<(String, FilterOp, String)> = if is_null {
+                vec![("IS NULL".into(), FilterOp::IsNull, String::new()), ("IS NOT NULL".into(), FilterOp::IsNotNull, String::new())]
+            } else {
+                vec![
+                    (format!("= {shown}"), FilterOp::Eq, shown.clone()),
+                    (format!("<> {shown}"), FilterOp::Ne, shown.clone()),
+                    ("Contains".into(), FilterOp::Contains, shown.clone()),
+                    ("Has prefix".into(), FilterOp::HasPrefix, shown.clone()),
+                    ("Has suffix".into(), FilterOp::HasSuffix, shown.clone()),
+                    ("IS NULL".into(), FilterOp::IsNull, String::new()),
+                ]
+            };
+            for (label, op, value) in entries {
+                pick(ui, &label.chars().take(40).collect::<String>(), GridEvent::QuickFilter { col: c, op, value });
+            }
+        });
         if input.editable {
             ui.separator();
             ui.add_enabled_ui(can_edit_row(input, r), |ui| {
