@@ -271,9 +271,29 @@ fn alter_column(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &Column
         }
         DriverId::Sqlite => {
             let st = current.ok_or_else(|| DdlError::Unsupported("altering a SQLite column needs the current table structure".into()))?;
+            if let Some(what) = sqlite_rebuild_loss(st) {
+                return Err(DdlError::Unsupported(format!("rebuilding this SQLite table would lose {what}")));
+            }
             Ok(sqlite_rebuild(d, table, old, new, st))
         }
     }
+}
+
+/// What a rebuild could not reproduce for this table, if anything.
+fn sqlite_rebuild_loss(st: &TableStructure) -> Option<&'static str> {
+    let upper = st.ddl.to_ascii_uppercase();
+    for (word, what) in [("UNIQUE", "UNIQUE constraints"), ("CHECK", "CHECK constraints"), ("COLLATE", "collations"), ("AUTOINCREMENT", "AUTOINCREMENT"), ("GENERATED", "generated columns"), ("WITHOUT ROWID", "WITHOUT ROWID")] {
+        if upper.contains(word) {
+            return Some(what);
+        }
+    }
+    if !st.triggers.is_empty() {
+        return Some("its triggers");
+    }
+    if st.indexes.iter().any(|i| i.condition.is_some() || i.columns.iter().any(|c| c.starts_with('<'))) {
+        return Some("partial or expression indexes");
+    }
+    None
 }
 
 /// SQLite table rebuild: create new, copy, drop old, rename, recreate indexes.

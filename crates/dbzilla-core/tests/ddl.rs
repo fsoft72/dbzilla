@@ -141,6 +141,26 @@ fn alter_column_sqlite_without_structure_is_an_error() {
     assert!(matches!(ddl(DriverId::Sqlite, op), Err(DdlError::Unsupported(_))));
 }
 
+/// Review I6: the SQLite rebuild refuses tables whose constraints it cannot reproduce.
+#[test]
+fn sqlite_rebuild_refuses_what_it_would_lose() {
+    let alter = |st: TableStructure| StructuralOp::AlterColumn { table: t("a"), old: col("c", "INTEGER", true, None), new: col("c", "TEXT", true, None), current: Some(Box::new(st)) };
+    for ddl_text in ["CREATE TABLE a (id INTEGER PRIMARY KEY, c INTEGER, e TEXT UNIQUE)", "CREATE TABLE a (id INTEGER, c INTEGER CHECK (c > 0))", "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, c INTEGER)", "CREATE TABLE a (id INTEGER, c TEXT COLLATE NOCASE)", "CREATE TABLE a (id INTEGER, c INTEGER, g INTEGER GENERATED ALWAYS AS (c + 1))"] {
+        let mut st = current_structure();
+        st.ddl = ddl_text.into();
+        assert!(matches!(ddl(DriverId::Sqlite, alter(st)), Err(DdlError::Unsupported(m)) if m.contains("would lose")), "{ddl_text}");
+    }
+    let mut partial = current_structure();
+    partial.indexes[0].condition = Some("c > 0".into());
+    assert!(ddl(DriverId::Sqlite, alter(partial)).is_err());
+    let mut expr = current_structure();
+    expr.indexes[0].columns = vec!["<expression>".into()];
+    assert!(ddl(DriverId::Sqlite, alter(expr)).is_err());
+    let mut plain = current_structure();
+    plain.ddl = "CREATE TABLE a (id INTEGER NOT NULL, c INTEGER, PRIMARY KEY (id))".into();
+    assert!(ddl(DriverId::Sqlite, alter(plain)).is_ok());
+}
+
 #[test]
 fn indexes() {
     let add = || StructuralOp::AddIndex { table: t("a"), index: IndexDef { name: "ix".into(), unique: true, columns: vec!["x".into(), "y".into()] } };
