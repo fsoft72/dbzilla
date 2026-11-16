@@ -1354,7 +1354,7 @@ impl Workspace {
             t.rename_to = t.draft.as_ref().filter(|d| t.view != TabView::Data && !d.is_new && d.new_name.trim() != t.table.name).map(|d| d.new_name.trim().to_owned());
         }
         self.req_map.insert(req, (id, ReqKind::Commit));
-        self.session.send(Command::Commit { req, statements });
+        self.session.send(Command::CommitRows { req, statements });
     }
 
     /// A commit succeeded: reload the tab.

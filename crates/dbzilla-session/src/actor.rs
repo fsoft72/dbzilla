@@ -3,7 +3,7 @@
 use crate::commands::{Command, DbOp, Event, PageRequest, RequestId};
 use crate::console::display_for_console;
 use dbzilla_core::caps::Capabilities;
-use dbzilla_core::dialect::{dialect_for, Dialect};
+use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::model::{ColumnMeta, Row, TableRef};
 use dbzilla_core::paging::{build_count, build_select};
@@ -245,7 +245,8 @@ impl Actor {
             Command::FetchPage(p) => self.fetch_page(&mut conn, *p).await,
             Command::CountExact { req, table, columns, filters, filters_or } => self.count(&mut conn, req, &table, &columns, &filters, filters_or).await,
             Command::RunSql { req, statements, opts, stop_on_error } => self.run_sql(&mut conn, req, &statements, opts, stop_on_error).await,
-            Command::Commit { req, statements } => self.commit(&mut conn, req, &statements).await,
+            Command::Commit { req, statements } => self.commit(&mut conn, req, &statements, false).await,
+            Command::CommitRows { req, statements } => self.commit(&mut conn, req, &statements, true).await,
             Command::Connect(_) | Command::Disconnect | Command::Reconnect | Command::Cancel(_) => {}
         }
         self.conn = Some(conn);
@@ -261,7 +262,7 @@ impl Actor {
             }
             Command::FetchPage(p) => self.out.emit(Event::QueryError { req: p.req, index: 0, error, cancelled: false }).await,
             Command::CountExact { req, .. } => self.out.emit(Event::QueryError { req: *req, index: 0, error, cancelled: false }).await,
-            Command::Commit { req, .. } => self.out.emit(Event::CommitError { req: *req, error }).await,
+            Command::Commit { req, .. } | Command::CommitRows { req, .. } => self.out.emit(Event::CommitError { req: *req, error }).await,
             _ => self.out.emit(Event::Error { error }).await,
         }
     }
@@ -333,14 +334,16 @@ impl Actor {
     }
 
     /// Commits pending-change statements atomically.
-    async fn commit(&mut self, conn: &mut Box<dyn Conn>, req: RequestId, statements: &[String]) {
+    async fn commit(&mut self, conn: &mut Box<dyn Conn>, req: RequestId, statements: &[String], check_rows: bool) {
         for sql in statements {
             self.out.emit(Event::Console { ts_ms: now_ms(), sql: display_for_console(sql) }).await;
         }
         let atomic = self.last_cfg.as_ref().is_none_or(|c| Capabilities::for_driver(c.driver).transactions);
-        match conn.execute_batch(statements, atomic).await {
+        let driver = self.last_cfg.as_ref().map(|c| c.driver);
+        let result = if atomic && check_rows { commit_checked(conn.as_mut(), driver, statements).await } else { conn.execute_batch(statements, atomic).await.map_err(|e| e.to_string()) };
+        match result {
             Ok(counts) => self.out.emit(Event::CommitDone { req, counts }).await,
-            Err(e) => self.out.emit(Event::CommitError { req, error: e.to_string() }).await,
+            Err(error) => self.out.emit(Event::CommitError { req, error }).await,
         }
     }
 
@@ -396,4 +399,36 @@ impl Actor {
             Err(e) => Err((e.to_string(), false)),
         }
     }
+}
+
+/// Runs the statements in one transaction, one at a time. A row statement (UPDATE or DELETE) that
+/// touches more than one row, or none, rolls everything back: the key did not identify one row.
+/// MySQL reports changed rows rather than matched rows, so "no row" is only checked elsewhere.
+async fn commit_checked(conn: &mut dyn Conn, driver: Option<DriverId>, statements: &[String]) -> Result<Vec<u64>, String> {
+    let begin = if driver == Some(DriverId::MySql) { "START TRANSACTION" } else { "BEGIN" };
+    conn.execute_batch(&[begin.to_owned()], false).await.map_err(|e| e.to_string())?;
+    let mut counts = Vec::with_capacity(statements.len());
+    for (i, sql) in statements.iter().enumerate() {
+        let outcome = match conn.execute_batch(std::slice::from_ref(sql), false).await {
+            Ok(c) => c.first().copied().unwrap_or(0),
+            Err(e) => {
+                let _ = conn.execute_batch(&["ROLLBACK".to_owned()], false).await;
+                return Err(format!("statement {} failed: {}", i + 1, e.to_string().trim_start_matches("statement 1 failed: ")));
+            }
+        };
+        let first = sql.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let is_row_statement = first == "UPDATE" || first == "DELETE";
+        let problem = match outcome {
+            n if is_row_statement && n > 1 => Some(format!("it affected {n} rows, the key columns do not identify a single row")),
+            0 if is_row_statement && driver != Some(DriverId::MySql) => Some("it matched no row, the data changed since it was loaded".to_owned()),
+            _ => None,
+        };
+        if let Some(p) = problem {
+            let _ = conn.execute_batch(&["ROLLBACK".to_owned()], false).await;
+            return Err(format!("statement {} failed: {p}", i + 1));
+        }
+        counts.push(outcome);
+    }
+    conn.execute_batch(&["COMMIT".to_owned()], false).await.map_err(|e| e.to_string())?;
+    Ok(counts)
 }

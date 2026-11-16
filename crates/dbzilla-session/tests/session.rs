@@ -270,3 +270,21 @@ async fn keep_alive_detects_a_dead_connection_and_reconnect_recovers() {
     until(&mut h, |e| matches!(e, Event::Connected { .. })).await;
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+/// Review I8: a statement that touches more than one row, or no row, rolls the whole commit back.
+#[tokio::test]
+async fn commit_checks_affected_rows() {
+    let (_d, path) = make_db();
+    rusqlite::Connection::open(&path).unwrap().execute_batch("INSERT INTO orders VALUES (11, 'n1');").unwrap();
+    let (mut h, _) = start(SessionConfig::default());
+    connect(&mut h, &path).await;
+    for (sql, word) in [("DELETE FROM orders WHERE name = 'n1'", "2 rows"), ("UPDATE orders SET name = 'x' WHERE id = 999", "no row")] {
+        let req = RequestId::next();
+        h.send(Command::CommitRows { req, statements: vec!["INSERT INTO orders VALUES (100, 'x')".into(), sql.into()] });
+        let ev = until(&mut h, |e| matches!(e, Event::CommitDone { .. } | Event::CommitError { .. })).await;
+        assert!(matches!(ev.last(), Some(Event::CommitError { error, .. }) if error.contains("statement 2") && error.contains(word)), "{sql}: {ev:?}");
+    }
+    let count = RequestId::next();
+    h.send(Command::CountExact { req: count, table: TableRef::simple("orders"), columns: vec![], filters: vec![], filters_or: false });
+    assert!(matches!(until(&mut h, |e| matches!(e, Event::Count { .. })).await.last(), Some(Event::Count { count: 11, .. })), "both commits were rolled back");
+}

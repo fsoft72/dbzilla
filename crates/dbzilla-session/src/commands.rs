@@ -56,6 +56,8 @@ pub enum Command {
     CountExact { req: RequestId, table: TableRef, columns: Vec<ColumnMeta>, filters: Vec<Filter>, filters_or: bool },
     RunSql { req: RequestId, statements: Vec<String>, opts: QueryOpts, stop_on_error: bool },
     Commit { req: RequestId, statements: Vec<String> },
+    /// Pending row changes: like `Commit`, but each UPDATE or DELETE must touch exactly one row.
+    CommitRows { req: RequestId, statements: Vec<String> },
     Cancel(RequestId),
     DbOp(DbOp),
 }
