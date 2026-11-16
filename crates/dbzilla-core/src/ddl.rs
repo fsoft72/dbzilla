@@ -57,6 +57,8 @@ pub enum StructuralOp {
     DropColumn { table: TableRef, column: String },
     /// `current` is required for SQLite, which rebuilds the table.
     AlterColumn { table: TableRef, old: ColumnDef, new: ColumnDef, current: Option<Box<TableStructure>> },
+    /// Replaces the primary key. `old` is the current one (empty when none); `current` is required for SQLite.
+    SetPrimaryKey { table: TableRef, old: Vec<String>, new: Vec<String>, current: Option<Box<TableStructure>> },
     AddIndex { table: TableRef, index: IndexDef },
     DropIndex { table: TableRef, name: String },
     AddForeignKey { table: TableRef, fk: ForeignKeyDef },
@@ -200,6 +202,7 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
         StructuralOp::AddColumn { table, column } => vec![format!("ALTER TABLE {} ADD COLUMN {}", q(table), col_sql(d, column))],
         StructuralOp::DropColumn { table, column } => vec![format!("ALTER TABLE {} DROP COLUMN {}", q(table), d.quote_ident(column))],
         StructuralOp::AlterColumn { table, old, new, current } => alter_column(d, table, old, new, current.as_deref())?,
+        StructuralOp::SetPrimaryKey { table, old, new, current } => set_primary_key(d, table, old, new, current.as_deref())?,
         StructuralOp::AddIndex { table, index } => {
             let unique = if index.unique { "UNIQUE " } else { "" };
             vec![format!("CREATE {unique}INDEX {} ON {} ({})", d.quote_ident(&index.name), q(table), ident_list(d, &index.columns))]
@@ -252,6 +255,67 @@ fn clone_table(d: &dyn Dialect, source: &TableRef, target: &TableRef, with_data:
             vec![format!("CREATE TABLE {t} AS SELECT * FROM {s}{tail}")]
         }
     }
+}
+
+/// Replaces the primary key per dialect. PostgreSQL assumes the default constraint name `<table>_pkey`.
+fn set_primary_key(d: &dyn Dialect, table: &TableRef, old: &[String], new: &[String], current: Option<&TableStructure>) -> Result<Vec<String>, DdlError> {
+    let t = d.quote_table(table);
+    match d.id() {
+        DriverId::Postgres => {
+            let mut v = Vec::new();
+            if !old.is_empty() {
+                v.push(format!("ALTER TABLE {t} DROP CONSTRAINT {}", d.quote_ident(&format!("{}_pkey", table.name))));
+            }
+            if !new.is_empty() {
+                v.push(format!("ALTER TABLE {t} ADD PRIMARY KEY ({})", ident_list(d, new)));
+            }
+            Ok(v)
+        }
+        DriverId::MySql => {
+            let mut parts = Vec::new();
+            if !old.is_empty() {
+                parts.push("DROP PRIMARY KEY".to_owned());
+            }
+            if !new.is_empty() {
+                parts.push(format!("ADD PRIMARY KEY ({})", ident_list(d, new)));
+            }
+            Ok(vec![format!("ALTER TABLE {t} {}", parts.join(", "))])
+        }
+        DriverId::Sqlite => {
+            let st = current.ok_or_else(|| DdlError::Unsupported("changing a SQLite primary key needs the current table structure".into()))?;
+            sqlite_set_pk(d, table, new, st)
+        }
+    }
+}
+
+/// SQLite can only gain a primary key here: the table text is rebuilt with a table level `PRIMARY KEY`.
+fn sqlite_set_pk(d: &dyn Dialect, table: &TableRef, new: &[String], st: &TableStructure) -> Result<Vec<String>, DdlError> {
+    let refuse = |why: String| DdlError::Unsupported(format!("this SQLite table cannot be rebuilt safely: {why}"));
+    if !st.primary_key.is_empty() {
+        return Err(refuse("changing or removing an existing primary key is not supported on SQLite".into()));
+    }
+    if new.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !st.referenced_by.is_empty() {
+        return Err(refuse(format!("{} refer to it by foreign key and dropping it could delete their rows", st.referenced_by.join(", "))));
+    }
+    if st.ddl.trim().is_empty() {
+        return Err(refuse("the original table text is unknown".into()));
+    }
+    let mut tmp = table.clone();
+    tmp.name = format!("{}{REBUILD_SUFFIX}", table.name);
+    let create = crate::sqlite_rewrite::add_primary_key(&st.ddl, &d.quote_table(&tmp), new, &|n| d.quote_ident(n)).map_err(refuse)?;
+    let names: Vec<String> = st.columns.iter().map(|c| c.name.clone()).collect();
+    let mut v = vec![
+        create,
+        format!("INSERT INTO {} ({}) SELECT {} FROM {}", d.quote_table(&tmp), ident_list(d, &names), ident_list(d, &names), d.quote_table(table)),
+        format!("DROP TABLE {}", d.quote_table(table)),
+        format!("ALTER TABLE {} RENAME TO {}", d.quote_table(&tmp), d.quote_ident(&table.name)),
+    ];
+    v.extend(st.index_sql.iter().cloned());
+    v.extend(st.triggers.iter().map(|t| t.statement.clone()));
+    Ok(v)
 }
 
 /// Alter column per dialect (SQLite rebuilds the table).

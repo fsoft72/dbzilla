@@ -34,3 +34,5 @@
 - UI: the "Key columns" dialog scrolls when a table has many columns, so its buttons stay on screen.
 - UI: the inline cell editor no longer draws over the old cell text.
 - Data grid header shows the key icon (blue) for columns covered by a single-column unique index when they are not part of the PK (the PK checkbox cannot be changed on existing tables).
+- Structure: the PK checkbox is editable on existing tables (new `SetPrimaryKey` op: PostgreSQL assumes `<table>_pkey`, MySQL drop+add, SQLite rebuild only when the table has no PK yet). It must be applied separately from other column changes.
+- Structure: the delete (trash) button of a column moved next to the row number so it stays on screen.

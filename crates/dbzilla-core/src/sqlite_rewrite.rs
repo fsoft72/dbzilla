@@ -239,6 +239,34 @@ pub fn rewrite_create(ddl: &str, tmp_quoted: &str, ch: &ColumnChange<'_>, quote:
     Ok(format!("CREATE TABLE {tmp_quoted} (\n  {}\n){tail}", rendered.join(",\n  ")))
 }
 
+/// Rewrites `ddl` into a `CREATE TABLE <tmp_quoted> (...)` with a table level `PRIMARY KEY (cols)` added.
+/// Refuses tables that already define a primary key anywhere, since replacing it is not safe to do textually.
+pub fn add_primary_key(ddl: &str, tmp_quoted: &str, cols: &[String], quote: &dyn Fn(&str) -> String) -> Result<String, String> {
+    let toks = scan(ddl);
+    let open = toks.iter().position(|t| t.kind == Kind::Group).ok_or("the table text has no column list")?;
+    let body = &toks[open].raw[1..toks[open].raw.len() - 1];
+    let suffix: Vec<&str> = toks[open + 1..].iter().map(|t| t.raw.as_str()).collect();
+    let mut elements: Vec<Vec<Tok>> = vec![Vec::new()];
+    for t in scan(body) {
+        if t.kind == Kind::Punct && t.raw == "," {
+            elements.push(Vec::new());
+        } else if let Some(last) = elements.last_mut() {
+            last.push(t);
+        }
+    }
+    let mut rendered = Vec::new();
+    for el in elements.iter().filter(|e| !e.is_empty()) {
+        if el.iter().any(|t| is_word(t, "PRIMARY")) {
+            return Err("the table already has a primary key".into());
+        }
+        rendered.push(el.iter().map(|t| t.raw.as_str()).collect::<Vec<_>>().join(" "));
+    }
+    let list: Vec<String> = cols.iter().map(|c| quote(c)).collect();
+    rendered.push(format!("PRIMARY KEY ({})", list.join(", ")));
+    let tail = if suffix.is_empty() { String::new() } else { format!(" {}", suffix.join(" ")) };
+    Ok(format!("CREATE TABLE {tmp_quoted} (\n  {}\n){tail}", rendered.join(",\n  ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +322,13 @@ mod tests {
         assert!(mentions_ident("CREATE INDEX i ON a (\"C\")", "c"));
         assert!(mentions_ident("CREATE INDEX i ON a (lower(c))", "c"));
         assert!(!mentions_ident("CREATE INDEX i ON a (x) WHERE y = 'c'", "c"));
+    }
+
+    /// A table level primary key is appended and existing constraints stay.
+    #[test]
+    fn adds_a_primary_key() {
+        let out = add_primary_key("CREATE TABLE a (id TEXT, e TEXT UNIQUE, CHECK (id <> ''))", "\"a_tmp\"", &["id".into()], &q).unwrap();
+        assert!(out.contains("e TEXT UNIQUE") && out.contains("CHECK (id <> '')") && out.contains("PRIMARY KEY (\"id\")"), "{out}");
+        assert!(add_primary_key("CREATE TABLE a (id INTEGER PRIMARY KEY)", "\"t\"", &["id".into()], &q).is_err());
     }
 }

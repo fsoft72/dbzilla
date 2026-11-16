@@ -98,15 +98,15 @@ pub fn show_columns(ui: &mut Ui, d: &mut StructDraft, env: &StructEnv) -> Vec<St
         .max_scroll_height(max_h)
         .cell_layout(Layout::left_to_right(Align::Center))
         .column(Column::exact(36.0))
+        .column(Column::exact(30.0))
         .column(Column::initial(180.0).at_least(80.0).clip(true))
         .column(Column::initial(200.0).at_least(100.0).clip(true))
         .column(Column::exact(56.0))
         .column(Column::initial(160.0).at_least(80.0).clip(true))
         .column(Column::exact(48.0))
-        .column(Column::initial(200.0).at_least(100.0))
-        .column(Column::remainder().at_least(40.0))
+        .column(Column::remainder().at_least(160.0))
         .header(30.0, |mut h| {
-            for t in ["#", "Name", "Type", "Null", "Default", "PK", "Foreign key", ""] {
+            for t in ["#", "", "Name", "Type", "Null", "Default", "PK", "Foreign key"] {
                 h.col(|ui| {
                     widgets::field_label(ui, t);
                 });
@@ -130,6 +130,13 @@ pub fn show_columns(ui: &mut Ui, d: &mut StructDraft, env: &StructEnv) -> Vec<St
                     muted(ui, &(i + 1).to_string());
                 });
                 row.col(|ui| {
+                    if enabled && widgets::ico_button(ui, Ico::Trash, "Delete the column").clicked() {
+                        delete = Some(i);
+                    } else if c.deleted && widgets::ico_button(ui, Ico::Discard, "Keep the column").clicked() {
+                        c.deleted = false;
+                    }
+                });
+                row.col(|ui| {
                     if let Some(t) = tint(c) {
                         ui.painter().rect_filled(ui.max_rect().expand2(egui::vec2(0.0, 1.0)), 0.0, t);
                     }
@@ -141,11 +148,7 @@ pub fn show_columns(ui: &mut Ui, d: &mut StructDraft, env: &StructEnv) -> Vec<St
                 });
                 row.col(|ui| cell_edit(ui, &mut c.default, enabled));
                 row.col(|ui| {
-                    if new_table {
-                        ui.checkbox(&mut c.pk, "");
-                    } else if c.pk {
-                        ui.label(RichText::new("PK").color(theme::TERTIARY).size(12.0));
-                    }
+                    ui.add_enabled(enabled, egui::Checkbox::without_text(&mut c.pk));
                 });
                 row.col(|ui| {
                     let can_fk = env.caps.add_fk_after_create || new_table;
@@ -163,13 +166,6 @@ pub fn show_columns(ui: &mut Ui, d: &mut StructDraft, env: &StructEnv) -> Vec<St
                                 }
                             });
                         }
-                    }
-                });
-                row.col(|ui| {
-                    if enabled && widgets::ico_button(ui, Ico::Trash, "Delete the column").clicked() {
-                        delete = Some(i);
-                    } else if c.deleted && widgets::ico_button(ui, Ico::Discard, "Keep the column").clicked() {
-                        c.deleted = false;
                     }
                 });
             });

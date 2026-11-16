@@ -128,8 +128,19 @@ impl StructDraft {
     pub fn has_changes(&self) -> bool {
         self.is_new
             || self.new_name != self.table.name
+            || self.pk_changed()
             || self.cols.iter().any(|c| c.orig.is_none() && !c.deleted || c.deleted && c.orig.is_some() || c.is_modified() || fk_changed(c))
             || self.indexes.iter().any(|i| i.orig.is_none() && !i.deleted || i.deleted && i.orig.is_some() || i.is_modified())
+    }
+
+    /// True when the ticked PK columns differ from the table's current primary key (order is ignored).
+    pub fn pk_changed(&self) -> bool {
+        if self.is_new {
+            return false;
+        }
+        let new: HashSet<String> = self.cols.iter().filter(|c| c.pk && !c.deleted).map(|c| c.orig.as_ref().map_or_else(|| c.name.trim().to_owned(), |o| o.name.clone())).collect();
+        let old: HashSet<String> = self.original.primary_key.iter().cloned().collect();
+        new != old
     }
 
     /// Primary key column names.
@@ -193,6 +204,13 @@ impl StructDraft {
         }
         let mut ops = Vec::new();
         let mut working = self.original.clone();
+        if self.pk_changed() {
+            if self.cols.iter().any(|c| c.orig.is_none() || c.deleted || c.is_modified()) {
+                return Err("Change the primary key separately: apply the other column changes first".into());
+            }
+            ops.push(StructuralOp::SetPrimaryKey { table: table.clone(), old: self.original.primary_key.clone(), new: self.pk_columns(), current: Some(Box::new(self.original.clone())) });
+            working.primary_key = self.pk_columns();
+        }
         for i in self.indexes.iter().filter(|i| i.orig.is_some() && (i.deleted || i.is_modified())) {
             let name = i.orig.as_ref().map(|o| o.name.clone()).unwrap_or_default();
             working.indexes.retain(|x| x.name != name);
@@ -284,6 +302,24 @@ mod tests {
 
     fn sql(d: &StructDraft, driver: DriverId) -> Vec<String> {
         d.to_ops(&Capabilities::for_driver(driver)).unwrap().iter().flat_map(|o| generate_ddl(o, dialect_for(driver).as_ref()).unwrap()).collect()
+    }
+
+    /// Ticking PK on an existing table adds the key, per dialect.
+    #[test]
+    fn set_primary_key_ops() {
+        let mut st = orders();
+        st.primary_key.clear();
+        st.columns[0].is_pk = false;
+        st.ddl = "CREATE TABLE orders (id integer, note text, cid integer)".into();
+        let mut d = StructDraft::from_structure(&st);
+        assert!(!d.has_changes());
+        d.cols[0].pk = true;
+        assert!(d.has_changes());
+        assert_eq!(sql(&d, DriverId::Postgres), vec!["ALTER TABLE \"orders\" ADD PRIMARY KEY (\"id\")"]);
+        assert_eq!(sql(&d, DriverId::MySql), vec!["ALTER TABLE `orders` ADD PRIMARY KEY (`id`)"]);
+        assert!(sql(&d, DriverId::Sqlite)[0].contains("PRIMARY KEY (\"id\")"));
+        d.cols[1].name = "memo".into();
+        assert!(d.to_ops(&Capabilities::for_driver(DriverId::Postgres)).is_err());
     }
 
     /// An untouched draft has no changes and no operations.
