@@ -10,3 +10,4 @@
 - Task 5: connection URLs, DDL generation (SQLite rebuild for alter column), copy formats and Copy Script As.
 - Task 6: driver traits and SQLite driver (streaming, cancel via interrupt, atomic batches, DB files list/create/rename/drop/switch).
 - Task 7: PostgreSQL driver (tokio-postgres + rustls, binary value decoding, side-connection cancel, notices) tested against a Docker postgres:16-alpine.
+- Task 7: PostgreSQL driver (tokio-postgres + rustls, binary value decoding, side-connection cancel, notices) tested against a Docker postgres:16-alpine.

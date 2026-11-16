@@ -14,7 +14,7 @@ use tokio::sync::OnceCell;
 const LABEL: &str = "dbzilla-test-pg";
 static SERVER: OnceCell<Option<Container>> = OnceCell::const_new();
 
-#[dtor::dtor]
+#[dtor::dtor(unsafe)]
 fn cleanup_container() {
     support::cleanup(LABEL);
 }
