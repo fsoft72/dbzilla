@@ -10,6 +10,9 @@ mod pg_value;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
+#[cfg(feature = "mysql")]
+pub mod mysql;
+
 pub use traits::*;
 
 use dbzilla_core::dialect::DriverId;
@@ -21,6 +24,8 @@ pub fn driver_for(id: DriverId) -> DriverResult<Box<dyn Driver>> {
         DriverId::Sqlite => Ok(Box::new(sqlite::SqliteDriver::new())),
         #[cfg(feature = "postgres")]
         DriverId::Postgres => Ok(Box::new(postgres::PostgresDriver::new())),
+        #[cfg(feature = "mysql")]
+        DriverId::MySql => Ok(Box::new(mysql::MySqlDriver::new())),
         #[allow(unreachable_patterns)]
         other => Err(DriverError::Unsupported(format!("driver {other:?} is not compiled into this build"))),
     }
