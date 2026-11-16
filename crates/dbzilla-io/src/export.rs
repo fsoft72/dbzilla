@@ -185,7 +185,7 @@ struct JsonRows {
 }
 
 /// JSON value of a cell.
-fn json_value(v: &Value) -> serde_json::Value {
+pub fn json_value(v: &Value) -> serde_json::Value {
     match v {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => (*b).into(),
