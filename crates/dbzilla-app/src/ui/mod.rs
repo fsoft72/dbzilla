@@ -2,8 +2,11 @@
 
 pub mod connform;
 pub mod connlist;
+pub mod grid;
 pub mod console;
+pub mod datatab;
 pub mod palette;
+pub mod quicklook;
 pub mod sidebar;
 pub mod settings;
 pub mod tabs;

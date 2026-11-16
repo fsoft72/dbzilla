@@ -1,6 +1,7 @@
 //! An open connection: session, sidebar, tabs, console and the workspace screen (SPEC 7).
 
 use super::console::{self, ConsoleLog};
+use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
 use super::sidebar::{self, SidebarAction, SidebarState, SidebarTab};
 use super::tabs::{decide_open, OpenDecision, OpenMode, TabId, TabMeta, TabTarget};
@@ -10,10 +11,12 @@ use crate::glyphs::Ico;
 use crate::keymap::{Action, KeyMap};
 use crate::theme;
 use dbzilla_core::caps::Capabilities;
-use dbzilla_core::dialect::DriverId;
+use dbzilla_core::copyfmt::CsvOptions;
+use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
+use dbzilla_core::filter::Filter;
 use dbzilla_core::model::{ObjectInfo, ObjectKind, TableRef, TableStructure};
 use dbzilla_drivers::DatabaseInfo;
-use dbzilla_session::{Command, Event, SessionHandle};
+use dbzilla_session::{Command, Event, PageRequest, RequestId, SessionHandle};
 use dbzilla_store::connections::StoredConnection;
 use dbzilla_store::settings::Settings;
 use dbzilla_store::tags::TagStore;
@@ -30,11 +33,19 @@ pub enum WsStatus {
     Disconnected(String),
 }
 
-/// Content of a table tab (the data grid arrives with the data tab).
+/// Content of a table tab.
 pub struct TableTab {
     pub table: TableRef,
     pub structure: Option<TableStructure>,
     pub error: Option<String>,
+    pub data: DataState,
+}
+
+/// What a request of a tab is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReqKind {
+    Page,
+    Count,
 }
 
 /// What a tab holds.
@@ -107,12 +118,16 @@ pub struct Workspace {
     pub left_open: bool,
     pub right_open: bool,
     pub palette: Option<PaletteState>,
+    pub dialect: Box<dyn Dialect>,
+    pub page_size: u64,
+    req_map: HashMap<RequestId, (TabId, ReqKind)>,
 }
 
 impl Workspace {
     /// Creates the workspace of a connection whose session is already connecting.
-    pub fn new(conn: StoredConnection, session: SessionHandle, console_entries: usize) -> Self {
+    pub fn new(conn: StoredConnection, session: SessionHandle, console_entries: usize, page_size: u64) -> Self {
         let caps = Capabilities::for_driver(conn.driver);
+        let conn_driver = conn.driver;
         Self {
             current_db: if conn.driver == DriverId::Sqlite { "main".into() } else { conn.database.clone() },
             conn,
@@ -132,6 +147,9 @@ impl Workspace {
             left_open: true,
             right_open: false,
             palette: None,
+            dialect: dialect_for(conn_driver),
+            page_size,
+            req_map: HashMap::new(),
         }
     }
 
@@ -158,6 +176,11 @@ impl Workspace {
                 self.objects = objects;
             }
             Event::Structure(st) => self.apply_structure(*st),
+            Event::RowBatch { req, columns, rows, .. } => self.on_rows(req, columns, rows),
+            Event::QueryDone { req, summary, .. } => self.on_page_done(req, summary.elapsed),
+            Event::QueryError { req, error, .. } => self.on_page_error(req, error),
+            Event::Count { req, count } => self.on_total(req, Total::Exact(count)),
+            Event::Estimate { req, count } => self.on_total(req, count.map_or(Total::Unknown, Total::Estimated)),
             Event::Console { ts_ms, sql } => self.console.push(ts_ms, sql),
             Event::Error { error } => {
                 self.console.push(0, format!("-- error: {error}"));
@@ -174,6 +197,110 @@ impl Workspace {
         }
         let schema = if self.caps.schemas { Some(self.current_schema.clone().unwrap_or_else(|| "public".into())) } else { None };
         self.session.send(Command::LoadSchema { db: self.current_db.clone(), schema });
+    }
+
+    /// Table tab with the given id.
+    fn table_tab_mut(&mut self, id: TabId) -> Option<&mut TableTab> {
+        self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).map(|t| {
+            let TabKind::Table(tt) = &mut t.kind;
+            tt
+        })
+    }
+
+    /// Rows of a page arrived.
+    fn on_rows(&mut self, req: RequestId, columns: Option<Vec<dbzilla_core::model::ColumnMeta>>, rows: Vec<dbzilla_core::model::Row>) {
+        let Some((id, ReqKind::Page)) = self.req_map.get(&req).copied() else { return };
+        if let Some(t) = self.table_tab_mut(id) {
+            if let Some(cols) = columns {
+                t.data.columns = cols;
+                t.data.rows.clear();
+                t.data.grid.selection.clear();
+            }
+            t.data.rows.extend(rows);
+        }
+    }
+
+    /// A page finished loading.
+    fn on_page_done(&mut self, req: RequestId, elapsed: std::time::Duration) {
+        let Some((id, ReqKind::Page)) = self.req_map.remove(&req) else { return };
+        let Some(t) = self.table_tab_mut(id) else { return };
+        t.data.loading = false;
+        t.data.elapsed = Some(elapsed);
+        if t.data.total == Total::Unknown {
+            self.request_total(id);
+        }
+    }
+
+    /// A page failed.
+    fn on_page_error(&mut self, req: RequestId, error: String) {
+        let Some((id, _)) = self.req_map.remove(&req) else { return };
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.loading = false;
+            t.data.error = Some(error);
+        }
+    }
+
+    /// A count or estimate arrived.
+    fn on_total(&mut self, req: RequestId, total: Total) {
+        let Some((id, _)) = self.req_map.remove(&req) else { return };
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.total = total;
+        }
+    }
+
+    /// Asks for the size of the table: exact when it is cheap or known, an estimate otherwise.
+    fn request_total(&mut self, id: TabId) {
+        let estimated = self.caps.estimated_count;
+        let Some(t) = self.table_tab_mut(id) else { return };
+        let (table, loaded, offset, limit, has_filters) = (t.table.clone(), t.data.rows.len() as u64, t.data.offset, t.data.limit, t.data.filters.iter().any(|f| f.enabled));
+        if loaded < limit {
+            t.data.total = Total::Exact(offset + loaded);
+            return;
+        }
+        let req = RequestId::next();
+        t.data.count_req = Some(req);
+        if estimated && !has_filters {
+            self.req_map.insert(req, (id, ReqKind::Count));
+            self.session.send(Command::EstimateCount { req, table });
+        } else {
+            self.count_exact(id);
+        }
+    }
+
+    /// Runs `SELECT COUNT(*)` for a tab.
+    pub fn count_exact(&mut self, id: TabId) {
+        let table = self.tab_table(id);
+        let columns = self.structures.get(&table).map(|s| s.columns.clone()).unwrap_or_default();
+        let Some(t) = self.table_tab_mut(id) else { return };
+        let req = RequestId::next();
+        t.data.total = Total::Counting;
+        t.data.count_req = Some(req);
+        let (table, filters, or) = (t.table.clone(), t.data.filters.clone(), t.data.filters_or);
+        self.req_map.insert(req, (id, ReqKind::Count));
+        self.session.send(Command::CountExact { req, table, columns, filters, filters_or: or });
+    }
+
+    /// Table shown by a tab.
+    fn tab_table(&mut self, id: TabId) -> TableRef {
+        self.table_tab_mut(id).map(|t| t.table.clone()).unwrap_or_default()
+    }
+
+    /// Loads (or reloads) the page of a tab.
+    pub fn fetch_tab(&mut self, id: TabId) {
+        let table = self.tab_table(id);
+        let columns = self.structures.get(&table).map(|s| s.columns.clone()).unwrap_or_default();
+        let Some(t) = self.table_tab_mut(id) else { return };
+        if let Some(old) = t.data.fetch_req.take() {
+            self.req_map.remove(&old);
+        }
+        let Some(t) = self.table_tab_mut(id) else { return };
+        let req = RequestId::next();
+        t.data.fetch_req = Some(req);
+        t.data.loading = true;
+        t.data.error = None;
+        let page = PageRequest { req, table: t.table.clone(), columns, filters: t.data.filters.clone(), filters_or: t.data.filters_or, sort: t.data.sort.clone(), limit: t.data.limit, offset: t.data.offset };
+        self.req_map.insert(req, (id, ReqKind::Page));
+        self.session.send(Command::FetchPage(Box::new(page)));
     }
 
     /// Stores a structure and hands it to the tabs showing that table.
@@ -212,14 +339,22 @@ impl Workspace {
 
     /// Opens a table or view following the preview-tab rules.
     pub fn open_table(&mut self, table: TableRef, mode: OpenMode) {
+        self.open_table_with(table, mode, Vec::new());
+    }
+
+    /// Opens a table with initial filters (used when following a foreign key).
+    pub fn open_table_with(&mut self, table: TableRef, mode: OpenMode, filters: Vec<Filter>) {
         let metas = self.tab_metas();
         let focused = self.focused_tab();
         let decision = decide_open(&metas, focused, &TabTarget::Table(table.clone()), mode);
         let new_tab = |ws: &mut Workspace, pinned: bool| {
             let id = ws.next_tab_id;
             ws.next_tab_id += 1;
-            Tab { id, pinned, kind: TabKind::Table(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None }) }
+            let mut data = DataState::new(ws.page_size);
+            data.filters = filters.clone();
+            Tab { id, pinned, kind: TabKind::Table(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data }) }
         };
+        let mut touched: Option<TabId> = None;
         match decision {
             OpenDecision::Focus(id) => {
                 if let Some(loc) = self.tab_location(id) {
@@ -228,17 +363,31 @@ impl Workspace {
                 if mode == OpenMode::Pin {
                     self.set_pinned(id, true);
                 }
+                if !filters.is_empty() {
+                    if let Some(t) = self.table_tab_mut(id) {
+                        t.data.filters = filters.clone();
+                        t.data.offset = 0;
+                        t.data.total = Total::Unknown;
+                    }
+                    touched = Some(id);
+                }
             }
             OpenDecision::Replace(id) => {
                 let fresh = new_tab(self, mode == OpenMode::Pin);
+                let new_id = fresh.id;
                 if let Some((_, slot)) = self.dock.iter_all_tabs_mut().find(|(_, t)| t.id == id) {
                     *slot = fresh;
                 }
+                touched = Some(new_id);
             }
             OpenDecision::New => {
                 let fresh = new_tab(self, mode != OpenMode::Preview);
+                touched = Some(fresh.id);
                 self.dock.push_to_focused_leaf(fresh);
             }
+        }
+        if let Some(id) = touched {
+            self.fetch_tab(id);
         }
         if !self.structures.contains_key(&table) {
             self.session.send(Command::LoadStructure(table));
@@ -337,6 +486,11 @@ impl Workspace {
             });
         }
         let mut requests = Vec::new();
+        let mut data_actions: Vec<(TabId, DataAction)> = Vec::new();
+        self.page_size = env.settings.page_size;
+        let csv = CsvOptions { delimiter: env.settings.csv.delimiter, quote: env.settings.csv.quote, quote_always: env.settings.csv.quote_always, line_break: env.settings.csv.line_break.clone(), decimal: env.settings.csv.decimal, null_as_empty: false };
+        let row_height = (env.settings.table_row_padding + 12.0).clamp(20.0, 60.0);
+        let alternating = env.settings.alternating_rows;
         egui::CentralPanel::default().frame(Frame::new().fill(theme::DEEP_DARK)).show(ctx, |ui| {
             if self.dock.iter_all_tabs().next().is_none() {
                 ui.add_space(60.0);
@@ -363,7 +517,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -375,6 +529,14 @@ impl Workspace {
                     let pinned = self.dock.iter_all_tabs().find(|(_, t)| t.id == id).is_some_and(|(_, t)| t.pinned);
                     self.set_pinned(id, !pinned);
                 }
+            }
+        }
+        for (id, a) in data_actions {
+            match a {
+                DataAction::Refetch => self.fetch_tab(id),
+                DataAction::CountExact => self.count_exact(id),
+                DataAction::FollowFk { table, column, value } => self.open_table_with(table, OpenMode::NewTab, vec![datatab::fk_filter(&column, &value)]),
+                DataAction::Toast(m) => env.toasts.ok(m),
             }
         }
         match sidebar_action {
@@ -488,6 +650,12 @@ impl Workspace {
 /// Draws the content of tabs and collects their requests.
 struct Viewer<'a> {
     requests: &'a mut Vec<TabRequest>,
+    data_actions: &'a mut Vec<(TabId, DataAction)>,
+    dialect: &'a dyn Dialect,
+    csv: &'a CsvOptions,
+    alternating: bool,
+    row_height: f32,
+    structures: &'a HashMap<TableRef, TableStructure>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -499,24 +667,13 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        let id = tab.id;
         let TabKind::Table(t) = &mut tab.kind;
-        egui::Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
-            widgets::heading(ui, &t.table.name);
-            match (&t.structure, &t.error) {
-                (_, Some(e)) => {
-                    ui.label(RichText::new(e).color(theme::ERROR));
-                }
-                (Some(st), _) => {
-                    widgets::muted(ui, &format!("{} columns", st.columns.len()));
-                    for c in &st.columns {
-                        ui.label(RichText::new(format!("{}  {}", c.name, c.type_name)).monospace().color(theme::TEXT));
-                    }
-                }
-                (None, None) => {
-                    ui.spinner();
-                }
-            }
-        });
+        let table = t.table.clone();
+        let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table) };
+        for a in datatab::show(ui, &mut t.data, &env) {
+            self.data_actions.push((id, a));
+        }
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
