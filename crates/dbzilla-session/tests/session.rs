@@ -8,7 +8,7 @@ use dbzilla_core::paging::SortKey;
 use dbzilla_core::value::Value;
 use dbzilla_drivers::*;
 use dbzilla_session::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ fn make_db() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-fn sqlite_cfg(path: &PathBuf) -> ConnectConfig {
+fn sqlite_cfg(path: &Path) -> ConnectConfig {
     ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: path.to_string_lossy().into_owned(), ssl: SslMode::Disabled, bootstrap: vec![] }
 }
 
@@ -34,7 +34,7 @@ fn start(cfg: SessionConfig) -> (SessionHandle, Arc<AtomicUsize>) {
     (h, repaints)
 }
 
-async fn connect(h: &mut SessionHandle, path: &PathBuf) {
+async fn connect(h: &mut SessionHandle, path: &Path) {
     h.send(Command::Connect(sqlite_cfg(path)));
     let ev = until(h, |e| matches!(e, Event::Connected { .. } | Event::ConnectFailed { .. })).await;
     assert!(matches!(ev.last(), Some(Event::Connected { .. })), "{ev:?}");
