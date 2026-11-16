@@ -109,10 +109,20 @@ impl MyConn {
             Err(e) => return Err(DriverError::Connect(connect_message(&e))),
         };
         let mut me = Self { conn, cfg: cfg.clone(), ssl };
+        me.drop_no_backslash_escapes().await?;
         for stmt in &cfg.bootstrap {
             me.conn.query_drop(stmt).await.map_err(|e| DriverError::Connect(format!("bootstrap command failed: {}", match map_err(e) { DriverError::Query(m) => m, other => other.to_string() })))?;
         }
         Ok(me)
+    }
+
+    /// Quoting and statement splitting assume backslash escapes, so a session running with
+    /// `NO_BACKSLASH_ESCAPES` would store `C:\\tmp` wrongly and misread string literals: switch it off for this session.
+    async fn drop_no_backslash_escapes(&mut self) -> DriverResult<()> {
+        let mode: Option<String> = self.conn.query_first("SELECT @@SESSION.sql_mode").await.map_err(map_err)?;
+        let Some(mode) = mode.filter(|m| m.contains("NO_BACKSLASH_ESCAPES")) else { return Ok(()) };
+        let kept: Vec<&str> = mode.split(',').filter(|m| !m.is_empty() && *m != "NO_BACKSLASH_ESCAPES").collect();
+        self.conn.query_drop(format!("SET SESSION sql_mode = '{}'", kept.join(","))).await.map_err(map_err)
     }
 
     /// Runs a query returning rows as plain strings (introspection helper).

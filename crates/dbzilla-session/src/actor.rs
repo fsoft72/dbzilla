@@ -416,7 +416,7 @@ async fn commit_checked(conn: &mut dyn Conn, driver: Option<DriverId>, statement
                 return Err(format!("statement {} failed: {}", i + 1, e.to_string().trim_start_matches("statement 1 failed: ")));
             }
         };
-        let first = sql.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let first = sql.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
         let is_row_statement = first == "UPDATE" || first == "DELETE";
         let problem = match outcome {
             n if is_row_statement && n > 1 => Some(format!("it affected {n} rows, the key columns do not identify a single row")),

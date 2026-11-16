@@ -361,6 +361,23 @@ impl Out {
     }
 }
 
+/// The path itself when free, otherwise `name-1.ext`, `name-2.ext`, ... so nothing is overwritten.
+fn free_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (stem, ext) = match file.find('.') {
+        Some(i) => (file[..i].to_owned(), file[i..].to_owned()),
+        None => (file, String::new()),
+    };
+    (1..)
+        .map(|n| dir.join(format!("{stem}-{n}{ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(path)
+}
+
 /// Opens an output file, gzip-wrapped when asked.
 fn create_out(path: &Path, gzip: bool) -> Result<Out, IoError> {
     let f = BufWriter::new(File::create(path)?);
@@ -406,7 +423,7 @@ pub async fn run_export(conn: &mut dyn Conn, driver: DriverId, sources: &[Export
             return Err(IoError::Cancelled);
         }
         let name = src.name();
-        let path = opts.dir.join(format!("{}.{}", render_name(&opts.name_pattern, &name, ctx), opts.format.extension()));
+        let path = free_path(opts.dir.join(format!("{}.{}", render_name(&opts.name_pattern, &name, ctx), opts.format.extension())));
         let sql = select_sql(d.as_ref(), src);
         let mut writer: Box<dyn RowWriter> = match opts.format {
             ExportFormat::Csv => {
@@ -454,7 +471,7 @@ async fn export_sql(conn: &mut dyn Conn, driver: DriverId, sources: &[ExportSour
     let d = dialect_for(driver);
     let base = if sources.len() == 1 { sources[0].name() } else { "export".to_owned() };
     let ext = if opts.gzip { "sql.gz" } else { "sql" };
-    let path = opts.dir.join(format!("{}.{ext}", render_name(&opts.name_pattern, &base, ctx)));
+    let path = free_path(opts.dir.join(format!("{}.{ext}", render_name(&opts.name_pattern, &base, ctx))));
     let mut out = create_out(&path, opts.gzip)?;
     let result = async {
         writeln!(out, "-- DBZilla SQL export {} {}", ctx.date, ctx.time)?;

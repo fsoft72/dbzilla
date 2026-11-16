@@ -219,3 +219,21 @@ async fn bad_values_are_reported_with_their_position() {
     assert!(text.contains("row 2") && text.contains("qty") && text.contains("abc"), "{text}");
     assert_eq!(rows(&mut c, "SELECT count(*) FROM t").await[0][0], Value::I64(0));
 }
+
+/// Review M9: an export never overwrites an existing file, it picks a free name.
+#[tokio::test]
+async fn export_never_overwrites_existing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = new_db(dir.path(), "a.sqlite3", SETUP);
+    std::fs::write(dir.path().join("people.csv"), "precious").unwrap();
+    let files = export(&db, dir.path(), &opts(ExportFormat::Csv, dir.path()), &[table("people")]).await;
+    assert_eq!(std::fs::read_to_string(dir.path().join("people.csv")).unwrap(), "precious");
+    assert!(files[0].ends_with("people-1.csv"), "{files:?}");
+    let again = export(&db, dir.path(), &opts(ExportFormat::Csv, dir.path()), &[table("people")]).await;
+    assert!(again[0].ends_with("people-2.csv"), "{again:?}");
+    let mut o = opts(ExportFormat::Sql, dir.path());
+    o.gzip = true;
+    std::fs::write(dir.path().join("people.sql.gz"), "x").unwrap();
+    let sql = export(&db, dir.path(), &o, &[table("people")]).await;
+    assert!(sql[0].ends_with("people-1.sql.gz"), "{sql:?}");
+}

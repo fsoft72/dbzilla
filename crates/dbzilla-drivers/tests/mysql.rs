@@ -271,3 +271,29 @@ async fn tls_required_works_with_tls_and_fails_without() {
     config.ssl = SslMode::Preferred;
     assert!(driver.connect(&config).await.is_ok(), "PREFERRED falls back to plain");
 }
+
+/// Review M1: a server running with NO_BACKSLASH_ESCAPES does not break backslash handling in our session.
+#[tokio::test]
+async fn no_backslash_escapes_is_switched_off_for_the_session() {
+    let srv = require!(mysql8());
+    let driver = driver_for(DriverId::MySql).unwrap();
+    let mut admin = driver.connect(&cfg(srv.port, "")).await.unwrap();
+    admin.execute_batch(&["SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES')".into()], false).await.unwrap();
+    let result = async {
+        let mut c = driver.connect(&cfg(srv.port, "")).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<dbzilla_drivers::RowBatch>(4);
+        let reader = tokio::spawn(async move {
+            let mut rows = Vec::new();
+            while let Some(b) = rx.recv().await {
+                rows.extend(b.rows);
+            }
+            rows
+        });
+        c.query_stream("SELECT @@SESSION.sql_mode LIKE '%NO_BACKSLASH_ESCAPES%', CHAR_LENGTH('a\\\\b')", dbzilla_drivers::QueryOpts::default(), tx).await.unwrap();
+        reader.await.unwrap()
+    }
+    .await;
+    admin.execute_batch(&["SET GLOBAL sql_mode = REPLACE(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES', '')".into()], false).await.unwrap();
+    assert_eq!(result[0][0], dbzilla_core::value::Value::I64(0), "the mode is off for our session");
+    assert_eq!(result[0][1], dbzilla_core::value::Value::I64(3), "'a\\\\b' is a, one backslash, b");
+}
