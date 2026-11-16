@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "dbzilla-core",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "insta",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-drivers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-io"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "csv",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-session"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "dbzilla-core",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "dbzilla-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dbzilla-core",
  "directories",
