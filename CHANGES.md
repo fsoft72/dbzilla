@@ -32,3 +32,4 @@
 - CSV: a quoted value is text, so the text "NULL" survives export and import next to a real NULL (own tokenizer and writer).
 - Data safety: SQLite column changes rewrite the original CREATE TABLE (UNIQUE, CHECK, COLLATE, AUTOINCREMENT, table constraints, partial and expression indexes, triggers kept; refused only for foreign-key parents, generated columns and renames other definitions use); SQLite database rename moves -wal/-shm with it and rolls back on failure; MySQL MODIFY/CHANGE keeps AUTO_INCREMENT, ON UPDATE, collation and comment (checked on MySQL 8.4 and MariaDB 11.8).
 - UI: the "Key columns" dialog scrolls when a table has many columns, so its buttons stay on screen.
+- UI: the inline cell editor no longer draws over the old cell text.

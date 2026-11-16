@@ -365,7 +365,9 @@ fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: us
         ui.painter().rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0_f32, theme::SECONDARY), StrokeKind::Inside);
     }
     let view = input.rows.get(r).and_then(|row| row.get(c)).map(display_cell);
-    if let Some(v) = &view {
+    let editing_here = st.editing.as_ref().is_some_and(|e| e.row == r && e.col == c);
+    // The cell text is not painted while the inline editor covers it, or the two overlap.
+    if let Some(v) = view.as_ref().filter(|_| !editing_here) {
         let painter = ui.painter().with_clip_rect(rect);
         let (font, color) = match v.style {
             CellStyle::Null => (FontId::new(13.0, egui::FontFamily::Proportional), theme::MUTED.gamma_multiply(0.7)),
