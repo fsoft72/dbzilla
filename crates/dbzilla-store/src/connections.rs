@@ -86,6 +86,15 @@ impl StoredConnection {
         c
     }
 
+    /// Display name of the driver.
+    pub fn driver_name(&self) -> &'static str {
+        match self.driver {
+            DriverId::Sqlite => "SQLite",
+            DriverId::Postgres => "PostgreSQL",
+            DriverId::MySql => "MySQL",
+        }
+    }
+
     /// Converts to a URL spec with the given password (fetched from the keychain by the caller).
     pub fn to_spec(&self, password: Option<String>) -> ConnectionSpec {
         let mut s = ConnectionSpec::new(self.driver);

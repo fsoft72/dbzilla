@@ -8,4 +8,16 @@ name = "dbzilla"
 path = "src/main.rs"
 
 [dependencies]
+dbzilla-core = { version = "0.1.0", path = "../dbzilla-core" }
+dbzilla-drivers = { version = "0.1.0", path = "../dbzilla-drivers" }
+dbzilla-session = { version = "0.1.0", path = "../dbzilla-session" }
+dbzilla-store = { version = "0.1.0", path = "../dbzilla-store" }
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+egui_dock = "0.16"
+egui_extras = "0.31"
+rfd = "0.18.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
+[dev-dependencies]
+egui_kittest = "0.31"
+tempfile = "3.27.0"

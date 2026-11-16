@@ -1,7 +1,14 @@
 //! DBZilla entry point: native database client.
 
+// The widget kit and glyph set are complete before every screen uses them; trimmed in the polish task.
+#![allow(dead_code)]
+
 mod app;
+mod cli;
+mod glyphs;
+mod keymap;
 mod theme;
+mod ui;
 
 use eframe::egui;
 
@@ -16,11 +23,13 @@ const MIN_SIZE: [f32; 2] = [900.0, 560.0];
 
 /// Starts the eframe event loop.
 fn main() -> eframe::Result<()> {
-    let viewport = egui::ViewportBuilder::default()
-        .with_app_id(APP_ID)
-        .with_title(APP_TITLE)
-        .with_inner_size(INITIAL_SIZE)
-        .with_min_inner_size(MIN_SIZE);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = cli::parse_args(&args);
+    if cli.help {
+        println!("{}", cli::HELP);
+        return Ok(());
+    }
+    let viewport = egui::ViewportBuilder::default().with_app_id(APP_ID).with_title(APP_TITLE).with_inner_size(INITIAL_SIZE).with_min_inner_size(MIN_SIZE);
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native(APP_TITLE, options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native(APP_TITLE, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cli)))))
 }
