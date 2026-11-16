@@ -10,6 +10,8 @@ mod fuzzy;
 mod glyphs;
 mod keymap;
 mod sqlhl;
+#[cfg(test)]
+mod testsupport;
 mod sqltext;
 mod theme;
 mod ui;

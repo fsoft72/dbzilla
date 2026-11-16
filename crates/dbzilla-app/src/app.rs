@@ -482,6 +482,8 @@ impl App {
 
     /// The workspace screen of an open connection.
     fn workspace_section(&mut self, ctx: &egui::Context, i: usize) {
+        let ctx = ctx.clone();
+        let ctx = &ctx;
         let Some(ws) = self.workspaces.get_mut(i) else { return };
         let mut env = WsEnv { settings: &self.settings, keymap: &self.keymap, tags: &self.tags, toasts: &mut self.toasts };
         let outputs = ws.show(ctx, &mut env);
@@ -494,6 +496,34 @@ impl App {
                 WsOutput::Run(Action::Settings) => self.section = Section::Settings,
                 WsOutput::Run(Action::OpenConnection) => self.section = Section::Connections,
                 WsOutput::Run(_) => {}
+                WsOutput::OpenDatabase(db) => {
+                    let ws = &self.workspaces[i];
+                    let mut conn = ws.conn.clone();
+                    conn.id = uuid_like(&conn.id, &db);
+                    if conn.driver == DriverId::Sqlite {
+                        conn.database = std::path::Path::new(&conn.database).with_file_name(&db).to_string_lossy().into_owned();
+                        conn.name = db.clone();
+                    } else {
+                        conn.database = db.clone();
+                        conn.name = format!("{} / {db}", ws.conn.name);
+                    }
+                    let password = ws.password.clone();
+                    self.open_workspace(ctx, conn, password);
+                }
+                WsOutput::SetSafeLevel(level) => {
+                    let id = self.workspaces[i].conn.id.clone();
+                    if let Some(c) = self.store.get(&id).cloned() {
+                        let mut c = c;
+                        c.safe_level = level;
+                        self.store.upsert(c);
+                        self.save_connections();
+                    }
+                }
+                WsOutput::EditConnection => {
+                    let id = self.workspaces[i].conn.id.clone();
+                    self.section = Section::Connections;
+                    self.edit_connection(&id);
+                }
             }
         }
     }
@@ -608,6 +638,12 @@ impl App {
             }
         }
     }
+}
+
+/// Id of the transient connection of another database (keeps the history of the original apart).
+fn uuid_like(base: &str, db: &str) -> String {
+    let safe: String = db.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    format!("{base}_{safe}")
 }
 
 /// Runs a shell command and returns its trimmed stdout.

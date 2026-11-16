@@ -25,6 +25,7 @@ use dbzilla_core::ddl::{generate_ddl, StructuralOp};
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::rowlimit::apply_row_limit;
+use dbzilla_core::safemode::SafeLevel;
 use dbzilla_core::model::{ObjectInfo, ObjectKind, TableRef, TableStructure};
 use dbzilla_drivers::DatabaseInfo;
 use dbzilla_session::gate::{gate_check, verify_password, GateDecision};
@@ -120,6 +121,27 @@ enum OpDialog {
     Drop { table: TableRef, cascade: bool },
 }
 
+/// Database picker and its operations (SPEC 11.1).
+struct DbPicker {
+    query: String,
+    selected: Option<String>,
+}
+
+/// Dialogs of database operations.
+enum DbDialog {
+    New { name: String, encoding: String, collation: String },
+    Rename { from: String, to: String },
+    Drop { name: String, typed: String },
+}
+
+/// Asks for the password before the safe mode level changes.
+struct LevelDialog {
+    level: dbzilla_core::safemode::SafeLevel,
+    input: String,
+    reveal: bool,
+    error: Option<String>,
+}
+
 /// Dialog creating a foreign key.
 struct FkDialog {
     tab: TabId,
@@ -161,6 +183,7 @@ enum ReqKind {
 enum GateAction {
     Commit,
     Ddl(DdlAfter),
+    DbOp(dbzilla_session::DbOp),
     Run { labels: Vec<Option<String>>, originals: Vec<String> },
 }
 
@@ -224,6 +247,12 @@ enum TabRequest {
 pub enum WsOutput {
     Close,
     Run(Action),
+    /// Open another database of this connection in a new workspace.
+    OpenDatabase(String),
+    /// The safe mode level of the connection changed (to be saved).
+    SetSafeLevel(dbzilla_core::safemode::SafeLevel),
+    /// Edit the connection in the connection list.
+    EditConnection,
 }
 
 /// Application data the workspace screen reads.
@@ -260,6 +289,7 @@ pub struct Workspace {
     /// Password of the connection, used to unlock the safe modes.
     pub password: Option<String>,
     pub keywords: HashSet<String>,
+    pub schema_loaded: bool,
     history: HistoryStore,
     queries: QueryStore,
     history_cache: Vec<HistoryEntry>,
@@ -274,6 +304,11 @@ pub struct Workspace {
     commit_log: HashMap<RequestId, (Vec<String>, Option<String>)>,
     ddl_after: HashMap<RequestId, DdlAfter>,
     search: Option<SearchState>,
+    db_picker: Option<DbPicker>,
+    db_dialog: Option<DbDialog>,
+    level_dialog: Option<LevelDialog>,
+    timeout_req: Option<RequestId>,
+    outputs: Vec<WsOutput>,
     op_dialog: Option<OpDialog>,
     fk_dialog: Option<FkDialog>,
     triggers_for: Option<TabId>,
@@ -323,6 +358,7 @@ impl Workspace {
             req_map: HashMap::new(),
             password,
             keywords: sqlhl::keyword_set(dialect_for(conn_driver).keywords()),
+            schema_loaded: false,
             history: stores.history,
             queries: stores.queries,
             history_cache: Vec::new(),
@@ -337,6 +373,11 @@ impl Workspace {
             commit_log: HashMap::new(),
             ddl_after: HashMap::new(),
             search: None,
+            db_picker: None,
+            db_dialog: None,
+            level_dialog: None,
+            timeout_req: None,
+            outputs: Vec::new(),
             op_dialog: None,
             fk_dialog: None,
             triggers_for: None,
@@ -370,11 +411,15 @@ impl Workspace {
             Event::Connected { server_version } => {
                 self.status = WsStatus::Connected(server_version);
                 self.load_schema();
+                if self.conn.driver != DriverId::Sqlite && self.current_db.is_empty() {
+                    self.db_picker = Some(DbPicker { query: String::new(), selected: None });
+                }
             }
             Event::ConnectFailed { error } => self.status = WsStatus::Failed(error),
             Event::Disconnected { reason } => self.status = WsStatus::Disconnected(reason),
             Event::Databases(d) => self.databases = d,
             Event::Schema { schema, schemas, objects, .. } => {
+                self.schema_loaded = true;
                 self.current_schema = schema;
                 self.schemas = schemas;
                 self.objects = objects;
@@ -394,7 +439,19 @@ impl Workspace {
                 _ => self.on_page_error(req, error),
             },
             Event::RunFinished { req } => self.on_run_finished(req),
-            Event::Timeout { .. } => self.notices.push((true, "The server is taking too long to respond".into())),
+            Event::Timeout { req } => self.timeout_req = Some(req),
+            Event::DbOpDone { what } => {
+                self.notices.push((false, format!("Done: {what}")));
+                self.session.send(Command::LoadDatabases);
+            }
+            Event::DbOpFailed { what, error } => self.notices.push((true, format!("Could not {what}: {error}"))),
+            Event::DatabaseChanged(db) => {
+                self.current_db = db;
+                self.objects.clear();
+                self.structures.clear();
+                self.retain_tabs(|_| false);
+                self.load_schema();
+            }
             Event::Count { req, count } => self.on_total(req, Total::Exact(count)),
             Event::Estimate { req, count } => self.on_total(req, count.map_or(Total::Unknown, Total::Estimated)),
             Event::CommitDone { req, counts } => self.on_commit_done(req, counts.len()),
@@ -403,7 +460,6 @@ impl Workspace {
             Event::Error { error } => {
                 self.console.push(0, format!("-- error: {error}"));
             }
-            _ => {}
         }
     }
 
@@ -723,6 +779,7 @@ impl Workspace {
                     s.find = if s.find.is_some() { None } else { Some(sqltab::FindState { focus: true, ..Default::default() }) };
                 }
             }
+            Action::OpenDatabase => self.db_picker = Some(DbPicker { query: String::new(), selected: None }),
             Action::SearchInDatabase => {
                 let tables: Vec<TableRef> = self.objects.iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::View)).map(|o| o.table.clone()).collect();
                 self.search = Some(SearchState::new(&tables));
@@ -1300,6 +1357,252 @@ impl Workspace {
         self.fetch_tab(id);
     }
 
+    /// SQL text of a database operation, used for the safe-mode gate and the history.
+    fn dbop_sql(&self, op: &dbzilla_session::DbOp) -> String {
+        let d = dialect_for(self.conn.driver);
+        match op {
+            dbzilla_session::DbOp::Create(n) => format!("CREATE DATABASE {}", d.quote_ident(&n.name)),
+            dbzilla_session::DbOp::Rename { from, to } => format!("ALTER DATABASE {} RENAME TO {}", d.quote_ident(from), d.quote_ident(to)),
+            dbzilla_session::DbOp::Drop(n) => format!("DROP DATABASE {}", d.quote_ident(n)),
+        }
+    }
+
+    /// Runs a database operation through the safe-mode gate.
+    fn submit_dbop(&mut self, op: dbzilla_session::DbOp) {
+        let statements = vec![self.dbop_sql(&op)];
+        match gate_check(self.conn.safe_level, self.conn.driver, &statements) {
+            GateDecision::Allow => self.session.send(Command::DbOp(op)),
+            GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::DbOp(op), statements: t, needs_password: false, input: String::new(), reveal: false, tab: 0, error: None }),
+            GateDecision::Password(t) => {
+                let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                self.gate = Some(GateModal { action: GateAction::DbOp(op), statements: t, needs_password: known, input: String::new(), reveal: false, tab: 0, error: None });
+            }
+        }
+    }
+
+    /// Changes the safe mode level, asking for the password when leaving a protected level.
+    fn request_safe_level(&mut self, level: dbzilla_core::safemode::SafeLevel) {
+        
+        if level == self.conn.safe_level {
+            return;
+        }
+        let protected = matches!(self.conn.safe_level, SafeLevel::Safe1 | SafeLevel::Safe2);
+        if protected && self.password.as_deref().is_some_and(|p| !p.is_empty()) {
+            self.level_dialog = Some(LevelDialog { level, input: String::new(), reveal: false, error: None });
+        } else {
+            self.conn.safe_level = level;
+            self.outputs.push(WsOutput::SetSafeLevel(level));
+        }
+    }
+
+    /// Database picker, database operation dialogs, safe level and timeout dialogs.
+    fn database_dialogs(&mut self, ctx: &egui::Context) {
+        let caps = self.caps.clone();
+        let driver = self.conn.driver;
+        if let Some(p) = self.db_picker.as_mut() {
+            let mut action: Option<(String, u8)> = None;
+            let mut close = false;
+            let mut new_clicked = false;
+            let current = self.current_db.clone();
+            let names: Vec<String> = self.databases.iter().map(|d| d.name.clone()).collect();
+            widgets::modal(ctx, "Open a database", |ui| {
+                ui.set_min_width(420.0);
+                widgets::search_box(ui, &mut p.query, "Search databases");
+                let q = p.query.to_lowercase();
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for n in names.iter().filter(|n| q.is_empty() || n.to_lowercase().contains(&q)) {
+                        let selected = p.selected.as_deref() == Some(n.as_str());
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+                        if selected || resp.hovered() {
+                            ui.painter().rect_filled(rect, theme::RADIUS_CTRL, if selected { theme::INPUT_FILL_BLUE } else { theme::FIELD_ROW_BG });
+                        }
+                        let label = if *n == current { format!("{n}   (open)") } else { n.clone() };
+                        ui.painter().text(rect.left_center() + egui::vec2(10.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::new(13.5, egui::FontFamily::Proportional), theme::TEXT);
+                        if resp.clicked() {
+                            p.selected = Some(n.clone());
+                        }
+                        if resp.double_clicked() {
+                            action = Some((n.clone(), 0));
+                        }
+                        resp.context_menu(|ui| {
+                            widgets::flat_menu_style(ui);
+                            for (label, code) in [("Open in a new workspace", 0u8), ("Open in the current workspace", 1), ("Rename...", 2), ("Drop...", 3)] {
+                                let enabled = match code {
+                                    2 => caps.rename_db && *n != current,
+                                    3 => caps.drop_db && *n != current,
+                                    _ => true,
+                                };
+                                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                    action = Some((n.clone(), code));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let sel = p.selected.clone();
+                    ui.add_enabled_ui(sel.is_some(), |ui| {
+                        if widgets::primary_button(ui, "Open").clicked() {
+                            action = sel.clone().map(|n| (n, 0));
+                        }
+                    });
+                    ui.add_enabled_ui(caps.create_db, |ui| {
+                        if widgets::secondary_button(ui, "New...").clicked() {
+                            new_clicked = true;
+                        }
+                    });
+                    if widgets::secondary_button(ui, "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.db_picker = None;
+            }
+            if new_clicked {
+                self.db_dialog = Some(DbDialog::New { name: String::new(), encoding: String::new(), collation: String::new() });
+            }
+            if let Some((name, code)) = action {
+                match code {
+                    0 => {
+                        self.db_picker = None;
+                        self.outputs.push(WsOutput::OpenDatabase(name));
+                    }
+                    1 => {
+                        self.db_picker = None;
+                        self.session.send(Command::UseDatabase(name));
+                    }
+                    2 => self.db_dialog = Some(DbDialog::Rename { to: name.clone(), from: name }),
+                    _ => self.db_dialog = Some(DbDialog::Drop { name, typed: String::new() }),
+                }
+            }
+        }
+        if let Some(dlg) = self.db_dialog.as_mut() {
+            let mut decision = None;
+            let title = match dlg {
+                DbDialog::New { .. } => "New database",
+                DbDialog::Rename { .. } => "Rename database",
+                DbDialog::Drop { .. } => "Drop database",
+            };
+            widgets::modal(ctx, title, |ui| {
+                match dlg {
+                    DbDialog::New { name, encoding, collation } => {
+                        widgets::field_label(ui, "Name");
+                        widgets::input(ui, name, "database name");
+                        if caps.encoding_collation_on_create_db {
+                            widgets::field_label(ui, "Encoding");
+                            widgets::input(ui, encoding, "utf8mb4 (optional)");
+                            widgets::field_label(ui, "Collation");
+                            widgets::input(ui, collation, "optional");
+                        } else if driver == DriverId::Postgres {
+                            widgets::field_label(ui, "Encoding");
+                            widgets::input(ui, encoding, "UTF8 (optional)");
+                        }
+                    }
+                    DbDialog::Rename { from, to } => {
+                        widgets::muted(ui, &format!("Rename {from} to:"));
+                        widgets::input(ui, to, "new name");
+                    }
+                    DbDialog::Drop { name, typed } => {
+                        ui.label(format!("Dropping {name} deletes all of its data. Type its name to confirm."));
+                        widgets::input(ui, typed, name);
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let (label, destructive, enabled) = match dlg {
+                        DbDialog::New { name, .. } => ("Create", false, !name.trim().is_empty()),
+                        DbDialog::Rename { to, from } => ("Rename", false, !to.trim().is_empty() && to != from),
+                        DbDialog::Drop { name, typed } => ("Drop", true, typed == name),
+                    };
+                    ui.add_enabled_ui(enabled, |ui| {
+                        let clicked = if destructive { widgets::danger_button(ui, label).clicked() } else { widgets::primary_button(ui, label).clicked() };
+                        if clicked {
+                            decision = Some(true);
+                        }
+                    });
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    if let Some(dlg) = self.db_dialog.take() {
+                        let op = match dlg {
+                            DbDialog::New { name, encoding, collation } => dbzilla_session::DbOp::Create(dbzilla_drivers::NewDatabase { name: name.trim().to_owned(), encoding: Some(encoding.trim().to_owned()).filter(|e| !e.is_empty()), collation: Some(collation.trim().to_owned()).filter(|c| !c.is_empty()) }),
+                            DbDialog::Rename { from, to } => dbzilla_session::DbOp::Rename { from, to: to.trim().to_owned() },
+                            DbDialog::Drop { name, .. } => dbzilla_session::DbOp::Drop(name),
+                        };
+                        self.submit_dbop(op);
+                    }
+                }
+                Some(false) => self.db_dialog = None,
+                None => {}
+            }
+        }
+        if let Some(l) = self.level_dialog.as_mut() {
+            let mut decision = None;
+            widgets::modal(ctx, "Enter the password to change the safe mode", |ui| {
+                widgets::secret_input(ui, &mut l.input, &mut l.reveal);
+                if let Some(e) = &l.error {
+                    ui.colored_label(theme::ERROR, e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Change").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    let ok = self.password.as_deref().is_some_and(|p| verify_password(p, &l.input));
+                    if ok {
+                        let level = l.level;
+                        self.level_dialog = None;
+                        self.conn.safe_level = level;
+                        self.outputs.push(WsOutput::SetSafeLevel(level));
+                    } else {
+                        l.error = Some("The password is not correct".into());
+                    }
+                }
+                Some(false) => self.level_dialog = None,
+                None => {}
+            }
+        }
+        if let Some(req) = self.timeout_req {
+            let mut decision = None;
+            widgets::modal(ctx, "The server is taking too long to respond", |ui| {
+                ui.label("The running statement has not finished yet. You can keep waiting or cancel it and reconnect.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Wait").clicked() {
+                        decision = Some(false);
+                    }
+                    if widgets::danger_button(ui, "Reconnect").clicked() {
+                        decision = Some(true);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    self.timeout_req = None;
+                    self.session.send(Command::Cancel(req));
+                    self.status = WsStatus::Connecting;
+                    self.session.send(Command::Reconnect);
+                }
+                Some(false) => self.timeout_req = None,
+                None => {}
+            }
+        }
+    }
+
     /// Moves the search on: next table, or finish.
     fn search_step(&mut self) {
         let Some(sr) = self.search.as_mut() else { return };
@@ -1692,6 +1995,7 @@ impl Workspace {
     /// Preview, safe-mode and key-column dialogs.
     fn modals(&mut self, ctx: &egui::Context) {
         self.table_dialogs(ctx);
+        self.database_dialogs(ctx);
         if let Some(d) = self.save_dialog.as_mut() {
             let mut decision = None;
             widgets::modal(ctx, "Add to Queries", |ui| {
@@ -1804,6 +2108,7 @@ impl Workspace {
                             match g.action {
                                 GateAction::Commit => self.send_commit(g.tab, g.statements),
                                 GateAction::Ddl(after) => self.send_ddl(g.statements, after),
+                                GateAction::DbOp(op) => self.session.send(Command::DbOp(op)),
                                 GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
                             }
                         }
@@ -2031,7 +2336,23 @@ impl Workspace {
                     }
                 });
                 ui.add_space(6.0);
-                widgets::ico_button(ui, Ico::Shield, &format!("Safe mode: {}", super::connform::safe_label(self.conn.safe_level)));
+                let shield = widgets::ico_button(ui, Ico::Shield, &format!("Safe mode: {}", super::connform::safe_label(self.conn.safe_level)));
+                let level_popup = ui.make_persistent_id("safe_level_menu");
+                if shield.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(level_popup));
+                }
+                egui::popup_below_widget(ui, level_popup, &shield, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    ui.set_min_width(180.0);
+                    widgets::flat_menu_style(ui);
+                    for l in [SafeLevel::Silent, SafeLevel::Alert1, SafeLevel::Alert2, SafeLevel::Safe1, SafeLevel::Safe2] {
+                        if ui.selectable_label(self.conn.safe_level == l, super::connform::safe_label(l)).clicked() {
+                            self.request_safe_level(l);
+                        }
+                    }
+                });
+                if widgets::ico_button(ui, Ico::Database, &tip("Open a database", Action::OpenDatabase)).clicked() {
+                    self.db_picker = Some(DbPicker { query: String::new(), selected: None });
+                }
                 if widgets::ico_button(ui, Ico::File, &tip("New SQL editor", Action::NewSqlEditor)).clicked() {
                     self.open_sql(String::new());
                 }
@@ -2078,7 +2399,26 @@ impl Workspace {
                 if let Some(t) = &self.conn.tag {
                     ui.label(RichText::new(t.to_uppercase()).font(egui::FontId::new(11.0, theme::semibold())).color(tint));
                 }
-                ui.label(RichText::new(state).size(12.0).color(theme::MUTED));
+                let info = ui.add(egui::Label::new(RichText::new(state).size(12.0).color(theme::MUTED)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let popup = ui.make_persistent_id("status_popover");
+                if info.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(popup));
+                }
+                egui::popup_above_or_below_widget(ui, popup, &info, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    ui.set_min_width(200.0);
+                    widgets::flat_menu_style(ui);
+                    ui.label(RichText::new(format!("{} on {}", self.conn.user, if self.conn.host.is_empty() { "this computer" } else { &self.conn.host })).size(12.0).color(theme::MUTED));
+                    ui.separator();
+                    if ui.button("Edit connection").clicked() {
+                        self.outputs.push(WsOutput::EditConnection);
+                    }
+                    if ui.button("Reconnect").clicked() {
+                        self.reconnect();
+                    }
+                    if ui.button("Disconnect").clicked() {
+                        self.session.send(Command::Disconnect);
+                    }
+                });
                 if matches!(self.status, WsStatus::Failed(_) | WsStatus::Disconnected(_)) && ui.small_button("Reconnect").clicked() {
                     self.reconnect();
                 }
@@ -2652,6 +2992,209 @@ mod tests {
         let loc = ws.dock.iter_all_tabs().last().map(|(l, _)| l).expect("the result tab");
         ws.dock.set_focused_node_and_surface(loc);
         wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| t.table.name == "u" && !t.data.loading && t.data.rows.len() == 1));
+    }
+
+    /// Database operations go through the session and the list refreshes.
+    #[test]
+    fn database_operations_through_the_workspace() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.submit_dbop(dbzilla_session::DbOp::Create(dbzilla_drivers::NewDatabase { name: "other".into(), encoding: None, collation: None }));
+        wait(&mut ws, |w| w.databases.iter().any(|d| d.name == "other.sqlite3"));
+        ws.submit_dbop(dbzilla_session::DbOp::Drop("other.sqlite3".into()));
+        wait(&mut ws, |w| !w.databases.iter().any(|d| d.name == "other.sqlite3"));
+        ws.submit_dbop(dbzilla_session::DbOp::Drop("w.sqlite3".into()));
+        wait(&mut ws, |w| w.notices.iter().any(|(err, m)| *err && m.contains("currently open")));
+    }
+
+    /// Safe mode: dropping a database waits for confirmation; the level can only leave Safe mode with the password.
+    #[test]
+    fn safe_mode_for_databases_and_level_changes() {
+        use dbzilla_core::safemode::SafeLevel;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.conn.safe_level = SafeLevel::Alert1;
+        ws.submit_dbop(dbzilla_session::DbOp::Drop("w.sqlite3".into()));
+        assert!(ws.gate.as_ref().is_some_and(|g| g.statements[0].starts_with("DROP DATABASE")), "the drop waits for confirmation");
+        ws.gate = None;
+        ws.conn.safe_level = SafeLevel::Silent;
+        ws.request_safe_level(SafeLevel::Alert2);
+        assert_eq!(ws.conn.safe_level, SafeLevel::Alert2);
+        assert!(matches!(ws.outputs.last(), Some(WsOutput::SetSafeLevel(SafeLevel::Alert2))));
+        ws.password = Some("secret".into());
+        ws.conn.safe_level = SafeLevel::Safe1;
+        ws.request_safe_level(SafeLevel::Silent);
+        assert_eq!(ws.conn.safe_level, SafeLevel::Safe1, "leaving Safe mode needs the password");
+        assert!(ws.level_dialog.is_some());
+    }
+
+    /// A timeout event raises the dialog instead of failing the query.
+    #[test]
+    fn timeout_event_opens_the_wait_or_reconnect_dialog() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        let req = RequestId::next();
+        ws.apply(Event::Timeout { req });
+        assert_eq!(ws.timeout_req, Some(req));
+    }
+
+    // ---- real PostgreSQL and MySQL servers (skipped without Docker) ----
+
+    /// Opens a workspace on a remote server.
+    fn remote(rt: &tokio::runtime::Runtime, cfg: ConnectConfig) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = StoredConnection::new("remote", cfg.driver);
+        conn.host = cfg.host.clone();
+        conn.port = cfg.port;
+        conn.user = cfg.user.clone();
+        conn.database = cfg.database.clone();
+        let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
+        session.send(Command::Connect(cfg));
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), queries: QueryStore::new(dir.path().join("queries")) };
+        let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
+        wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && w.schema_loaded);
+        (dir, ws)
+    }
+
+    /// Runs statements on the server outside the workspace.
+    fn server_exec(rt: &tokio::runtime::Runtime, cfg: &ConnectConfig, stmts: &[&str]) {
+        rt.block_on(async {
+            let mut c = dbzilla_drivers::driver_for(cfg.driver).unwrap().connect(cfg).await.unwrap();
+            c.execute_batch(&stmts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), false).await.unwrap();
+        });
+    }
+
+    /// First column of the first row of a query.
+    fn server_scalar(rt: &tokio::runtime::Runtime, cfg: &ConnectConfig, sql: &str) -> Value {
+        rt.block_on(async {
+            let mut c = dbzilla_drivers::driver_for(cfg.driver).unwrap().connect(cfg).await.unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<dbzilla_drivers::RowBatch>(8);
+            let reader = tokio::spawn(async move {
+                let mut rows = Vec::new();
+                while let Some(b) = rx.recv().await {
+                    rows.extend(b.rows);
+                }
+                rows
+            });
+            c.query_stream(sql, dbzilla_drivers::QueryOpts::default(), tx).await.unwrap();
+            reader.await.unwrap().first().and_then(|r| r.first().cloned()).unwrap_or(Value::Null)
+        })
+    }
+
+    /// Waits until the server answers.
+    fn wait_for_server(rt: &tokio::runtime::Runtime, cfg: &ConnectConfig) {
+        rt.block_on(async {
+            for _ in 0..240 {
+                if let Ok(mut c) = dbzilla_drivers::driver_for(cfg.driver).unwrap().connect(cfg).await {
+                    if c.ping().await.is_ok() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            panic!("the database server did not become ready");
+        });
+    }
+
+    /// Edit, filter, add a column and insert on a table of a real server.
+    fn exercise_server(rt: &tokio::runtime::Runtime, cfg: ConnectConfig, create: &[&str], table: &str, name_filter: dbzilla_core::filter::FilterOp, quote: char) {
+        server_exec(rt, &cfg, create);
+        let (_dir, mut ws) = remote(rt, cfg.clone());
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == table));
+        let target = ws.objects.iter().find(|o| o.table.name == table).map(|o| o.table.clone()).unwrap();
+        ws.open_table(target.clone(), OpenMode::Pin);
+        let loc = ws.dock.iter_all_tabs().next().map(|(l, _)| l).unwrap();
+        ws.dock.set_focused_node_and_surface(loc);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 3 && !t.data.key_cols.is_empty()));
+        // edit a cell and commit
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.data.pending.edit_cell(&mut t.data.rows, 0, 1, CellValue::Value(Value::Text("ALPHA2".into())));
+        ws.commit_active();
+        wait(&mut ws, |w| !w.has_pending() && w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && !t.data.committing));
+        assert_eq!(server_scalar(rt, &cfg, &format!("SELECT name FROM {q}{table}{q} WHERE id = 1", q = quote)), Value::Text("ALPHA2".into()));
+        // case insensitive filter
+        let id = ws.active_tab_mut().unwrap().0;
+        let f = Filter { enabled: true, column: dbzilla_core::filter::FilterColumn::Column("name".into()), op: name_filter, value: "beta".into() };
+        ws.apply_filters(id, vec![f], false);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 1));
+        ws.apply_filters(id, vec![], false);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 3));
+        // insert a row with generated key
+        let (_, t) = ws.active_tab_mut().unwrap();
+        let cols = super::datatab::merge_columns(&t.data.columns, t.structure.as_ref());
+        let r = t.data.pending.insert_row(&mut t.data.rows, &cols);
+        t.data.pending.edit_cell(&mut t.data.rows, r, 1, CellValue::Value(Value::Text("delta".into())));
+        ws.commit_active();
+        wait(&mut ws, |w| !w.has_pending() && w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && !t.data.committing && t.data.rows.len() == 4));
+        // add a column through the structure editor
+        {
+            let (_, t) = ws.active_tab_mut().unwrap();
+            t.view = TabView::Structure;
+        }
+        wait(&mut ws, structure_ready);
+        {
+            let (_, t) = ws.active_tab_mut().unwrap();
+            let mut c = super::super::structdraft::ColDraft::blank("integer");
+            c.name = "extra".into();
+            c.default = "5".into();
+            t.draft.as_mut().unwrap().cols.push(c);
+        }
+        ws.commit_active();
+        wait(&mut ws, |w| structure_ready(w) && w.active_tab_mut().is_some_and(|(_, t)| t.structure.as_ref().is_some_and(|s| s.columns.iter().any(|c| c.name == "extra"))));
+        assert_eq!(server_scalar(rt, &cfg, &format!("SELECT extra FROM {q}{table}{q} WHERE id = 1", q = quote)), Value::I64(5));
+    }
+
+    /// End to end on a real PostgreSQL server.
+    #[test]
+    fn postgres_edit_filter_insert_and_structure() {
+        const LABEL: &str = "dbzilla-test-app-pg";
+        let Some(c) = crate::testsupport::start(LABEL, "postgres:16-alpine", &[("POSTGRES_PASSWORD", "pw")], 5432) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cfg = ConnectConfig { driver: DriverId::Postgres, host: "127.0.0.1".into(), port: Some(c.port), user: "postgres".into(), password: Some("pw".into()), database: "postgres".into(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        wait_for_server(&rt, &cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_server(
+                &rt,
+                cfg.clone(),
+                &["CREATE TABLE items (id serial PRIMARY KEY, name text NOT NULL, qty int DEFAULT 0)", "INSERT INTO items (name, qty) VALUES ('alpha', 1), ('Beta', 2), ('gamma', 3)"],
+                "items",
+                dbzilla_core::filter::FilterOp::IContains,
+                '"',
+            );
+        }));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// End to end on a real MySQL server.
+    #[test]
+    fn mysql_edit_filter_insert_and_structure() {
+        const LABEL: &str = "dbzilla-test-app-mysql";
+        let Some(c) = crate::testsupport::start(LABEL, "mysql:8.4", &[("MYSQL_ROOT_PASSWORD", "pw"), ("MYSQL_DATABASE", "shop")], 3306) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cfg = ConnectConfig { driver: DriverId::MySql, host: "127.0.0.1".into(), port: Some(c.port), user: "root".into(), password: Some("pw".into()), database: "shop".into(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        wait_for_server(&rt, &cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_server(
+                &rt,
+                cfg.clone(),
+                &["CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(40) NOT NULL, qty INT DEFAULT 0) ENGINE=InnoDB", "INSERT INTO items (name, qty) VALUES ('alpha', 1), ('Beta', 2), ('gamma', 3)"],
+                "items",
+                dbzilla_core::filter::FilterOp::Contains,
+                '`',
+            );
+        }));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }
 

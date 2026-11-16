@@ -1060,6 +1060,7 @@ dependencies = [
  "dbzilla-drivers",
  "dbzilla-session",
  "dbzilla-store",
+ "dtor",
  "eframe",
  "egui_dock",
  "egui_extras",
