@@ -47,6 +47,7 @@ pub enum ResView {
 pub struct ResultTab {
     pub index: usize,
     pub title: String,
+    #[allow(dead_code)] // kept for the re-run and export of a single result
     pub sql: String,
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Row>,
@@ -204,10 +205,6 @@ impl SqlTab {
         self.set_selection(range);
     }
 
-    /// Result by statement index.
-    pub fn result_mut(&mut self, index: usize) -> Option<&mut ResultTab> {
-        self.results.iter_mut().find(|r| r.index == index)
-    }
 }
 
 /// Inputs of a frame.

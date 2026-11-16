@@ -210,6 +210,7 @@ pub enum GridEvent {
     CopyColumn(usize),
     EditCommit { row: usize, col: usize, text: String },
     SetValue { row: usize, col: usize, value: CellValue },
+    #[allow(dead_code)] // the grid context menu has no insert entry yet
     InsertRow,
     DuplicateRows,
     DeleteRows,

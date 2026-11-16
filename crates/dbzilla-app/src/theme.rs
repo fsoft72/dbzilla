@@ -1,8 +1,6 @@
 //! "Obsidian" design system: near-black neutral surfaces, one electric-blue
 //! accent, sharp corners (3-6 px) and IBM Plex typography.
 
-// Design tokens are consumed incrementally by later screens.
-#![allow(dead_code)]
 
 use eframe::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Stroke};
 use std::sync::Arc;
@@ -144,6 +142,7 @@ pub fn parse_hex_color(s: &str) -> Option<Color32> {
 }
 
 /// Opaque colour as "RRGGBB".
+#[cfg(test)]
 pub fn to_hex(c: Color32) -> String {
     format!("{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
 }

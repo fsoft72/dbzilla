@@ -130,11 +130,6 @@ impl Pending {
         self.meta.get(r).is_some_and(|m| m.edits.contains_key(&c))
     }
 
-    /// Number of changed rows.
-    pub fn count(&self) -> usize {
-        self.meta.iter().filter(|m| m.state != RowState::Clean).count()
-    }
-
     /// Saves the current state for undo.
     fn snapshot(&mut self, rows: &[Row]) {
         self.undo.push((rows.to_vec(), self.meta.clone()));

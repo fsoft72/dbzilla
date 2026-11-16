@@ -12,8 +12,6 @@ use std::time::Duration;
 pub const ICON_BUTTON: f32 = 28.0;
 /// Size of rail tiles.
 pub const RAIL_TILE: f32 = 44.0;
-/// Height of full-width buttons.
-pub const WIDE_BUTTON_HEIGHT: f32 = 40.0;
 /// Text input inner margin.
 const INPUT_MARGIN: Margin = Margin { left: 8, right: 8, top: 9, bottom: 9 };
 /// Text size of buttons.
@@ -89,12 +87,6 @@ fn kit_button(ui: &mut Ui, text: &str, look: ButtonLook, min: Option<Vec2>) -> R
 /// The main action of a screen (solid accent).
 pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
     kit_button(ui, text, ButtonLook { idle: theme::PRIMARY, hover: theme::PRIMARY_HOVER, active: theme::PRIMARY_ACTIVE, stroke: Stroke::NONE, text: theme::ON_ACCENT }, None)
-}
-
-/// Primary button stretched to the available width with the full-width height.
-pub fn wide_primary_button(ui: &mut Ui, text: &str) -> Response {
-    let min = egui::vec2(ui.available_width(), WIDE_BUTTON_HEIGHT);
-    kit_button(ui, text, ButtonLook { idle: theme::PRIMARY, hover: theme::PRIMARY_HOVER, active: theme::PRIMARY_ACTIVE, stroke: Stroke::NONE, text: theme::ON_ACCENT }, Some(min))
 }
 
 /// Outlined destructive button.

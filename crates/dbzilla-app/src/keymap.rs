@@ -181,6 +181,7 @@ impl KeyMap {
         self.shortcut(a).map(|s| format_shortcut(&s)).unwrap_or_default()
     }
 
+    #[allow(dead_code)] // reserved for the deferred keymap editor
     /// Rebinds an action; refuses a shortcut that another action already uses in the same context.
     pub fn rebind(&mut self, a: Action, s: KeyboardShortcut) -> Result<(), String> {
         if let Some(other) = self.conflict(a, &s) {
@@ -190,6 +191,7 @@ impl KeyMap {
         Ok(())
     }
 
+    #[allow(dead_code)] // reserved for the deferred keymap editor
     /// Another action using `s` in an overlapping context, if any.
     pub fn conflict(&self, a: Action, s: &KeyboardShortcut) -> Option<Action> {
         self.map.iter().find(|(other, sc)| **other != a && *sc == s && context(**other) == context(a)).map(|(o, _)| *o)
@@ -204,6 +206,7 @@ impl KeyMap {
     }
 }
 
+#[allow(dead_code)] // used by the conflict check of the deferred keymap editor
 /// Shortcut context: bindings in different contexts may share keys.
 fn context(a: Action) -> u8 {
     match a {

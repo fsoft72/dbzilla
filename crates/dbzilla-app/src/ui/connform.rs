@@ -156,6 +156,7 @@ impl ConnForm {
     }
 
     /// True when something changed since the form was opened or last saved.
+    #[cfg(test)]
     pub fn is_dirty(&self) -> bool {
         self.fingerprint() != self.original
     }

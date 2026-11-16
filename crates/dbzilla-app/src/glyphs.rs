@@ -11,6 +11,7 @@ const CURVE_SEGMENTS: usize = 20;
 
 /// All icons of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // the painter icon set is kept whole, some icons are not used by a screen yet
 pub enum Ico {
     Search,
     Close,

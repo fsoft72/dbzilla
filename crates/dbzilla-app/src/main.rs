@@ -1,7 +1,6 @@
 //! DBZilla entry point: native database client.
 
 // The widget kit and glyph set are complete before every screen uses them; trimmed in the polish task.
-#![allow(dead_code)]
 
 mod app;
 mod autocomplete;

@@ -14,6 +14,7 @@ const PREFIX_BONUS: i32 = 10;
 pub enum Strategy {
     #[default]
     Fuzzy,
+    #[allow(dead_code)] // selectable once the search settings expose it
     Contains,
 }
 

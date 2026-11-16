@@ -62,6 +62,7 @@ pub enum ListAction {
     CopyUrl(String),
     Delete(String),
     ToggleGroup(String),
+    #[allow(dead_code)] // the group menu arrives with group management
     DeleteGroup(String),
 }
 
