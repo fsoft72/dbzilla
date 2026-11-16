@@ -29,6 +29,21 @@ pub trait Dialect: Send + Sync {
     /// Keywords for highlight, completion and formatting.
     fn keywords(&self) -> &'static [&'static str];
 
+    /// Casts an SQL expression to text.
+    fn cast_text(&self, expr: &str) -> String;
+    /// Operand used by text matching operators (PostgreSQL needs an explicit cast).
+    fn text_operand(&self, expr: &str) -> String {
+        expr.to_owned()
+    }
+    /// Statement inserting a row made only of column defaults.
+    fn insert_defaults(&self, quoted_table: &str) -> String {
+        format!("INSERT INTO {quoted_table} DEFAULT VALUES")
+    }
+    /// True when `SET col = DEFAULT` is valid.
+    fn supports_default_keyword(&self) -> bool {
+        true
+    }
+
     /// Quotes a table reference, skipping missing parts.
     fn quote_table(&self, t: &TableRef) -> String {
         let mut parts = Vec::new();
@@ -144,6 +159,12 @@ impl Dialect for SqliteDialect {
     fn literal(&self, v: &Value) -> String {
         literal_common(v, false, |b| if b { "1" } else { "0" }, |b| format!("X'{}'", hex(b)))
     }
+    fn cast_text(&self, expr: &str) -> String {
+        format!("CAST({expr} AS TEXT)")
+    }
+    fn supports_default_keyword(&self) -> bool {
+        false
+    }
     fn types(&self) -> &'static [&'static str] {
         &["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC", "BOOLEAN", "DATE", "DATETIME", "VARCHAR", "JSON"]
     }
@@ -164,6 +185,12 @@ impl Dialect for PostgresDialect {
     }
     fn literal(&self, v: &Value) -> String {
         literal_common(v, false, |b| if b { "TRUE" } else { "FALSE" }, |b| format!("'\\x{}'", hex(b)))
+    }
+    fn cast_text(&self, expr: &str) -> String {
+        format!("CAST({expr} AS text)")
+    }
+    fn text_operand(&self, expr: &str) -> String {
+        self.cast_text(expr)
     }
     fn types(&self) -> &'static [&'static str] {
         &[
@@ -189,6 +216,12 @@ impl Dialect for MySqlDialect {
     }
     fn literal(&self, v: &Value) -> String {
         literal_common(v, true, |b| if b { "TRUE" } else { "FALSE" }, |b| format!("X'{}'", hex(b)))
+    }
+    fn cast_text(&self, expr: &str) -> String {
+        format!("CAST({expr} AS CHAR)")
+    }
+    fn insert_defaults(&self, quoted_table: &str) -> String {
+        format!("INSERT INTO {quoted_table} () VALUES ()")
     }
     fn types(&self) -> &'static [&'static str] {
         &[
