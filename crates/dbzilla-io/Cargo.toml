@@ -4,3 +4,18 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", features = ["clock"] }
+csv = "1.4.0"
+dbzilla-core = { version = "0.1.0", path = "../dbzilla-core" }
+dbzilla-drivers = { version = "0.1.0", path = "../dbzilla-drivers" }
+encoding_rs = "0.8.44"
+flate2 = "1.1.11"
+rust_xlsxwriter = "0.102.0"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "sync", "macros", "time"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["full"] }
