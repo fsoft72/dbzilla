@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+/// A connection opened through MCP, locked per connection so one slow query blocks only its own.
+type SharedConn = Arc<tokio::sync::Mutex<Box<dyn Conn>>>;
+
 /// Longest a client query may run, in seconds (SPEC 16).
 pub const QUERY_TIMEOUT_SECS: u64 = 300;
 /// How long the user has to answer an approval request, in seconds.
@@ -38,7 +41,7 @@ pub struct Shared {
 pub struct AppBackend {
     pub shared: Arc<Shared>,
     resolver: PasswordResolver,
-    conns: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Box<dyn Conn>>>>>,
+    conns: tokio::sync::Mutex<HashMap<String, SharedConn>>,
     approvals: Mutex<Sender<PendingApproval>>,
     activity_file: PathBuf,
     repaint: Arc<dyn Fn() + Send + Sync>,
