@@ -2,7 +2,7 @@
 # Usage: scripts/release.sh VERSION [-y]
 # Releases VERSION (e.g. 0.1.1): bumps the workspace version, commits, tags vVERSION and pushes
 # the branch and the tag. The tag push triggers .github/workflows/release.yml, which builds the
-# Linux, macOS and Windows binaries and attaches them to the GitHub release.
+# Linux and Windows binaries and attaches them to the GitHub release.
 # -y skips the confirmation prompt.
 set -euo pipefail
 

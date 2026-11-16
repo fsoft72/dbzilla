@@ -40,3 +40,4 @@
 - Release 0.1.1.
 - Release workflow: macOS jobs now run on macos-15 (macos-14 arm64 config was rejected and macos-13 was retired); the x86_64 binary is cross-compiled.
 - Release 0.1.2.
+- Release workflow: removed the macOS targets (CI kept failing); only Linux and Windows binaries are built.
