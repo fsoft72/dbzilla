@@ -1,8 +1,10 @@
 //! The data grid: virtualised table with selection, sorting and Quick Look entry points (SPEC 8.3).
 
+use super::pending::{Pending, RowState};
 use super::widgets;
 use crate::glyphs::{self, Ico};
 use crate::theme;
+use dbzilla_core::changes::CellValue;
 use dbzilla_core::copyfmt::CopyFormat;
 use dbzilla_core::model::{ColumnMeta, Row};
 use dbzilla_core::paging::SortKey;
@@ -158,9 +160,19 @@ impl Selection {
     }
 }
 
+/// A cell being edited inline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Editing {
+    pub row: usize,
+    pub col: usize,
+    pub text: String,
+    pub fresh: bool,
+}
+
 /// Grid state kept by the owner (one per tab).
 #[derive(Default)]
 pub struct GridState {
+    pub editing: Option<Editing>,
     pub selection: Selection,
     pub hidden: BTreeSet<usize>,
     /// True after a click inside the grid: keyboard navigation is active.
@@ -171,6 +183,11 @@ pub struct GridState {
 
 /// Read-only inputs of a frame.
 pub struct GridInput<'a> {
+    pub pending: &'a Pending,
+    /// False when the data cannot be edited (views).
+    pub editable: bool,
+    /// True when loaded rows cannot be updated or deleted because no key is known.
+    pub key_missing: bool,
     pub columns: &'a [ColumnMeta],
     pub rows: &'a [Row],
     pub sort: &'a [SortKey],
@@ -190,6 +207,11 @@ pub enum GridEvent {
     FollowFk { row: usize, col: usize },
     Copy { format: CopyFormat, cells_only: bool },
     CopyColumn(usize),
+    EditCommit { row: usize, col: usize, text: String },
+    SetValue { row: usize, col: usize, value: CellValue },
+    InsertRow,
+    DuplicateRows,
+    DeleteRows,
 }
 
 /// Initial width of a column from its name.
@@ -202,7 +224,7 @@ pub fn show(ui: &mut Ui, st: &mut GridState, input: &GridInput) -> Vec<GridEvent
     let mut events = Vec::new();
     let visible: Vec<usize> = (0..input.columns.len()).filter(|c| !st.hidden.contains(c)).collect();
     let n_rows = input.rows.len();
-    handle_keys(ui, st, n_rows, visible.len(), &mut events);
+    handle_keys(ui, st, input, n_rows, input.columns.len(), &mut events);
     let mut table = TableBuilder::new(ui)
         .id_salt(input.id)
         .striped(false)
@@ -226,7 +248,7 @@ pub fn show(ui: &mut Ui, st: &mut GridState, input: &GridInput) -> Vec<GridEvent
         .body(|body| {
             body.rows(input.row_height, n_rows, |mut row| {
                 let r = row.index();
-                row.col(|ui| gutter_cell(ui, st, r, input.alternating));
+                row.col(|ui| gutter_cell(ui, st, r, input));
                 for (vc, &c) in visible.iter().enumerate() {
                     row.col(|ui| data_cell(ui, st, input, r, c, vc, &mut events));
                 }
@@ -280,10 +302,19 @@ fn header_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, c: usize, eve
 }
 
 /// The row number gutter; clicking selects the row.
-fn gutter_cell(ui: &mut Ui, st: &mut GridState, r: usize, alternating: bool) {
+fn gutter_cell(ui: &mut Ui, st: &mut GridState, r: usize, input: &GridInput) {
+    let alternating = input.alternating;
     let (rect, resp) = ui.allocate_exact_size(ui.available_size_before_wrap(), Sense::click());
     let selected = st.selection.rows.contains(&r);
-    let fill = if selected { theme::INPUT_FILL_BLUE } else if alternating && r % 2 == 1 { theme::NAVY_DARK } else { theme::INPUT_FILL };
+    let fill = if selected {
+        theme::INPUT_FILL_BLUE
+    } else if let Some(tint) = state_tint(input.pending.state(r)) {
+        tint
+    } else if alternating && r % 2 == 1 {
+        theme::NAVY_DARK
+    } else {
+        theme::INPUT_FILL
+    };
     ui.painter().rect_filled(rect, 0.0, fill);
     ui.painter().text(rect.right_center() - egui::vec2(8.0, 0.0), Align2::RIGHT_CENTER, (r + 1).to_string(), FontId::new(11.5, egui::FontFamily::Proportional), if selected { theme::SECONDARY } else { theme::MUTED });
     if resp.clicked() {
@@ -295,12 +326,30 @@ fn gutter_cell(ui: &mut Ui, st: &mut GridState, r: usize, alternating: bool) {
     }
 }
 
+/// True when the row may be edited or deleted.
+fn can_edit_row(input: &GridInput, r: usize) -> bool {
+    input.editable && (!input.key_missing || input.pending.state(r) == RowState::New) && input.pending.state(r) != RowState::Deleted
+}
+
+/// Background tint of a changed row.
+fn state_tint(state: RowState) -> Option<egui::Color32> {
+    match state {
+        RowState::Clean => None,
+        RowState::New => Some(theme::OK.gamma_multiply(0.14)),
+        RowState::Modified => Some(theme::TERTIARY.gamma_multiply(0.12)),
+        RowState::Deleted => Some(theme::ERROR.gamma_multiply(0.16)),
+    }
+}
+
 /// One data cell with selection, drag and context menu.
 fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: usize, vc: usize, events: &mut Vec<GridEvent>) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size_before_wrap(), Sense::click_and_drag());
     let selected = st.selection.contains(r, c);
+    let row_state = input.pending.state(r);
     let fill = if selected {
         theme::PRIMARY.gamma_multiply(0.30)
+    } else if let Some(tint) = state_tint(row_state) {
+        tint
     } else if input.alternating && r % 2 == 1 {
         theme::FIELD_ROW_BG.gamma_multiply(0.55)
     } else {
@@ -320,7 +369,30 @@ fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: us
         };
         let reserve = if input.columns[c].fk.is_some() { 24.0 } else { 8.0 };
         let (pos, align) = if v.right_aligned { (rect.right_center() - egui::vec2(reserve, 0.0), Align2::RIGHT_CENTER) } else { (rect.left_center() + egui::vec2(8.0, 0.0), Align2::LEFT_CENTER) };
-        painter.text(pos, align, &v.text, font, color);
+        let text_rect = painter.text(pos, align, &v.text, font, color);
+        if row_state == RowState::Deleted {
+            painter.line_segment([text_rect.left_center(), text_rect.right_center()], Stroke::new(1.0_f32, theme::ERROR));
+        }
+    }
+    if input.pending.is_edited(r, c) && row_state == RowState::Modified {
+        let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height()));
+        ui.painter().rect_filled(bar, 0.0, theme::TERTIARY);
+    }
+    if let Some(ed) = st.editing.as_mut().filter(|e| e.row == r && e.col == c) {
+        let edit = ui.put(rect, egui::TextEdit::singleline(&mut ed.text).frame(false).margin(egui::Margin::symmetric(6, 0)).vertical_align(Align::Center).desired_width(rect.width()));
+        if ed.fresh {
+            edit.request_focus();
+            ed.fresh = false;
+        }
+        if edit.lost_focus() {
+            let cancelled = ui.input(|i| i.key_pressed(Key::Escape));
+            let text = ed.text.clone();
+            st.editing = None;
+            if !cancelled {
+                events.push(GridEvent::EditCommit { row: r, col: c, text });
+            }
+        }
+        return;
     }
     if input.columns[c].fk.is_some() && view.as_ref().is_some_and(|v| v.style != CellStyle::Null) {
         let arrow = egui::Rect::from_center_size(egui::pos2(rect.right() - 12.0, rect.center().y), egui::vec2(18.0, 18.0));
@@ -346,6 +418,9 @@ fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: us
     }
     if resp.clicked_by(egui::PointerButton::Middle) || (resp.double_clicked() && command) {
         events.push(GridEvent::QuickLook { row: r, col: c });
+    } else if resp.double_clicked() && can_edit_row(input, r) {
+        let text = input.rows.get(r).and_then(|row| row.get(c)).map(|v| if v.is_null() { String::new() } else { v.to_display() }).unwrap_or_default();
+        st.editing = Some(Editing { row: r, col: c, text, fresh: true });
     }
     resp.context_menu(|ui| {
         widgets::flat_menu_style(ui);
@@ -373,6 +448,20 @@ fn data_cell(ui: &mut Ui, st: &mut GridState, input: &GridInput, r: usize, c: us
             }
         });
         pick(ui, "Copy all column values", GridEvent::CopyColumn(c));
+        if input.editable {
+            ui.separator();
+            ui.add_enabled_ui(can_edit_row(input, r), |ui| {
+            ui.menu_button("Set value", |ui| {
+                for (label, v) in [("EMPTY", CellValue::Value(Value::Text(String::new()))), ("NULL", CellValue::Null), ("DEFAULT", CellValue::Default)] {
+                    pick(ui, label, GridEvent::SetValue { row: r, col: c, value: v });
+                }
+            });
+            });
+            pick(ui, "Duplicate row", GridEvent::DuplicateRows);
+            ui.add_enabled_ui(can_edit_row(input, r), |ui| {
+                pick(ui, "Delete row", GridEvent::DeleteRows);
+            });
+        }
     });
     let _ = vc;
 }
@@ -399,7 +488,7 @@ impl Color32Ext {
 }
 
 /// Keyboard navigation and copy when the grid has focus.
-fn handle_keys(ui: &mut Ui, st: &mut GridState, rows: usize, cols: usize, events: &mut Vec<GridEvent>) {
+fn handle_keys(ui: &mut Ui, st: &mut GridState, input: &GridInput, rows: usize, cols: usize, events: &mut Vec<GridEvent>) {
     if !st.focused || ui.ctx().wants_keyboard_input() {
         return;
     }
@@ -439,6 +528,15 @@ fn handle_keys(ui: &mut Ui, st: &mut GridState, rows: usize, cols: usize, events
         if let Some((r, c)) = st.selection.cursor {
             events.push(GridEvent::QuickLook { row: r, col: c });
         }
+    } else if qlook && !cmd {
+        if let Some((r, c)) = st.selection.cursor.filter(|(r, _)| can_edit_row(input, *r)) {
+            let text = input.rows.get(r).and_then(|row| row.get(c)).map(|v| if v.is_null() { String::new() } else { v.to_display() }).unwrap_or_default();
+            st.editing = Some(Editing { row: r, col: c, text, fresh: true });
+        }
+    }
+    let rows_ok = st.selection.selected_rows().iter().all(|r| can_edit_row(input, *r));
+    if input.editable && rows_ok && ui.input(|i| i.key_pressed(Key::Delete)) && !cmd && !st.selection.selected_rows().is_empty() {
+        events.push(GridEvent::DeleteRows);
     }
 }
 

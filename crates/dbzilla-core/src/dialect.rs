@@ -29,6 +29,10 @@ pub trait Dialect: Send + Sync {
     /// Keywords for highlight, completion and formatting.
     fn keywords(&self) -> &'static [&'static str];
 
+    /// Expression for the current timestamp.
+    fn now_expr(&self) -> &'static str {
+        "NOW()"
+    }
     /// Casts an SQL expression to text.
     fn cast_text(&self, expr: &str) -> String;
     /// Operand used by text matching operators (PostgreSQL needs an explicit cast).
@@ -161,6 +165,9 @@ impl Dialect for SqliteDialect {
     }
     fn cast_text(&self, expr: &str) -> String {
         format!("CAST({expr} AS TEXT)")
+    }
+    fn now_expr(&self) -> &'static str {
+        "CURRENT_TIMESTAMP"
     }
     fn supports_default_keyword(&self) -> bool {
         false

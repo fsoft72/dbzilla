@@ -1,6 +1,7 @@
 //! The Data tab of a table: paging, state and drawing (SPEC 8.2).
 
 use super::grid::{self, GridEvent, GridInput, GridState};
+use super::pending::{parse_edit, Pending};
 use super::quicklook::{self, QuickLook};
 use super::widgets;
 use crate::glyphs::Ico;
@@ -44,6 +45,10 @@ pub struct DataState {
     pub quicklook: Option<QuickLook>,
     pub limit_text: String,
     pub offset_text: String,
+    pub pending: Pending,
+    /// Columns identifying a row for updates and deletes.
+    pub key_cols: Vec<String>,
+    pub committing: bool,
 }
 
 impl DataState {
@@ -67,6 +72,9 @@ impl DataState {
             quicklook: None,
             limit_text: limit.to_string(),
             offset_text: "0".into(),
+            pending: Pending::default(),
+            key_cols: Vec::new(),
+            committing: false,
         }
     }
 }
@@ -78,6 +86,8 @@ pub enum DataAction {
     CountExact,
     FollowFk { table: TableRef, column: String, value: Value },
     Toast(String),
+    Error(String),
+    ChooseKey,
 }
 
 /// Context needed to draw a data tab.
@@ -88,6 +98,7 @@ pub struct DataEnv<'a> {
     pub row_height: f32,
     pub table: &'a TableRef,
     pub structure: Option<&'a TableStructure>,
+    pub is_view: bool,
 }
 
 /// First and last row numbers (1-based) of the loaded page; `None` when empty.
@@ -147,7 +158,8 @@ pub fn fk_filter(column: &str, value: &Value) -> Filter {
 pub fn show(ui: &mut Ui, d: &mut DataState, env: &DataEnv) -> Vec<DataAction> {
     let mut actions = Vec::new();
     let columns = merge_columns(&d.columns, env.structure);
-    egui::TopBottomPanel::bottom(ui.id().with("data_bar")).exact_height(34.0).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(egui::Margin::symmetric(10, 4))).show_inside(ui, |ui| bottom_bar(ui, d, &mut actions));
+    d.pending.sync_len(d.rows.len());
+    egui::TopBottomPanel::bottom(ui.id().with("data_bar")).exact_height(38.0).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(egui::Margin::symmetric(10, 4))).show_inside(ui, |ui| bottom_bar(ui, d, env, &columns, &mut actions));
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::DEEP_DARK)).show_inside(ui, |ui| {
         if let Some(e) = &d.error {
             ui.add_space(12.0);
@@ -165,7 +177,7 @@ pub fn show(ui: &mut Ui, d: &mut DataState, env: &DataEnv) -> Vec<DataAction> {
             });
             return;
         }
-        let input = GridInput { columns: &columns, rows: &d.rows, sort: &d.sort, alternating: env.alternating, row_height: env.row_height, id: ui.id().with("grid") };
+        let input = GridInput { pending: &d.pending, editable: !env.is_view, key_missing: d.key_cols.is_empty(), columns: &columns, rows: &d.rows, sort: &d.sort, alternating: env.alternating, row_height: env.row_height, id: ui.id().with("grid") };
         let events = grid::show(ui, &mut d.grid, &input);
         for e in events {
             apply_event(ui, d, &columns, env, e, &mut actions);
@@ -219,6 +231,27 @@ fn apply_event(ui: &Ui, d: &mut DataState, columns: &[ColumnMeta], env: &DataEnv
                 actions.push(DataAction::Toast("Copied".into()));
             }
         }
+        GridEvent::EditCommit { row, col, text } => {
+            let type_name = columns.get(col).map(|c| c.type_name.clone()).unwrap_or_default();
+            match parse_edit(&type_name, &text) {
+                Ok(v) => d.pending.edit_cell(&mut d.rows, row, col, v),
+                Err(e) => actions.push(DataAction::Error(e)),
+            }
+        }
+        GridEvent::SetValue { row, col, value } => d.pending.edit_cell(&mut d.rows, row, col, value),
+        GridEvent::InsertRow => insert_row(d, columns),
+        GridEvent::DuplicateRows => {
+            let sel = d.grid.selection.selected_rows();
+            let added = d.pending.duplicate(&mut d.rows, columns, &sel);
+            if let Some(&last) = added.last() {
+                d.grid.selection.select_row(last, false, false, None);
+            }
+        }
+        GridEvent::DeleteRows => {
+            let sel = d.grid.selection.selected_rows();
+            d.pending.delete(&mut d.rows, &sel);
+            d.grid.selection.clear();
+        }
         GridEvent::CopyColumn(c) => {
             let text = d.rows.iter().filter_map(|r| r.get(c)).map(Value::to_display).collect::<Vec<_>>().join("\n");
             ui.ctx().copy_text(text);
@@ -227,8 +260,14 @@ fn apply_event(ui: &Ui, d: &mut DataState, columns: &[ColumnMeta], env: &DataEnv
     }
 }
 
+/// Appends a new row and selects it.
+pub fn insert_row(d: &mut DataState, columns: &[ColumnMeta]) {
+    let r = d.pending.insert_row(&mut d.rows, columns);
+    d.grid.selection.select_row(r, false, false, None);
+}
+
 /// Paging controls, counts and timing.
-fn bottom_bar(ui: &mut Ui, d: &mut DataState, actions: &mut Vec<DataAction>) {
+fn bottom_bar(ui: &mut Ui, d: &mut DataState, env: &DataEnv, columns: &[ColumnMeta], actions: &mut Vec<DataAction>) {
     ui.horizontal_centered(|ui| {
         let can_prev = d.offset > 0 && !d.loading;
         ui.add_enabled_ui(can_prev, |ui| {
@@ -283,6 +322,21 @@ fn bottom_bar(ui: &mut Ui, d: &mut DataState, actions: &mut Vec<DataAction>) {
         if d.loading {
             ui.spinner();
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if env.is_view {
+                widgets::muted(ui, "Read only: view");
+            } else {
+                if widgets::secondary_button(ui, "+ Row").on_hover_text("Add a row (Ctrl+I)").clicked() && !d.columns.is_empty() {
+                    insert_row(d, columns);
+                }
+                if d.key_cols.is_empty() {
+                    if ui.small_button("Choose key...").on_hover_text("Rows can only be updated or deleted when a key identifies them").clicked() {
+                        actions.push(DataAction::ChooseKey);
+                    }
+                    ui.label(RichText::new("No key: existing rows are read only").size(12.0).color(theme::TERTIARY));
+                }
+            }
+        });
     });
 }
 
@@ -297,7 +351,7 @@ mod tests {
     }
 
     fn env<'a>(d: &'a dyn Dialect, csv: &'a CsvOptions, t: &'a TableRef) -> DataEnv<'a> {
-        DataEnv { dialect: d, csv, alternating: true, row_height: 24.0, table: t, structure: None }
+        DataEnv { dialect: d, csv, alternating: true, row_height: 24.0, table: t, structure: None, is_view: false }
     }
 
     /// Page bounds, previous offset and next availability.
@@ -350,5 +404,47 @@ mod tests {
     fn fk_filter_is_equality() {
         let f = fk_filter("id", &Value::I64(7));
         assert_eq!((f.op, f.value.as_str()), (FilterOp::Eq, "7"));
+    }
+
+    /// Type into the inline editor and press Enter: the row becomes modified (egui_kittest).
+    #[test]
+    fn editing_a_cell_with_the_keyboard() {
+        let table = TableRef::simple("t");
+        let d = dialect_for(DriverId::Sqlite);
+        let csv = CsvOptions::default();
+        let mut state = DataState::new(300);
+        state.columns = vec![ColumnMeta { name: "id".into(), type_name: "integer".into(), is_pk: true, ..Default::default() }, col("name")];
+        state.rows = vec![vec![Value::I64(1), Value::Text("alpha".into())], vec![Value::I64(2), Value::Text("beta".into())]];
+        state.key_cols = vec!["id".into()];
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, st: &mut DataState| {
+                let themed = egui::Id::new("themed");
+                if ui.ctx().data(|d| d.get_temp::<bool>(themed)).is_none() {
+                    ui.ctx().data_mut(|d| d.insert_temp(themed, true));
+                    crate::theme::apply(ui.ctx());
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                let env = DataEnv { dialect: d.as_ref(), csv: &csv, alternating: true, row_height: 24.0, table: &table, structure: None, is_view: false };
+                show(ui, st, &env);
+            },
+            state,
+        );
+        harness.run();
+        // painted cell text is not in the accessibility tree, so start the editor as a double click would
+        harness.state_mut().grid.editing = Some(crate::ui::grid::Editing { row: 1, col: 1, text: "beta".into(), fresh: true });
+        harness.run();
+        harness.input_mut().events.push(egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND });
+        harness.step();
+        harness.input_mut().events.push(egui::Event::Text("gamma".into()));
+        harness.step();
+        harness.input_mut().events.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+        harness.step();
+        harness.run();
+        let s = harness.state();
+        assert!(s.grid.editing.is_none());
+        assert_eq!(s.rows[1][1], Value::Text("gamma".into()));
+        assert_eq!(s.pending.state(1), crate::ui::pending::RowState::Modified);
+        assert_eq!(s.pending.state(0), crate::ui::pending::RowState::Clean);
     }
 }

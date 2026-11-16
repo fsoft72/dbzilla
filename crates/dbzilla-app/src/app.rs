@@ -206,8 +206,8 @@ impl App {
         };
         let repaint_ctx = ctx.clone();
         let session = spawn(self.rt.handle(), cfg, default_factory(), Arc::new(move || repaint_ctx.request_repaint()));
-        session.send(Command::Connect(config_for(&conn, password)));
-        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries, self.settings.page_size));
+        session.send(Command::Connect(config_for(&conn, password.clone())));
+        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries, self.settings.page_size, password));
         self.section = Section::Workspace(self.workspaces.len() - 1);
     }
 

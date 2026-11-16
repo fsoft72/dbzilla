@@ -2,6 +2,8 @@
 
 use super::console::{self, ConsoleLog};
 use super::datatab::{self, DataAction, DataEnv, DataState, Total};
+use super::details::{self, DetailsAction, DetailsState};
+use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
 use super::sidebar::{self, SidebarAction, SidebarState, SidebarTab};
 use super::tabs::{decide_open, OpenDecision, OpenMode, TabId, TabMeta, TabTarget};
@@ -11,11 +13,13 @@ use crate::glyphs::Ico;
 use crate::keymap::{Action, KeyMap};
 use crate::theme;
 use dbzilla_core::caps::Capabilities;
+use dbzilla_core::changes::generate_sql;
 use dbzilla_core::copyfmt::CsvOptions;
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::model::{ObjectInfo, ObjectKind, TableRef, TableStructure};
 use dbzilla_drivers::DatabaseInfo;
+use dbzilla_session::gate::{gate_check, verify_password, GateDecision};
 use dbzilla_session::{Command, Event, PageRequest, RequestId, SessionHandle};
 use dbzilla_store::connections::StoredConnection;
 use dbzilla_store::settings::Settings;
@@ -39,6 +43,7 @@ pub struct TableTab {
     pub structure: Option<TableStructure>,
     pub error: Option<String>,
     pub data: DataState,
+    pub is_view: bool,
 }
 
 /// What a request of a tab is for.
@@ -46,6 +51,24 @@ pub struct TableTab {
 enum ReqKind {
     Page,
     Count,
+    Commit,
+}
+
+/// A statement list waiting for the safe-mode answer.
+struct GateModal {
+    statements: Vec<String>,
+    needs_password: bool,
+    input: String,
+    reveal: bool,
+    tab: TabId,
+    error: Option<String>,
+}
+
+/// Dialog choosing the key columns of a table without a primary key.
+struct KeyDialog {
+    tab: TabId,
+    names: Vec<String>,
+    selected: Vec<bool>,
 }
 
 /// What a tab holds.
@@ -121,11 +144,19 @@ pub struct Workspace {
     pub dialect: Box<dyn Dialect>,
     pub page_size: u64,
     req_map: HashMap<RequestId, (TabId, ReqKind)>,
+    /// Password of the connection, used to unlock the safe modes.
+    pub password: Option<String>,
+    pub details: DetailsState,
+    gate: Option<GateModal>,
+    preview: Option<Vec<String>>,
+    key_dialog: Option<KeyDialog>,
+    /// Messages for the toast area: (is_error, text).
+    notices: Vec<(bool, String)>,
 }
 
 impl Workspace {
     /// Creates the workspace of a connection whose session is already connecting.
-    pub fn new(conn: StoredConnection, session: SessionHandle, console_entries: usize, page_size: u64) -> Self {
+    pub fn new(conn: StoredConnection, session: SessionHandle, console_entries: usize, page_size: u64, password: Option<String>) -> Self {
         let caps = Capabilities::for_driver(conn.driver);
         let conn_driver = conn.driver;
         Self {
@@ -150,6 +181,12 @@ impl Workspace {
             dialect: dialect_for(conn_driver),
             page_size,
             req_map: HashMap::new(),
+            password,
+            details: DetailsState::default(),
+            gate: None,
+            preview: None,
+            key_dialog: None,
+            notices: Vec::new(),
         }
     }
 
@@ -181,6 +218,8 @@ impl Workspace {
             Event::QueryError { req, error, .. } => self.on_page_error(req, error),
             Event::Count { req, count } => self.on_total(req, Total::Exact(count)),
             Event::Estimate { req, count } => self.on_total(req, count.map_or(Total::Unknown, Total::Estimated)),
+            Event::CommitDone { req, counts } => self.on_commit_done(req, counts.len()),
+            Event::CommitError { req, error } => self.on_commit_error(req, error),
             Event::Console { ts_ms, sql } => self.console.push(ts_ms, sql),
             Event::Error { error } => {
                 self.console.push(0, format!("-- error: {error}"));
@@ -285,8 +324,20 @@ impl Workspace {
         self.table_tab_mut(id).map(|t| t.table.clone()).unwrap_or_default()
     }
 
-    /// Loads (or reloads) the page of a tab.
+    /// Loads (or reloads) the page of a tab; refused while changes are pending.
     pub fn fetch_tab(&mut self, id: TabId) {
+        if self.table_tab_mut(id).is_some_and(|t| t.data.pending.has_changes()) {
+            self.notices.push((true, "Commit or discard the pending changes first".into()));
+            return;
+        }
+        self.fetch_tab_forced(id);
+    }
+
+    /// Loads the page of a tab, dropping any pending changes.
+    fn fetch_tab_forced(&mut self, id: TabId) {
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.pending.reset();
+        }
         let table = self.tab_table(id);
         let columns = self.structures.get(&table).map(|s| s.columns.clone()).unwrap_or_default();
         let Some(t) = self.table_tab_mut(id) else { return };
@@ -310,6 +361,9 @@ impl Workspace {
             if t.table == st.table {
                 t.structure = Some(st.clone());
                 t.error = None;
+                if t.data.key_cols.is_empty() {
+                    t.data.key_cols = default_key_columns(Some(&st));
+                }
             }
         }
         self.structures.insert(st.table.clone(), st);
@@ -352,7 +406,11 @@ impl Workspace {
             ws.next_tab_id += 1;
             let mut data = DataState::new(ws.page_size);
             data.filters = filters.clone();
-            Tab { id, pinned, kind: TabKind::Table(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data }) }
+            let is_view = ws.objects.iter().any(|o| o.table == table && matches!(o.kind, ObjectKind::View | ObjectKind::MaterializedView));
+            if let Some(st) = ws.structures.get(&table) {
+                data.key_cols = default_key_columns(Some(st));
+            }
+            Tab { id, pinned, kind: TabKind::Table(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data, is_view }) }
         };
         let mut touched: Option<TabId> = None;
         match decision {
@@ -435,6 +493,26 @@ impl Workspace {
                 }
             }
             Action::ReloadWorkspace => self.load_schema(),
+            Action::Commit => self.commit_active(),
+            Action::Preview => self.preview_active(),
+            Action::Discard => self.discard_active(),
+            Action::Undo => self.row_op(|t| {
+                t.data.pending.undo(&mut t.data.rows);
+            }),
+            Action::Redo => self.row_op(|t| {
+                t.data.pending.redo(&mut t.data.rows);
+            }),
+            Action::AddRow => self.row_op(|t| {
+                let cols = super::datatab::merge_columns(&t.data.columns, t.structure.as_ref());
+                if !cols.is_empty() {
+                    datatab::insert_row(&mut t.data, &cols);
+                }
+            }),
+            Action::DuplicateRow => self.row_op(|t| {
+                let cols = super::datatab::merge_columns(&t.data.columns, t.structure.as_ref());
+                let sel = t.data.grid.selection.selected_rows();
+                t.data.pending.duplicate(&mut t.data.rows, &cols, &sel);
+            }),
             Action::Reconnect => {
                 self.status = WsStatus::Connecting;
                 self.session.send(Command::Reconnect);
@@ -442,6 +520,127 @@ impl Workspace {
             other => return Some(WsOutput::Run(other)),
         }
         None
+    }
+
+    /// The focused table tab.
+    fn active_tab_mut(&mut self) -> Option<(TabId, &mut TableTab)> {
+        self.dock.find_active_focused().map(|(_, t)| {
+            let id = t.id;
+            let TabKind::Table(tt) = &mut t.kind;
+            (id, tt)
+        })
+    }
+
+    /// True when the focused tab has pending changes.
+    pub fn has_pending(&mut self) -> bool {
+        self.active_tab_mut().is_some_and(|(_, t)| t.data.pending.has_changes())
+    }
+
+    /// Statements for the pending changes of a tab.
+    fn statements_of(&mut self, id: TabId) -> Result<Vec<String>, String> {
+        let columns = {
+            let table = self.tab_table(id);
+            let st = self.structures.get(&table).cloned();
+            let Some(t) = self.table_tab_mut(id) else { return Err("tab closed".into()) };
+            super::datatab::merge_columns(&t.data.columns, st.as_ref().or(t.structure.as_ref()))
+        };
+        let dialect = dialect_for(self.conn.driver);
+        let Some(t) = self.table_tab_mut(id) else { return Err("tab closed".into()) };
+        let cs = t.data.pending.to_changeset(&t.table, &columns, &t.data.key_cols, &t.data.rows).map_err(|e| e.to_string())?;
+        generate_sql(&cs, dialect.as_ref()).map_err(|e| e.to_string())
+    }
+
+    /// Shows the generated SQL of the focused tab.
+    pub fn preview_active(&mut self) {
+        let Some((id, _)) = self.active_tab_mut() else { return };
+        match self.statements_of(id) {
+            Ok(s) if s.is_empty() => self.notices.push((false, "There are no pending changes".into())),
+            Ok(s) => self.preview = Some(s),
+            Err(e) => self.notices.push((true, e)),
+        }
+    }
+
+    /// Throws away the pending changes of the focused tab and reloads it.
+    pub fn discard_active(&mut self) {
+        if let Some((id, _)) = self.active_tab_mut() {
+            self.fetch_tab_forced(id);
+        }
+    }
+
+    /// Starts the commit of the focused tab, going through the safe-mode gate.
+    pub fn commit_active(&mut self) {
+        let Some((id, _)) = self.active_tab_mut() else { return };
+        let statements = match self.statements_of(id) {
+            Ok(s) if s.is_empty() => return self.notices.push((false, "There are no pending changes".into())),
+            Ok(s) => s,
+            Err(e) => return self.notices.push((true, e)),
+        };
+        match gate_check(self.conn.safe_level, self.conn.driver, &statements) {
+            GateDecision::Allow => self.send_commit(id, statements),
+            GateDecision::Confirm(s) => self.gate = Some(GateModal { statements: s, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
+            GateDecision::Password(s) => {
+                let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                self.gate = Some(GateModal { statements: s, needs_password: known, input: String::new(), reveal: false, tab: id, error: None });
+            }
+        }
+    }
+
+    /// Sends the statements to the server.
+    fn send_commit(&mut self, id: TabId, statements: Vec<String>) {
+        let req = RequestId::next();
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.committing = true;
+        }
+        self.req_map.insert(req, (id, ReqKind::Commit));
+        self.session.send(Command::Commit { req, statements });
+    }
+
+    /// A commit succeeded: reload the tab.
+    fn on_commit_done(&mut self, req: RequestId, statements: usize) {
+        let Some((id, ReqKind::Commit)) = self.req_map.remove(&req) else { return };
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.committing = false;
+        }
+        self.notices.push((false, format!("{statements} {} committed", if statements == 1 { "statement" } else { "statements" })));
+        self.fetch_tab_forced(id);
+    }
+
+    /// A commit failed: nothing is lost, the changes stay pending.
+    fn on_commit_error(&mut self, req: RequestId, error: String) {
+        let Some((id, ReqKind::Commit)) = self.req_map.remove(&req) else { return };
+        if let Some(t) = self.table_tab_mut(id) {
+            t.data.committing = false;
+        }
+        self.notices.push((true, format!("Commit failed: {error}")));
+    }
+
+    /// Applies edits made in the Details panel to every selected row.
+    fn apply_detail_edits(&mut self, edits: Vec<DetailsAction>) {
+        let Some((_, t)) = self.active_tab_mut() else { return };
+        let selected = t.data.grid.selection.selected_rows();
+        let mut errors = Vec::new();
+        for e in edits {
+            match e {
+                DetailsAction::Edit { col, value } => {
+                    for &r in &selected {
+                        t.data.pending.edit_cell(&mut t.data.rows, r, col, value.clone());
+                    }
+                }
+                DetailsAction::Error(m) => errors.push(m),
+            }
+        }
+        for m in errors {
+            self.notices.push((true, m));
+        }
+    }
+
+    /// Row operations on the focused tab.
+    fn row_op(&mut self, f: impl FnOnce(&mut TableTab)) {
+        if let Some((_, t)) = self.active_tab_mut() {
+            if !t.is_view {
+                f(t);
+            }
+        }
     }
 
     /// Asks the session to reconnect.
@@ -465,7 +664,8 @@ impl Workspace {
     /// Draws the whole workspace screen.
     pub fn show(&mut self, ctx: &egui::Context, env: &mut WsEnv) -> Vec<WsOutput> {
         let mut out = Vec::new();
-        self.toolbar(ctx, env, &mut out);
+        let pending = self.has_pending();
+        self.toolbar(ctx, env, pending, &mut out);
         self.status_bar(ctx, env, &mut out);
         if self.console_open {
             egui::TopBottomPanel::bottom("ws_console").resizable(true).default_height(160.0).height_range(80.0..=500.0).frame(Frame::new().fill(theme::NAVY_DARK).inner_margin(Margin::symmetric(12, 8))).show(ctx, |ui| {
@@ -484,6 +684,28 @@ impl Workspace {
                     widgets::muted(ui, if tab == SidebarTab::Queries { "Saved queries will appear here." } else { "The query history will appear here." });
                 });
             });
+        }
+        let mut detail_actions = Vec::new();
+        if self.right_open {
+            egui::SidePanel::right("ws_details").default_width(300.0).width_range(240.0..=520.0).resizable(true).frame(Frame::new().fill(theme::DEEP_DARK).inner_margin(Margin::same(10))).show(ctx, |ui| {
+                let Workspace { dock, details, .. } = &mut *self;
+                match dock.find_active_focused() {
+                    Some((_, t)) => {
+                        let id = t.id;
+                        let TabKind::Table(tt) = &mut t.kind;
+                        let cols = datatab::merge_columns(&tt.data.columns, tt.structure.as_ref());
+                        let selected = tt.data.grid.selection.selected_rows();
+                        detail_actions = details::show(ui, details, id, &cols, &tt.data.rows, &selected, !tt.is_view);
+                    }
+                    None => {
+                        ui.label(widgets::semibold("Details", 15.0).color(theme::TEXT));
+                        widgets::muted(ui, "Open a table to see the fields of its rows.");
+                    }
+                }
+            });
+        }
+        if !detail_actions.is_empty() {
+            self.apply_detail_edits(detail_actions);
         }
         let mut requests = Vec::new();
         let mut data_actions: Vec<(TabId, DataAction)> = Vec::new();
@@ -537,6 +759,16 @@ impl Workspace {
                 DataAction::CountExact => self.count_exact(id),
                 DataAction::FollowFk { table, column, value } => self.open_table_with(table, OpenMode::NewTab, vec![datatab::fk_filter(&column, &value)]),
                 DataAction::Toast(m) => env.toasts.ok(m),
+                DataAction::Error(m) => env.toasts.err(m),
+                DataAction::ChooseKey => self.open_key_dialog(id),
+            }
+        }
+        self.modals(ctx);
+        for (is_err, m) in self.notices.drain(..) {
+            if is_err {
+                env.toasts.err(m);
+            } else {
+                env.toasts.ok(m);
             }
         }
         match sidebar_action {
@@ -576,8 +808,127 @@ impl Workspace {
         out
     }
 
+    /// Opens the dialog choosing key columns for a tab.
+    fn open_key_dialog(&mut self, id: TabId) {
+        let Some(t) = self.table_tab_mut(id) else { return };
+        let names: Vec<String> = datatab::merge_columns(&t.data.columns, t.structure.as_ref()).into_iter().map(|c| c.name).collect();
+        let selected = names.iter().map(|n| t.data.key_cols.contains(n)).collect();
+        self.key_dialog = Some(KeyDialog { tab: id, names, selected });
+    }
+
+    /// Preview, safe-mode and key-column dialogs.
+    fn modals(&mut self, ctx: &egui::Context) {
+        if let Some(statements) = self.preview.clone() {
+            let mut action = None;
+            widgets::modal(ctx, "Pending changes", |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for s in &statements {
+                        ui.add(egui::Label::new(RichText::new(s).monospace().color(theme::TEXT)).wrap());
+                        ui.add_space(4.0);
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Commit").clicked() {
+                        action = Some(0);
+                    }
+                    if widgets::danger_button(ui, "Discard").clicked() {
+                        action = Some(1);
+                    }
+                    if widgets::secondary_button(ui, "Close").clicked() {
+                        action = Some(2);
+                    }
+                });
+            });
+            match action {
+                Some(0) => {
+                    self.preview = None;
+                    self.commit_active();
+                }
+                Some(1) => {
+                    self.preview = None;
+                    self.discard_active();
+                }
+                Some(_) => self.preview = None,
+                None => {}
+            }
+        }
+        if let Some(g) = self.gate.as_mut() {
+            let mut decision = None;
+            let title = if g.needs_password { "Enter the password to continue" } else { "Review the statements" };
+            widgets::modal(ctx, title, |ui| {
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for s in &g.statements {
+                        ui.add(egui::Label::new(RichText::new(s).monospace().color(theme::TEXT)).wrap());
+                    }
+                });
+                if g.needs_password {
+                    ui.add_space(8.0);
+                    widgets::field_label(ui, "Database password");
+                    widgets::secret_input(ui, &mut g.input, &mut g.reveal);
+                }
+                if let Some(e) = &g.error {
+                    ui.colored_label(theme::ERROR, e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Send").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    let ok = !g.needs_password || self.password.as_deref().is_some_and(|p| verify_password(p, &g.input));
+                    if ok {
+                        if let Some(g) = self.gate.take() {
+                            self.send_commit(g.tab, g.statements);
+                        }
+                    } else if let Some(g) = self.gate.as_mut() {
+                        g.error = Some("The password is not correct".into());
+                    }
+                }
+                Some(false) => self.gate = None,
+                None => {}
+            }
+        }
+        if let Some(k) = self.key_dialog.as_mut() {
+            let mut decision = None;
+            widgets::modal(ctx, "Key columns", |ui| {
+                widgets::muted(ui, "Rows are updated and deleted using these columns in the WHERE clause.");
+                for (i, n) in k.names.iter().enumerate() {
+                    ui.checkbox(&mut k.selected[i], n);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Use these columns").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    if let Some(k) = self.key_dialog.take() {
+                        let chosen: Vec<String> = k.names.iter().zip(&k.selected).filter(|(_, s)| **s).map(|(n, _)| n.clone()).collect();
+                        if let Some(t) = self.table_tab_mut(k.tab) {
+                            t.data.key_cols = chosen;
+                        }
+                    }
+                }
+                Some(false) => self.key_dialog = None,
+                None => {}
+            }
+        }
+    }
+
     /// The toolbar (SPEC 7.2).
-    fn toolbar(&mut self, ctx: &egui::Context, env: &WsEnv, out: &mut Vec<WsOutput>) {
+    fn toolbar(&mut self, ctx: &egui::Context, env: &WsEnv, pending: bool, out: &mut Vec<WsOutput>) {
         let tip = |name: &str, a: Action| {
             let h = env.keymap.hint(a);
             if h.is_empty() { name.to_owned() } else { format!("{name} ({h})") }
@@ -588,10 +939,16 @@ impl Workspace {
                     self.left_open = !self.left_open;
                 }
                 ui.add_space(6.0);
-                ui.add_enabled_ui(false, |ui| {
-                    widgets::ico_button(ui, Ico::Discard, &tip("Discard changes", Action::Discard));
-                    widgets::ico_button(ui, Ico::Preview, &tip("Preview changes", Action::Preview));
-                    widgets::ico_button(ui, Ico::Commit, &tip("Commit", Action::Commit));
+                ui.add_enabled_ui(pending, |ui| {
+                    if widgets::ico_button(ui, Ico::Discard, &tip("Discard changes", Action::Discard)).clicked() {
+                        self.discard_active();
+                    }
+                    if widgets::ico_button(ui, Ico::Preview, &tip("Preview changes", Action::Preview)).clicked() {
+                        self.preview_active();
+                    }
+                    if widgets::ico_button(ui, Ico::Commit, &tip("Commit", Action::Commit)).clicked() {
+                        self.commit_active();
+                    }
                 });
                 ui.add_space(6.0);
                 widgets::ico_button(ui, Ico::Shield, &format!("Safe mode: {}", super::connform::safe_label(self.conn.safe_level)));
@@ -670,7 +1027,7 @@ impl TabViewer for Viewer<'_> {
         let id = tab.id;
         let TabKind::Table(t) = &mut tab.kind;
         let table = t.table.clone();
-        let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table) };
+        let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table), is_view: t.is_view };
         for a in datatab::show(ui, &mut t.data, &env) {
             self.data_actions.push((id, a));
         }
@@ -702,3 +1059,119 @@ impl TabViewer for Viewer<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbzilla_core::changes::CellValue;
+    use dbzilla_core::value::Value;
+    use dbzilla_drivers::{ConnectConfig, SslMode};
+    use dbzilla_session::{default_factory, spawn, SessionConfig};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A workspace connected to a SQLite file holding `t(id pk, name)` with two rows.
+    fn connected(rt: &tokio::runtime::Runtime) -> (tempfile::TempDir, std::path::PathBuf, Workspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.sqlite3");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1,'alpha'),(2,'beta');").unwrap();
+        let mut conn = StoredConnection::new("test", DriverId::Sqlite);
+        conn.database = path.to_string_lossy().into_owned();
+        let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
+        session.send(Command::Connect(ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: conn.database.clone(), ssl: SslMode::Disabled, bootstrap: vec![] }));
+        let mut ws = Workspace::new(conn, session, 1000, 300, None);
+        wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && !w.objects.is_empty());
+        (dir, path, ws)
+    }
+
+    /// Polls the workspace until `done` holds (10 s limit).
+    fn wait(ws: &mut Workspace, done: impl Fn(&mut Workspace) -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            ws.poll();
+            if done(ws) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for the workspace");
+    }
+
+    /// Opens table `t` and waits for its rows; focuses its tab.
+    fn open_t(ws: &mut Workspace) {
+        ws.open_table(TableRef::simple("t"), OpenMode::Pin);
+        let loc = ws.dock.iter_all_tabs().next().map(|(l, _)| l).expect("a tab");
+        ws.dock.set_focused_node_and_surface(loc);
+        wait(ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 2));
+    }
+
+    fn name_of_row(ws: &mut Workspace, r: usize) -> Value {
+        ws.active_tab_mut().map(|(_, t)| t.data.rows[r][1].clone()).unwrap()
+    }
+
+    /// Edit, commit, reload: the database and the grid both show the change.
+    #[test]
+    fn edit_commit_reload() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.data.pending.edit_cell(&mut t.data.rows, 0, 1, CellValue::Value(Value::Text("changed".into())));
+        assert!(ws.has_pending());
+        ws.commit_active();
+        wait(&mut ws, |w| !w.has_pending() && w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && !t.data.committing));
+        assert_eq!(name_of_row(&mut ws, 0), Value::Text("changed".into()));
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let v: String = c.query_row("SELECT name FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "changed");
+    }
+
+    /// A failing commit leaves the database untouched and keeps the pending changes.
+    #[test]
+    fn failed_commit_keeps_pending_changes_and_the_database() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.data.pending.edit_cell(&mut t.data.rows, 0, 1, CellValue::Value(Value::Text("ok".into())));
+        t.data.pending.edit_cell(&mut t.data.rows, 1, 0, CellValue::Value(Value::I64(1)));
+        ws.commit_active();
+        wait(&mut ws, |w| w.notices.iter().any(|(err, m)| *err && m.contains("Commit failed")));
+        assert!(ws.has_pending(), "nothing is lost after a failed commit");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let names: Vec<String> = c.prepare("SELECT name FROM t ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(names, vec!["alpha", "beta"], "the first statement was rolled back too");
+    }
+
+    /// Changes on a table without any key cannot be committed, and say why.
+    #[test]
+    fn updates_without_a_key_are_refused() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.data.key_cols.clear();
+        t.data.pending.edit_cell(&mut t.data.rows, 0, 1, CellValue::Value(Value::Text("x".into())));
+        ws.commit_active();
+        assert!(ws.notices.iter().any(|(err, m)| *err && m.contains("no primary key")), "{:?}", ws.notices);
+    }
+
+    /// Commits can be intercepted by the safe-mode gate.
+    #[test]
+    fn safe_mode_asks_before_sending() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        ws.conn.safe_level = dbzilla_core::safemode::SafeLevel::Alert1;
+        open_t(&mut ws);
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.data.pending.edit_cell(&mut t.data.rows, 0, 1, CellValue::Value(Value::Text("gated".into())));
+        ws.commit_active();
+        assert!(ws.gate.is_some(), "the statements wait for confirmation");
+        std::thread::sleep(Duration::from_millis(200));
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let v: String = c.query_row("SELECT name FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "alpha", "nothing was sent yet");
+    }
+}
+
