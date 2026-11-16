@@ -108,3 +108,14 @@ pub struct ObjectInfo {
     pub kind: ObjectKind,
     pub table: TableRef,
 }
+
+/// TLS mode of a connection (the UI shows the driver-specific subset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SslMode {
+    #[default]
+    Preferred,
+    Disabled,
+    Required,
+    VerifyCa,
+    VerifyFull,
+}

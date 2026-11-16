@@ -11,3 +11,4 @@
 - Task 6: driver traits and SQLite driver (streaming, cancel via interrupt, atomic batches, DB files list/create/rename/drop/switch).
 - Task 7: PostgreSQL driver (tokio-postgres + rustls, binary value decoding, side-connection cancel, notices) tested against a Docker postgres:16-alpine.
 - Task 8: MySQL/MariaDB driver (mysql_async + rustls, typed text protocol, KILL QUERY cancel, TLS modes) tested on mysql:8.4 and mariadb:11.8 containers.
+- Task 9: store crate (atomic JSON with corrupt-file backup, settings with SPEC defaults, connections/groups/tags, JSONL history, saved queries with path-escape protection, keyring and memory secret stores). SslMode moved to core.

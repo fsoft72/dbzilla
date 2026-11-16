@@ -29,16 +29,7 @@ pub enum DriverError {
 /// Result alias for driver calls.
 pub type DriverResult<T> = Result<T, DriverError>;
 
-/// TLS mode (the UI shows the driver-specific subset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SslMode {
-    #[default]
-    Preferred,
-    Disabled,
-    Required,
-    VerifyCa,
-    VerifyFull,
-}
+pub use dbzilla_core::model::SslMode;
 
 /// Everything needed to open a connection.
 #[derive(Debug, Clone)]
