@@ -3,6 +3,7 @@
 use crate::cli::{CliArgs, OpenTarget};
 use crate::glyphs::Ico;
 use crate::keymap::{Action, KeyMap};
+use crate::mcpbackend::{McpHost, PasswordResolver};
 use crate::theme;
 use crate::ui::connform::{self, config_for, ConnForm, FormAction, TestState};
 use crate::ui::connlist::{self, ListAction, ListState};
@@ -89,6 +90,8 @@ pub struct App {
     new_group: Option<String>,
     password_prompt: Option<PasswordPrompt>,
     pending_commands: Vec<PendingCommand>,
+    mcp: McpHost,
+    mcp_synced: Option<std::time::Instant>,
 }
 
 /// Chooses the OS keychain when it works, otherwise an in-memory store.
@@ -120,6 +123,16 @@ impl App {
         }
         let secrets = pick_secret_store(&mut toasts);
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(3).enable_all().build().expect("cannot start the async runtime");
+        let resolver: PasswordResolver = {
+            let secrets = secrets.clone();
+            Arc::new(move |c: &StoredConnection| match &c.password_mode {
+                PasswordMode::NoPassword => Ok(None),
+                PasswordMode::Keychain => secrets.get(&secret_key(&c.id, "password")).map_err(|e| format!("cannot read the password: {e}")),
+                PasswordMode::AskEveryTime => Err("this connection asks for its password every time, so it cannot be opened through MCP".to_owned()),
+                PasswordMode::Command(cmd) => run_password_command(cmd).map(Some),
+            })
+        };
+        let mcp = McpHost::new(paths.mcp_tokens_file(), paths.mcp_activity_file(), resolver);
         let mut app = Self {
             paths,
             settings: settings.value,
@@ -139,6 +152,8 @@ impl App {
             new_group: None,
             password_prompt: None,
             pending_commands: Vec::new(),
+            mcp,
+            mcp_synced: None,
         };
         if let Some(t) = cli.open {
             app.open_target(&cc.egui_ctx, t);
@@ -220,6 +235,15 @@ impl App {
 
     /// Handles results of background work.
     fn poll(&mut self, ctx: &egui::Context) {
+        let repaint = ctx.clone();
+        self.mcp.sync(self.rt.handle(), &self.settings.mcp, Arc::new(move || repaint.request_repaint()));
+        self.mcp.poll();
+        if self.mcp.running() && self.mcp_synced.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+            if let Ok(mut c) = self.mcp.shared.connections.lock() {
+                *c = self.store.list().to_vec();
+            }
+            self.mcp_synced = Some(std::time::Instant::now());
+        }
         for ws in &mut self.workspaces {
             ws.poll();
         }
@@ -676,10 +700,7 @@ impl eframe::App for App {
                     let width = ui.available_width().min(DETAIL_MAX_WIDTH);
                     let rect = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, ui.max_rect().height()));
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        changed = settings::show(ui, &mut self.settings, &mut self.settings_tab, &mut |ui, _| {
-                            widgets::muted(ui, "The MCP server arrives in a later milestone.");
-                            false
-                        });
+                        changed = settings::show(ui, &mut self.settings, &mut self.settings_tab, &mut |ui, s| crate::ui::mcp::settings_tab(ui, s, &mut self.mcp));
                     });
                 });
                 if changed {
@@ -688,6 +709,7 @@ impl eframe::App for App {
             }
         }
         self.modals(ctx);
+        crate::ui::mcp::approval_modal(ctx, &mut self.mcp);
         widgets::draw_toasts(ctx, &mut self.toasts);
     }
 }

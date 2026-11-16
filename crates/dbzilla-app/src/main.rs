@@ -9,6 +9,7 @@ mod cli;
 mod fuzzy;
 mod glyphs;
 mod keymap;
+mod mcpbackend;
 mod sqlhl;
 #[cfg(test)]
 mod testsupport;

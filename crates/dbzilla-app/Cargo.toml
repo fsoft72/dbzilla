@@ -8,9 +8,11 @@ name = "dbzilla"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = "0.1.92"
 dbzilla-core = { version = "0.1.0", path = "../dbzilla-core" }
 dbzilla-drivers = { version = "0.1.0", path = "../dbzilla-drivers" }
 dbzilla-io = { version = "0.1.0", path = "../dbzilla-io" }
+dbzilla-mcp = { version = "0.1.0", path = "../dbzilla-mcp" }
 dbzilla-session = { version = "0.1.0", path = "../dbzilla-session" }
 dbzilla-store = { version = "0.1.0", path = "../dbzilla-store" }
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
@@ -26,3 +28,4 @@ dtor = "1.0.7"
 egui_kittest = "0.31"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 tempfile = "3.27.0"
+ureq = { version = "3.5.2", features = ["json"] }

@@ -1175,9 +1175,11 @@ dependencies = [
 name = "dbzilla-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dbzilla-core",
  "dbzilla-drivers",
  "dbzilla-io",
+ "dbzilla-mcp",
  "dbzilla-session",
  "dbzilla-store",
  "dtor",
@@ -1191,6 +1193,7 @@ dependencies = [
  "sqlformat",
  "tempfile",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
