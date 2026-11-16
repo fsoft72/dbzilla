@@ -36,3 +36,4 @@
 - Data grid header shows the key icon (blue) for columns covered by a single-column unique index when they are not part of the PK (the PK checkbox cannot be changed on existing tables).
 - Structure: the PK checkbox is editable on existing tables (new `SetPrimaryKey` op: PostgreSQL assumes `<table>_pkey`, MySQL drop+add, SQLite rebuild only when the table has no PK yet). It must be applied separately from other column changes.
 - Structure: the delete (trash) button of a column moved next to the row number so it stays on screen.
+- Added scripts/release.sh (version bump, tag, push) and the tag-triggered release workflow that builds Linux, macOS and Windows binaries into GitHub Releases.
