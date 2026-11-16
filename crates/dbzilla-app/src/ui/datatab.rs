@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn merging_structure_info() {
         let st = TableStructure {
-            columns: vec![ColumnMeta { name: "id".into(), type_name: "int4".into(), is_pk: true, ordinal: 0, ..Default::default() }, ColumnMeta { name: "cid".into(), fk: Some(ForeignKeyRef { table: TableRef::simple("c"), columns: vec!["id".into()], on_update: "NO ACTION".into(), on_delete: "NO ACTION".into() }), ..col("cid") }],
+            columns: vec![ColumnMeta { name: "id".into(), type_name: "int4".into(), is_pk: true, ordinal: 0, ..Default::default() }, ColumnMeta { name: "cid".into(), fk: Some(ForeignKeyRef { table: TableRef::simple("c"), columns: vec!["id".into()], on_update: "NO ACTION".into(), on_delete: "NO ACTION".into(), name: None }), ..col("cid") }],
             ..Default::default()
         };
         let merged = merge_columns(&[col("id"), col("cid"), col("extra")], Some(&st));

@@ -267,7 +267,7 @@ fn read_foreign_keys(conn: &Connection, quoted: &str, st: &mut TableStructure) -
     for row in rows {
         let (table, from, to, on_update, on_delete) = row.map_err(map_err)?;
         let Some(col) = st.columns.iter_mut().find(|c| c.name == from) else { continue };
-        col.fk = Some(ForeignKeyRef { table: TableRef::simple(&table), columns: to.into_iter().collect(), on_update, on_delete });
+        col.fk = Some(ForeignKeyRef { table: TableRef::simple(&table), columns: to.into_iter().collect(), on_update, on_delete, name: None });
     }
     Ok(())
 }

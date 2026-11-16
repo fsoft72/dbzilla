@@ -161,6 +161,8 @@ impl Default for KeyMap {
         m.insert(Action::DuplicateRow, cmd(Key::D));
         m.insert(Action::Export, cmd_shift(Key::E));
         m.insert(Action::FocusSidebarSearch, cmd_shift(Key::F));
+        m.insert(Action::ShowData, KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, Key::OpenBracket));
+        m.insert(Action::ShowStructure, KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::ALT, Key::CloseBracket));
         Self { map: m }
     }
 }

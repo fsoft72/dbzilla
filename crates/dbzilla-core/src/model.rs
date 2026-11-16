@@ -15,6 +15,9 @@ pub struct ForeignKeyRef {
     pub columns: Vec<String>,
     pub on_update: String,
     pub on_delete: String,
+    /// Constraint name when the database reports one.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Column description.

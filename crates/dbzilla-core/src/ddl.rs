@@ -115,7 +115,7 @@ fn fks_from_columns(cols: &[ColumnMeta]) -> Vec<ForeignKeyDef> {
         .filter_map(|c| {
             let fk = c.fk.as_ref()?;
             Some(ForeignKeyDef {
-                name: None,
+                name: fk.name.clone(),
                 columns: vec![c.name.clone()],
                 ref_table: fk.table.clone(),
                 ref_columns: fk.columns.clone(),

@@ -7,6 +7,8 @@ use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
 use super::sidebar::{self, ExtraAction, SidebarAction, SidebarState, SidebarTab};
 use super::sqltab::{self, ResStatus, ResultTab, SqlAction, SqlEnv, SqlTab};
+use super::structdraft::{FkDraft, StructDraft};
+use super::structure::{self, StructAction, StructEnv};
 use super::tabs::{decide_open, OpenDecision, OpenMode, TabId, TabMeta, TabTarget};
 use super::widgets;
 use super::Toasts;
@@ -17,7 +19,8 @@ use crate::sqltext;
 use crate::theme;
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::changes::generate_sql;
-use dbzilla_core::copyfmt::{format_rows, CopyContext, CopyFormat, CsvOptions};
+use dbzilla_core::copyfmt::{copy_script, format_rows, CopyContext, CopyFormat, CsvOptions, ScriptKind};
+use dbzilla_core::ddl::{generate_ddl, StructuralOp};
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::rowlimit::apply_row_limit;
@@ -34,6 +37,20 @@ use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Stroke};
 use egui_dock::{DockArea, DockState, Style, TabViewer};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Statements that replace a view with the edited definition.
+fn view_apply_statements(driver: DriverId, table: &TableRef, ddl: &str) -> Vec<String> {
+    let d = dialect_for(driver);
+    let body = ddl.trim().trim_end_matches(';').to_owned();
+    match driver {
+        DriverId::Postgres => vec![body],
+        DriverId::MySql => {
+            let rest = body.strip_prefix("CREATE").or_else(|| body.strip_prefix("create")).map(str::to_owned);
+            vec![rest.map_or(body, |r| format!("ALTER{r}"))]
+        }
+        DriverId::Sqlite => vec![format!("DROP VIEW {}", d.quote_table(table)), body],
+    }
+}
 
 /// Quotes an identifier only when it is not a plain lower-case word.
 fn quote_if_needed(d: &dyn Dialect, name: &str) -> String {
@@ -55,6 +72,15 @@ pub enum WsStatus {
     Disconnected(String),
 }
 
+/// Which view of a table is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabView {
+    Data,
+    Structure,
+    Index,
+    Ddl,
+}
+
 /// Content of a table tab.
 pub struct TableTab {
     pub table: TableRef,
@@ -62,7 +88,49 @@ pub struct TableTab {
     pub error: Option<String>,
     pub data: DataState,
     pub is_view: bool,
+    pub is_matview: bool,
+    pub view: TabView,
+    pub draft: Option<StructDraft>,
+    pub ddl_text: String,
+    /// The last commit changed the structure (reload it afterwards).
+    ddl_commit: bool,
+    /// New name when the last commit renames the table.
+    rename_to: Option<String>,
 }
+
+impl TableTab {
+    /// True when the DDL text differs from the database.
+    fn ddl_dirty(&self) -> bool {
+        self.structure.as_ref().is_some_and(|s| s.ddl != self.ddl_text)
+    }
+}
+
+/// What happens after a statement batch that is not a tab commit.
+#[derive(Debug, Clone, Default)]
+struct DdlAfter {
+    closed: Option<TableRef>,
+    message: String,
+}
+
+/// Table level dialogs (SPEC 8.9).
+enum OpDialog {
+    Clone { source: TableRef, name: String, with_data: bool },
+    Truncate { table: TableRef, cascade: bool, restart: bool },
+    Drop { table: TableRef, cascade: bool },
+}
+
+/// Dialog creating a foreign key.
+struct FkDialog {
+    tab: TabId,
+    col: usize,
+    ref_table: String,
+    ref_columns: String,
+    on_update: String,
+    on_delete: String,
+}
+
+/// Foreign key actions offered in menus.
+const FK_ACTIONS: [&str; 5] = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"];
 
 /// The persistent stores a workspace writes to.
 pub struct Stores {
@@ -84,11 +152,13 @@ enum ReqKind {
     Count,
     Commit,
     Sql,
+    Ddl,
 }
 
 /// What a confirmed gate does.
 enum GateAction {
     Commit,
+    Ddl(DdlAfter),
     Run { labels: Vec<Option<String>>, originals: Vec<String> },
 }
 
@@ -200,6 +270,13 @@ pub struct Workspace {
     save_dialog: Option<SaveDialog>,
     requested_structs: HashSet<String>,
     commit_log: HashMap<RequestId, (Vec<String>, Option<String>)>,
+    ddl_after: HashMap<RequestId, DdlAfter>,
+    op_dialog: Option<OpDialog>,
+    fk_dialog: Option<FkDialog>,
+    triggers_for: Option<TabId>,
+    pending_copy: Option<(TableRef, ScriptKind)>,
+    clipboard_out: Option<String>,
+    new_table_no: usize,
     log_original: bool,
     sql_counter: usize,
     fmt_width: u8,
@@ -255,6 +332,13 @@ impl Workspace {
             save_dialog: None,
             requested_structs: HashSet::new(),
             commit_log: HashMap::new(),
+            ddl_after: HashMap::new(),
+            op_dialog: None,
+            fk_dialog: None,
+            triggers_for: None,
+            pending_copy: None,
+            clipboard_out: None,
+            new_table_no: 0,
             log_original: false,
             sql_counter: 0,
             fmt_width: 4,
@@ -455,6 +539,20 @@ impl Workspace {
                 if t.data.key_cols.is_empty() {
                     t.data.key_cols = default_key_columns(Some(&st));
                 }
+                if t.draft.as_ref().is_none_or(|d| !d.has_changes() && !d.is_new) {
+                    t.draft = Some(StructDraft::from_structure(&st));
+                }
+                if !t.ddl_dirty() {
+                    t.ddl_text = st.ddl.clone();
+                }
+            }
+        }
+        if let Some((table, kind)) = self.pending_copy.take() {
+            if table == st.table {
+                self.clipboard_out = Some(copy_script(kind, &st, self.dialect.as_ref()));
+                self.notices.push((false, "Script copied".into()));
+            } else {
+                self.pending_copy = Some((table, kind));
             }
         }
         self.structures.insert(st.table.clone(), st);
@@ -491,6 +589,9 @@ impl Workspace {
 
     /// Opens a table with initial filters (used when following a foreign key).
     pub fn open_table_with(&mut self, table: TableRef, mode: OpenMode, filters: Vec<Filter>) {
+        if let Some(kind) = self.objects.iter().find(|o| o.table == table).map(|o| o.kind).filter(|k| matches!(k, ObjectKind::Function | ObjectKind::Procedure)) {
+            return self.open_definition(&table, kind);
+        }
         let metas = self.tab_metas();
         let focused = self.focused_tab();
         let decision = decide_open(&metas, focused, &TabTarget::Table(table.clone()), mode);
@@ -503,7 +604,9 @@ impl Workspace {
             if let Some(st) = ws.structures.get(&table) {
                 data.key_cols = default_key_columns(Some(st));
             }
-            Tab { id, pinned, kind: TabKind::Table(Box::new(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data, is_view })) }
+            let is_matview = ws.objects.iter().any(|o| o.table == table && o.kind == ObjectKind::MaterializedView);
+            let ddl_text = ws.structures.get(&table).map(|s| s.ddl.clone()).unwrap_or_default();
+            Tab { id, pinned, kind: TabKind::Table(Box::new(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data, is_view, is_matview, view: TabView::Data, draft: None, ddl_text, ddl_commit: false, rename_to: None })) }
         };
         let mut touched: Option<TabId> = None;
         match decision {
@@ -586,6 +689,8 @@ impl Workspace {
                 }
             }
             Action::ReloadWorkspace => self.load_schema(),
+            Action::ShowData => self.set_view(TabView::Data),
+            Action::ShowStructure => self.set_view(TabView::Structure),
             Action::NewSqlEditor => self.open_sql(String::new()),
             Action::RunCurrent => self.run_sql(false),
             Action::RunAll => self.run_sql(true),
@@ -944,11 +1049,39 @@ impl Workspace {
 
     /// True when the focused tab has pending changes.
     pub fn has_pending(&mut self) -> bool {
-        self.active_tab_mut().is_some_and(|(_, t)| t.data.pending.has_changes())
+        self.active_tab_mut().is_some_and(|(_, t)| match t.view {
+            TabView::Data => t.data.pending.has_changes(),
+            TabView::Structure | TabView::Index => t.draft.as_ref().is_some_and(StructDraft::has_changes),
+            TabView::Ddl => t.ddl_dirty(),
+        })
     }
 
     /// Statements for the pending changes of a tab.
     fn statements_of(&mut self, id: TabId) -> Result<Vec<String>, String> {
+        let driver = self.conn.driver;
+        let caps = self.caps.clone();
+        let Some(t) = self.table_tab_mut(id) else { return Err("tab closed".into()) };
+        match t.view {
+            TabView::Structure | TabView::Index => {
+                let Some(d) = &t.draft else { return Ok(Vec::new()) };
+                if !d.has_changes() {
+                    return Ok(Vec::new());
+                }
+                let dialect = dialect_for(driver);
+                let mut out = Vec::new();
+                for op in d.to_ops(&caps)? {
+                    out.extend(generate_ddl(&op, dialect.as_ref()).map_err(|e| e.to_string())?);
+                }
+                return Ok(out);
+            }
+            TabView::Ddl => {
+                if !t.ddl_dirty() {
+                    return Ok(Vec::new());
+                }
+                return Ok(view_apply_statements(driver, &t.table, &t.ddl_text));
+            }
+            TabView::Data => {}
+        }
         let columns = {
             let table = self.tab_table(id);
             let st = self.structures.get(&table).cloned();
@@ -973,8 +1106,21 @@ impl Workspace {
 
     /// Throws away the pending changes of the focused tab and reloads it.
     pub fn discard_active(&mut self) {
-        if let Some((id, _)) = self.active_tab_mut() {
-            self.fetch_tab_forced(id);
+        let Some((id, t)) = self.active_tab_mut() else { return };
+        match t.view {
+            TabView::Data => self.fetch_tab_forced(id),
+            TabView::Structure | TabView::Index => {
+                if t.draft.as_ref().is_some_and(|d| d.is_new) {
+                    self.retain_tabs(|x| x.id != id);
+                } else {
+                    t.draft = t.structure.as_ref().map(StructDraft::from_structure);
+                }
+            }
+            TabView::Ddl => {
+                if let Some(st) = &t.structure {
+                    t.ddl_text = st.ddl.clone();
+                }
+            }
         }
     }
 
@@ -1003,6 +1149,8 @@ impl Workspace {
         self.commit_log.insert(req, (statements.clone(), csv));
         if let Some(t) = self.table_tab_mut(id) {
             t.data.committing = true;
+            t.ddl_commit = t.view != TabView::Data;
+            t.rename_to = t.draft.as_ref().filter(|d| t.view != TabView::Data && !d.is_new && d.new_name.trim() != t.table.name).map(|d| d.new_name.trim().to_owned());
         }
         self.req_map.insert(req, (id, ReqKind::Commit));
         self.session.send(Command::Commit { req, statements });
@@ -1022,22 +1170,173 @@ impl Workspace {
             }
             self.history_dirty = true;
         }
-        let Some((id, ReqKind::Commit)) = self.req_map.remove(&req) else { return };
-        if let Some(t) = self.table_tab_mut(id) {
-            t.data.committing = false;
+        match self.req_map.remove(&req) {
+            Some((id, ReqKind::Commit)) => {
+                self.notices.push((false, format!("{statements} {} committed", if statements == 1 { "statement" } else { "statements" })));
+                self.after_tab_commit(id);
+            }
+            Some((_, ReqKind::Ddl)) => {
+                let after = self.ddl_after.remove(&req).unwrap_or_default();
+                if let Some(closed) = &after.closed {
+                    let closed = closed.clone();
+                    self.structures.remove(&closed);
+                    self.retain_tabs(|t| !matches!(&t.kind, TabKind::Table(tt) if tt.table == closed));
+                }
+                self.notices.push((false, if after.message.is_empty() { "Done".into() } else { after.message }));
+                self.load_schema();
+            }
+            _ => {}
         }
-        self.notices.push((false, format!("{statements} {} committed", if statements == 1 { "statement" } else { "statements" })));
+    }
+
+    /// After a tab commit: reload the data and, for structure changes, the structure and the item list.
+    fn after_tab_commit(&mut self, id: TabId) {
+        let Some(t) = self.table_tab_mut(id) else { return };
+        t.data.committing = false;
+        if !t.ddl_commit {
+            return self.fetch_tab_forced(id);
+        }
+        t.ddl_commit = false;
+        let old = t.table.clone();
+        let new_name = t.rename_to.take().or_else(|| t.draft.as_ref().filter(|d| d.is_new).map(|d| d.new_name.trim().to_owned()));
+        if let Some(n) = new_name {
+            t.table.name = n;
+        }
+        if t.draft.as_ref().is_some_and(|d| d.is_new) {
+            t.is_view = false;
+        }
+        t.draft = None;
+        t.structure = None;
+        let table = t.table.clone();
+        self.structures.remove(&old);
+        self.structures.remove(&table);
+        self.session.send(Command::LoadStructure(table));
+        self.load_schema();
         self.fetch_tab_forced(id);
     }
 
     /// A commit failed: nothing is lost, the changes stay pending.
     fn on_commit_error(&mut self, req: RequestId, error: String) {
         self.commit_log.remove(&req);
-        let Some((id, ReqKind::Commit)) = self.req_map.remove(&req) else { return };
-        if let Some(t) = self.table_tab_mut(id) {
-            t.data.committing = false;
+        self.ddl_after.remove(&req);
+        let Some((id, kind)) = self.req_map.remove(&req) else { return };
+        if kind == ReqKind::Commit {
+            if let Some(t) = self.table_tab_mut(id) {
+                t.data.committing = false;
+                t.ddl_commit = false;
+            }
         }
         self.notices.push((true, format!("Commit failed: {error}")));
+    }
+
+    /// Table tab showing `table`.
+    fn find_table_tab(&mut self, table: &TableRef) -> Option<TabId> {
+        self.dock.iter_all_tabs().find(|(_, t)| matches!(&t.kind, TabKind::Table(tt) if &tt.table == table)).map(|(_, t)| t.id)
+    }
+
+    /// Opens a table on a given view.
+    fn open_table_view(&mut self, table: TableRef, view: TabView) {
+        self.open_table(table.clone(), OpenMode::Pin);
+        if let Some(id) = self.find_table_tab(&table) {
+            if let Some(t) = self.table_tab_mut(id) {
+                t.view = view;
+            }
+        }
+    }
+
+    /// Switches the focused table tab to a view.
+    fn set_view(&mut self, view: TabView) {
+        if let Some((_, t)) = self.active_tab_mut() {
+            t.view = view;
+        }
+    }
+
+    /// Opens an editor for a table that does not exist yet.
+    pub fn new_table(&mut self) {
+        self.new_table_no += 1;
+        let table = TableRef { database: None, schema: self.current_schema.clone().filter(|_| self.caps.schemas), name: format!("untitled_table_{}", self.new_table_no) };
+        let int_type = self.dialect.types().first().copied().unwrap_or("integer");
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut data = DataState::new(self.page_size);
+        data.key_cols = vec!["id".into()];
+        let draft = StructDraft::new_table(table.clone(), int_type);
+        let tab = TableTab { table, structure: None, error: None, data, is_view: false, is_matview: false, view: TabView::Structure, draft: Some(draft), ddl_text: String::new(), ddl_commit: false, rename_to: None };
+        self.dock.push_to_focused_leaf(Tab { id, pinned: true, kind: TabKind::Table(Box::new(tab)) });
+        if let Some(loc) = self.tab_location(id) {
+            self.dock.set_active_tab(loc);
+            self.dock.set_focused_node_and_surface((loc.0, loc.1));
+        }
+    }
+
+    /// Generates statements for operations and sends them through the safe-mode gate.
+    fn submit_ddl(&mut self, ops: Vec<StructuralOp>, after: DdlAfter) {
+        let dialect = dialect_for(self.conn.driver);
+        let mut statements = Vec::new();
+        for op in &ops {
+            match generate_ddl(op, dialect.as_ref()) {
+                Ok(v) => statements.extend(v),
+                Err(e) => return self.notices.push((true, e.to_string())),
+            }
+        }
+        match gate_check(self.conn.safe_level, self.conn.driver, &statements) {
+            GateDecision::Allow => self.send_ddl(statements, after),
+            GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::Ddl(after), statements: t, needs_password: false, input: String::new(), reveal: false, tab: 0, error: None }),
+            GateDecision::Password(t) => {
+                let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                self.gate = Some(GateModal { action: GateAction::Ddl(after), statements: t, needs_password: known, input: String::new(), reveal: false, tab: 0, error: None });
+            }
+        }
+    }
+
+    /// Sends table level statements.
+    fn send_ddl(&mut self, statements: Vec<String>, after: DdlAfter) {
+        let req = RequestId::next();
+        self.commit_log.insert(req, (statements.clone(), None));
+        self.ddl_after.insert(req, after);
+        self.req_map.insert(req, (0, ReqKind::Ddl));
+        self.session.send(Command::Commit { req, statements });
+    }
+
+    /// Copies a creation / drop / truncate / select script of a table.
+    fn copy_script_for(&mut self, table: TableRef, kind: ScriptKind) {
+        match self.structures.get(&table) {
+            Some(st) => {
+                self.clipboard_out = Some(copy_script(kind, st, self.dialect.as_ref()));
+                self.notices.push((false, "Script copied".into()));
+            }
+            None => {
+                self.pending_copy = Some((table.clone(), kind));
+                self.session.send(Command::LoadStructure(table));
+            }
+        }
+    }
+
+    /// Opens the definition of a function or procedure in a SQL tab.
+    fn open_definition(&mut self, table: &TableRef, kind: ObjectKind) {
+        let d = dialect_for(self.conn.driver);
+        let sql = match self.conn.driver {
+            DriverId::Postgres => format!(
+                "SELECT pg_get_functiondef(p.oid) AS definition FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = {} AND p.proname = {}",
+                d.literal(&dbzilla_core::value::Value::Text(table.schema.clone().unwrap_or_else(|| "public".into()))),
+                d.literal(&dbzilla_core::value::Value::Text(table.name.clone()))
+            ),
+            DriverId::MySql => format!("SHOW CREATE {} {}.{}", if kind == ObjectKind::Procedure { "PROCEDURE" } else { "FUNCTION" }, d.quote_ident(table.database.as_deref().unwrap_or(&self.current_db)), d.quote_ident(&table.name)),
+            DriverId::Sqlite => return self.notices.push((true, "SQLite has no stored functions".into())),
+        };
+        self.open_sql(sql);
+        self.run_sql(true);
+    }
+
+    /// Requests of the structure views.
+    fn struct_action(&mut self, id: TabId, a: StructAction) {
+        match a {
+            StructAction::EditFk(col) => {
+                let first = self.objects.iter().find(|o| o.kind == ObjectKind::Table).map(|o| o.table.name.clone()).unwrap_or_default();
+                self.fk_dialog = Some(FkDialog { tab: id, col, ref_table: first, ref_columns: "id".into(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into() });
+            }
+            StructAction::ShowTriggers => self.triggers_for = Some(id),
+        }
     }
 
     /// CSV of the rows as they were before the pending updates and deletes.
@@ -1150,6 +1449,7 @@ impl Workspace {
         let mut requests = Vec::new();
         let mut data_actions: Vec<(TabId, DataAction)> = Vec::new();
         let mut sql_actions: Vec<(TabId, SqlAction)> = Vec::new();
+        let mut struct_actions: Vec<(TabId, StructAction)> = Vec::new();
         self.fmt_width = env.settings.indent_width;
         self.fmt_with = env.settings.indent_with;
         self.fmt_kind = env.settings.indent_type;
@@ -1184,7 +1484,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -1201,6 +1501,9 @@ impl Workspace {
         for (_, a) in sql_actions {
             self.sql_action(a);
         }
+        for (id, a) in struct_actions {
+            self.struct_action(id, a);
+        }
         for (id, a) in data_actions {
             match a {
                 DataAction::Refetch => self.fetch_tab(id),
@@ -1212,6 +1515,9 @@ impl Workspace {
             }
         }
         self.modals(ctx);
+        if let Some(text) = self.clipboard_out.take() {
+            ctx.copy_text(text);
+        }
         for (is_err, m) in self.notices.drain(..) {
             if is_err {
                 env.toasts.err(m);
@@ -1231,6 +1537,15 @@ impl Workspace {
             }
             Some(SidebarAction::Refresh) => self.load_schema(),
             Some(SidebarAction::Extra(a)) => self.handle_extra(ctx, a),
+            Some(SidebarAction::OpenStructure(t)) => self.open_table_view(t, TabView::Structure),
+            Some(SidebarAction::CopyScript(t, k)) => self.copy_script_for(t, k),
+            Some(SidebarAction::CloneTable(t)) => {
+                let name = format!("{}_clone", t.name);
+                self.op_dialog = Some(OpDialog::Clone { source: t, name, with_data: true });
+            }
+            Some(SidebarAction::TruncateTable(t)) => self.op_dialog = Some(OpDialog::Truncate { table: t, cascade: false, restart: false }),
+            Some(SidebarAction::DropTable(t)) => self.op_dialog = Some(OpDialog::Drop { table: t, cascade: false }),
+            Some(SidebarAction::NewTable) => self.new_table(),
             None => {}
         }
         if self.palette.is_some() {
@@ -1267,6 +1582,7 @@ impl Workspace {
 
     /// Preview, safe-mode and key-column dialogs.
     fn modals(&mut self, ctx: &egui::Context) {
+        self.table_dialogs(ctx);
         if let Some(d) = self.save_dialog.as_mut() {
             let mut decision = None;
             widgets::modal(ctx, "Add to Queries", |ui| {
@@ -1378,6 +1694,7 @@ impl Workspace {
                         if let Some(g) = self.gate.take() {
                             match g.action {
                                 GateAction::Commit => self.send_commit(g.tab, g.statements),
+                                GateAction::Ddl(after) => self.send_ddl(g.statements, after),
                                 GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
                             }
                         }
@@ -1417,6 +1734,166 @@ impl Workspace {
                 }
                 Some(false) => self.key_dialog = None,
                 None => {}
+            }
+        }
+    }
+
+    /// Clone / truncate / drop, foreign key and trigger dialogs.
+    fn table_dialogs(&mut self, ctx: &egui::Context) {
+        let caps = self.caps.clone();
+        if let Some(op) = self.op_dialog.as_mut() {
+            let mut decision = None;
+            let title = match op {
+                OpDialog::Clone { .. } => "Clone table",
+                OpDialog::Truncate { .. } => "Truncate table",
+                OpDialog::Drop { .. } => "Delete table",
+            };
+            widgets::modal(ctx, title, |ui| {
+                match op {
+                    OpDialog::Clone { source, name, with_data } => {
+                        widgets::muted(ui, &format!("Copy of {}", source.name));
+                        widgets::field_label(ui, "New table name");
+                        widgets::input(ui, name, "name");
+                        ui.checkbox(with_data, "Duplicate table content");
+                    }
+                    OpDialog::Truncate { table, cascade, restart } => {
+                        ui.label(format!("Delete every row of {}?", table.name));
+                        if caps.truncate_cascade {
+                            ui.checkbox(cascade, "Cascade");
+                        }
+                        if caps.truncate_restart_identity {
+                            ui.checkbox(restart, "Restart identity");
+                        }
+                    }
+                    OpDialog::Drop { table, cascade } => {
+                        ui.label(format!("Delete {}? This cannot be undone.", table.name));
+                        if caps.drop_cascade {
+                            ui.checkbox(cascade, "Cascade");
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let destructive = !matches!(op, OpDialog::Clone { .. });
+                    let label = match op {
+                        OpDialog::Clone { .. } => "Clone",
+                        OpDialog::Truncate { .. } => "Truncate",
+                        OpDialog::Drop { .. } => "Delete",
+                    };
+                    let clicked = if destructive { widgets::danger_button(ui, label).clicked() } else { widgets::primary_button(ui, label).clicked() };
+                    if clicked {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    if let Some(op) = self.op_dialog.take() {
+                        match op {
+                            OpDialog::Clone { source, name, with_data } => {
+                                if name.trim().is_empty() {
+                                    self.notices.push((true, "Give the new table a name".into()));
+                                    self.op_dialog = Some(OpDialog::Clone { source, name, with_data });
+                                } else {
+                                    let mut target = source.clone();
+                                    target.name = name.trim().to_owned();
+                                    let msg = format!("Cloned {} to {}", source.name, target.name);
+                                    self.submit_ddl(vec![StructuralOp::CloneTable { source, target, with_data }], DdlAfter { closed: None, message: msg });
+                                }
+                            }
+                            OpDialog::Truncate { table, cascade, restart } => {
+                                let msg = format!("Truncated {}", table.name);
+                                self.submit_ddl(vec![StructuralOp::Truncate { table: table.clone(), cascade, restart_identity: restart }], DdlAfter { closed: None, message: msg });
+                                let tabs: Vec<TabId> = self.dock.iter_all_tabs().filter(|(_, t)| matches!(&t.kind, TabKind::Table(tt) if tt.table == table)).map(|(_, t)| t.id).collect();
+                                for id in tabs {
+                                    if let Some(t) = self.table_tab_mut(id) {
+                                        t.data.total = Total::Unknown;
+                                    }
+                                }
+                            }
+                            OpDialog::Drop { table, cascade } => {
+                                let msg = format!("Deleted {}", table.name);
+                                self.submit_ddl(vec![StructuralOp::DropTable { table: table.clone(), cascade }], DdlAfter { closed: Some(table), message: msg });
+                            }
+                        }
+                    }
+                }
+                Some(false) => self.op_dialog = None,
+                None => {}
+            }
+        }
+        if let Some(f) = self.fk_dialog.as_mut() {
+            let mut decision = None;
+            let tables: Vec<String> = self.objects.iter().filter(|o| o.kind == ObjectKind::Table).map(|o| o.table.name.clone()).collect();
+            widgets::modal(ctx, "Create a foreign key", |ui| {
+                widgets::field_label(ui, "Referenced table");
+                egui::ComboBox::from_id_salt("fk_table").selected_text(f.ref_table.clone()).width(240.0).show_ui(ui, |ui| {
+                    for t in &tables {
+                        ui.selectable_value(&mut f.ref_table, t.clone(), t);
+                    }
+                });
+                widgets::field_label(ui, "Referenced column");
+                widgets::input(ui, &mut f.ref_columns, "id");
+                widgets::field_label(ui, "On update");
+                egui::ComboBox::from_id_salt("fk_upd").selected_text(f.on_update.clone()).show_ui(ui, |ui| {
+                    for a in FK_ACTIONS {
+                        ui.selectable_value(&mut f.on_update, a.to_owned(), a);
+                    }
+                });
+                widgets::field_label(ui, "On delete");
+                egui::ComboBox::from_id_salt("fk_del").selected_text(f.on_delete.clone()).show_ui(ui, |ui| {
+                    for a in FK_ACTIONS {
+                        ui.selectable_value(&mut f.on_delete, a.to_owned(), a);
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Create").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    if let Some(f) = self.fk_dialog.take() {
+                        let target = self.objects.iter().find(|o| o.table.name == f.ref_table).map(|o| o.table.clone()).unwrap_or_else(|| TableRef::simple(&f.ref_table));
+                        let cols: Vec<String> = f.ref_columns.split(',').map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect();
+                        if cols.is_empty() || f.ref_table.is_empty() {
+                            self.notices.push((true, "Choose the referenced table and column".into()));
+                        } else if let Some(t) = self.table_tab_mut(f.tab) {
+                            if let Some(c) = t.draft.as_mut().and_then(|d| d.cols.get_mut(f.col)) {
+                                c.fk = Some(FkDraft { name: None, ref_table: target, ref_columns: cols, on_update: f.on_update, on_delete: f.on_delete });
+                            }
+                        }
+                    }
+                }
+                Some(false) => self.fk_dialog = None,
+                None => {}
+            }
+        }
+        if let Some(id) = self.triggers_for {
+            let triggers = self.table_tab_mut(id).and_then(|t| t.structure.as_ref().map(|s| s.triggers.clone())).unwrap_or_default();
+            let mut close = false;
+            widgets::modal(ctx, "Triggers", |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for t in &triggers {
+                        ui.label(widgets::semibold(format!("{}  {} {}", t.name, t.timing, t.event), 13.0).color(theme::SECONDARY));
+                        ui.add(egui::Label::new(RichText::new(&t.statement).monospace().color(theme::TEXT)).selectable(true));
+                        ui.add_space(6.0);
+                    }
+                });
+                if widgets::secondary_button(ui, "Close").clicked() {
+                    close = true;
+                }
+            });
+            if close {
+                self.triggers_for = None;
             }
         }
     }
@@ -1511,6 +1988,8 @@ struct Viewer<'a> {
     row_height: f32,
     structures: &'a HashMap<TableRef, TableStructure>,
     sql_actions: &'a mut Vec<(TabId, SqlAction)>,
+    struct_actions: &'a mut Vec<(TabId, StructAction)>,
+    caps: &'a Capabilities,
     keywords: &'a HashSet<String>,
     driver: DriverId,
     font_size: f32,
@@ -1568,9 +2047,51 @@ impl TabViewer for Viewer<'_> {
             }
         };
         let table = t.table.clone();
-        let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table), is_view: t.is_view };
-        for a in datatab::show(ui, &mut t.data, &env) {
-            self.data_actions.push((id, a));
+        let creating = t.draft.as_ref().is_some_and(|d| d.is_new);
+        egui::TopBottomPanel::bottom(ui.id().with("view_switch")).exact_height(32.0).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(Margin::symmetric(10, 4))).show_inside(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.add_enabled_ui(!creating, |ui| {
+                    ui.selectable_value(&mut t.view, TabView::Data, "Data");
+                });
+                ui.selectable_value(&mut t.view, TabView::Structure, "Structure");
+                ui.selectable_value(&mut t.view, TabView::Index, "Index");
+                ui.add_enabled_ui(!creating, |ui| {
+                    ui.selectable_value(&mut t.view, TabView::Ddl, "DDL");
+                });
+            });
+        });
+        if t.draft.is_none() && t.view != TabView::Data {
+            t.draft = t.structure.as_ref().map(StructDraft::from_structure);
+        }
+        match t.view {
+            TabView::Data => {
+                let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table), is_view: t.is_view };
+                for a in datatab::show(ui, &mut t.data, &env) {
+                    self.data_actions.push((id, a));
+                }
+            }
+            TabView::Structure | TabView::Index => {
+                let editable = !t.is_view && !t.is_matview;
+                let senv = StructEnv { caps: self.caps, types: self.dialect.types(), editable };
+                match &mut t.draft {
+                    Some(d) if t.view == TabView::Structure => {
+                        for a in structure::show_columns(ui, d, &senv) {
+                            self.struct_actions.push((id, a));
+                        }
+                    }
+                    Some(d) => structure::show_indexes(ui, d, &senv),
+                    None => {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| ui.spinner());
+                    }
+                }
+            }
+            TabView::Ddl => {
+                let editable = t.is_view && !t.is_matview;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_enabled(editable, egui::TextEdit::multiline(&mut t.ddl_text).code_editor().desired_width(f32::INFINITY).desired_rows(20));
+                });
+            }
         }
     }
 
@@ -1878,6 +2399,105 @@ mod tests {
         ws.handle_extra(&egui::Context::default(), ExtraAction::HistoryClear);
         ws.refresh_lists();
         assert!(ws.history_cache.is_empty());
+    }
+
+    fn structure_ready(ws: &mut Workspace) -> bool {
+        ws.active_tab_mut().is_some_and(|(_, t)| !t.data.committing && !t.data.loading && t.structure.is_some() && t.draft.is_some())
+    }
+
+    /// Editing the structure: add a column, commit, the table and the draft reload.
+    #[test]
+    fn structure_add_column_and_commit() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        wait(&mut ws, structure_ready);
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.view = TabView::Structure;
+        let mut c = super::super::structdraft::ColDraft::blank("integer");
+        c.name = "qty".into();
+        c.default = "7".into();
+        t.draft.as_mut().unwrap().cols.push(c);
+        assert!(ws.has_pending());
+        ws.commit_active();
+        wait(&mut ws, |w| structure_ready(w) && !w.has_pending() && w.active_tab_mut().is_some_and(|(_, t)| t.structure.as_ref().is_some_and(|s| s.columns.len() == 3)));
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let v: i64 = c.query_row("SELECT qty FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 7, "the default filled the new column");
+    }
+
+    /// SQLite alter column rebuilds the table and keeps the data; renaming follows.
+    #[test]
+    fn structure_alter_and_rename_on_sqlite() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        wait(&mut ws, structure_ready);
+        {
+            let (_, t) = ws.active_tab_mut().unwrap();
+            t.view = TabView::Structure;
+            let d = t.draft.as_mut().unwrap();
+            d.cols[1].name = "label".into();
+            d.cols[1].type_name = "VARCHAR(30)".into();
+            d.new_name = "things".into();
+        }
+        ws.commit_active();
+        wait(&mut ws, |w| structure_ready(w) && w.active_tab_mut().is_some_and(|(_, t)| t.table.name == "things" && t.structure.as_ref().is_some_and(|s| s.table.name == "things")));
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let labels: Vec<String> = c.prepare("SELECT label FROM things ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(labels, vec!["alpha", "beta"]);
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "things") && !w.objects.iter().any(|o| o.table.name == "t"));
+    }
+
+    /// A new table is created from the editor and becomes a normal tab.
+    #[test]
+    fn create_table_from_the_editor() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        ws.new_table();
+        {
+            let (_, t) = ws.active_tab_mut().unwrap();
+            let d = t.draft.as_mut().unwrap();
+            d.new_name = "fresh".into();
+            let mut c = super::super::structdraft::ColDraft::blank("TEXT");
+            c.name = "label".into();
+            d.cols.push(c);
+        }
+        ws.commit_active();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "fresh") && w.active_tab_mut().is_some_and(|(_, t)| t.table.name == "fresh" && t.structure.is_some() && !t.data.loading));
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM fresh", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        assert!(!ws.active_tab_mut().unwrap().1.draft.as_ref().is_some_and(|d| d.is_new));
+    }
+
+    /// Clone, truncate and drop go through the same pipeline as commits.
+    #[test]
+    fn clone_truncate_and_drop_tables() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        open_t(&mut ws);
+        ws.submit_ddl(vec![StructuralOp::CloneTable { source: TableRef::simple("t"), target: TableRef::simple("t_clone"), with_data: true }], DdlAfter::default());
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "t_clone"));
+        let count = |table: &str| -> i64 { rusqlite::Connection::open(&path).unwrap().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("t_clone"), 2);
+        ws.submit_ddl(vec![StructuralOp::Truncate { table: TableRef::simple("t_clone"), cascade: false, restart_identity: false }], DdlAfter::default());
+        wait(&mut ws, |_| count("t_clone") == 0);
+        ws.submit_ddl(vec![StructuralOp::DropTable { table: TableRef::simple("t"), cascade: false }], DdlAfter { closed: Some(TableRef::simple("t")), message: String::new() });
+        wait(&mut ws, |w| !w.objects.iter().any(|o| o.table.name == "t") && w.dock.iter_all_tabs().next().is_none());
+    }
+
+    /// Copy Script As produces the creation script, loading the structure when needed.
+    #[test]
+    fn copy_creation_script() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.copy_script_for(TableRef::simple("t"), ScriptKind::Creation);
+        wait(&mut ws, |w| w.clipboard_out.is_some());
+        let script = ws.clipboard_out.take().unwrap();
+        assert!(script.starts_with("CREATE TABLE t") && script.ends_with(';'), "{script}");
+        ws.copy_script_for(TableRef::simple("t"), ScriptKind::SelectTop100);
+        assert_eq!(ws.clipboard_out.as_deref(), Some("SELECT * FROM \"t\" LIMIT 100;"));
     }
 }
 

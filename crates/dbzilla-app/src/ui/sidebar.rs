@@ -6,6 +6,7 @@ use crate::fuzzy::{match_item, Strategy};
 use crate::glyphs::{self, Ico};
 use crate::theme;
 use dbzilla_core::caps::Capabilities;
+use dbzilla_core::copyfmt::ScriptKind;
 use super::console::clock;
 use dbzilla_core::model::{ObjectInfo, ObjectKind, TableRef};
 use dbzilla_store::history::HistoryEntry;
@@ -58,6 +59,12 @@ pub enum SidebarAction {
     SwitchSchema(String),
     Refresh,
     Extra(ExtraAction),
+    OpenStructure(TableRef),
+    CopyScript(TableRef, ScriptKind),
+    CloneTable(TableRef),
+    TruncateTable(TableRef),
+    DropTable(TableRef),
+    NewTable,
 }
 
 /// Section title of an object kind.
@@ -161,6 +168,9 @@ pub fn show(ui: &mut Ui, st: &mut SidebarState, view: &SidebarView) -> Option<Si
                     }
                 }
             });
+        }
+        if widgets::ico_button(ui, Ico::Plus, "New table").clicked() {
+            action = Some(SidebarAction::NewTable);
         }
         if widgets::ico_button(ui, Ico::Refresh, "Reload items").clicked() {
             action = Some(SidebarAction::Refresh);
@@ -310,8 +320,37 @@ fn item_row(ui: &mut Ui, o: &ObjectInfo, active: bool) -> Option<SidebarAction> 
             action = Some(SidebarAction::Open(o.table.clone(), OpenMode::NewTab));
             ui.close_menu();
         }
+        if matches!(o.kind, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView) && ui.button("Open structure").clicked() {
+            action = Some(SidebarAction::OpenStructure(o.table.clone()));
+            ui.close_menu();
+        }
         if ui.button("Copy name").clicked() {
             action = Some(SidebarAction::CopyName(o.table.name.clone()));
+            ui.close_menu();
+        }
+        if matches!(o.kind, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView) {
+            ui.menu_button("Copy script as", |ui| {
+                for (label, k) in [("Creation", ScriptKind::Creation), ("Drop", ScriptKind::Drop), ("Truncate", ScriptKind::Truncate), ("Select top 100", ScriptKind::SelectTop100)] {
+                    if ui.button(label).clicked() {
+                        action = Some(SidebarAction::CopyScript(o.table.clone(), k));
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
+        if o.kind == ObjectKind::Table {
+            ui.separator();
+            if ui.button("Clone...").clicked() {
+                action = Some(SidebarAction::CloneTable(o.table.clone()));
+                ui.close_menu();
+            }
+            if ui.button("Truncate...").clicked() {
+                action = Some(SidebarAction::TruncateTable(o.table.clone()));
+                ui.close_menu();
+            }
+        }
+        if matches!(o.kind, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView) && ui.add(egui::Button::new(RichText::new("Delete...").color(theme::ERROR))).clicked() {
+            action = Some(SidebarAction::DropTable(o.table.clone()));
             ui.close_menu();
         }
     });

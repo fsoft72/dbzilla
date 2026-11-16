@@ -288,7 +288,7 @@ impl Conn for PgConn {
             }
             st.primary_key.push(name);
         }
-        let fk_sql = "SELECT a.attname, rn.nspname, rc.relname, ra.attname, c.confupdtype::text, c.confdeltype::text FROM pg_constraint c \
+        let fk_sql = "SELECT a.attname, rn.nspname, rc.relname, ra.attname, c.confupdtype::text, c.confdeltype::text, c.conname::text FROM pg_constraint c \
                       CROSS JOIN LATERAL unnest(c.conkey, c.confkey) AS k(attnum, refattnum) \
                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
                       JOIN pg_class rc ON rc.oid = c.confrelid JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
@@ -303,6 +303,7 @@ impl Conn for PgConn {
                     columns: vec![r.get(3)],
                     on_update: fk_action(&on_update).to_owned(),
                     on_delete: fk_action(&on_delete).to_owned(),
+                    name: Some(r.get(6)),
                 });
             }
         }

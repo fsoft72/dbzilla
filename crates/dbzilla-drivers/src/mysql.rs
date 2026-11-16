@@ -345,7 +345,7 @@ impl Conn for MyConn {
         st.primary_key = pk.iter().map(|r| text(r, 0)).collect();
         let fks = self
             .rows(&format!(
-                "SELECT k.column_name, k.referenced_table_schema, k.referenced_table_name, k.referenced_column_name, r.update_rule, r.delete_rule \
+                "SELECT k.column_name, k.referenced_table_schema, k.referenced_table_name, k.referenced_column_name, r.update_rule, r.delete_rule, k.constraint_name \
                  FROM information_schema.key_column_usage k JOIN information_schema.referential_constraints r \
                  ON r.constraint_schema = k.constraint_schema AND r.constraint_name = k.constraint_name AND r.table_name = k.table_name \
                  WHERE k.table_schema = {sdb} AND k.table_name = {stable} AND k.referenced_table_name IS NOT NULL ORDER BY k.ordinal_position"
@@ -359,6 +359,7 @@ impl Conn for MyConn {
                     columns: vec![text(r, 3)],
                     on_update: text(r, 4),
                     on_delete: text(r, 5),
+                    name: opt_text(r, 6),
                 });
             }
         }
