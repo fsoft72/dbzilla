@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 dbzilla-core = { version = "0.1.0", path = "../dbzilla-core" }
 dbzilla-drivers = { version = "0.1.0", path = "../dbzilla-drivers" }
+dbzilla-io = { version = "0.1.0", path = "../dbzilla-io" }
 dbzilla-session = { version = "0.1.0", path = "../dbzilla-session" }
 dbzilla-store = { version = "0.1.0", path = "../dbzilla-store" }
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }

@@ -64,6 +64,8 @@ pub enum SidebarAction {
     CloneTable(TableRef),
     TruncateTable(TableRef),
     DropTable(TableRef),
+    ExportTable(TableRef),
+    ImportInto(TableRef),
     NewTable,
 }
 
@@ -337,6 +339,15 @@ fn item_row(ui: &mut Ui, o: &ObjectInfo, active: bool) -> Option<SidebarAction> 
                     }
                 }
             });
+        }
+        ui.separator();
+        if ui.button("Export...").clicked() {
+            action = Some(SidebarAction::ExportTable(o.table.clone()));
+            ui.close_menu();
+        }
+        if o.kind == ObjectKind::Table && ui.button("Import into...").clicked() {
+            action = Some(SidebarAction::ImportInto(o.table.clone()));
+            ui.close_menu();
         }
         if o.kind == ObjectKind::Table {
             ui.separator();

@@ -3,6 +3,7 @@
 pub mod connform;
 pub mod connlist;
 pub mod grid;
+pub mod jobs;
 pub mod console;
 pub mod datatab;
 pub mod dbsearch;

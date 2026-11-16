@@ -1090,6 +1090,7 @@ version = "0.1.0"
 dependencies = [
  "dbzilla-core",
  "dbzilla-drivers",
+ "dbzilla-io",
  "dbzilla-session",
  "dbzilla-store",
  "dtor",

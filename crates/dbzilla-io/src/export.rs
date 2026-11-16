@@ -132,7 +132,7 @@ fn select_sql(d: &dyn Dialect, src: &ExportSource) -> String {
 }
 
 /// A destination of rows.
-trait RowWriter {
+trait RowWriter: Send {
     fn begin(&mut self, cols: &[ColumnMeta]) -> Result<(), IoError>;
     fn rows(&mut self, rows: &[Row]) -> Result<(), IoError>;
     fn finish(self: Box<Self>) -> Result<(), IoError>;
@@ -152,7 +152,7 @@ fn csv_cell(v: &Value, o: &CsvExportOptions) -> String {
 
 /// CSV writer.
 struct CsvRows {
-    w: csv::Writer<Box<dyn Write>>,
+    w: csv::Writer<Box<dyn Write + Send>>,
     o: CsvExportOptions,
 }
 
@@ -179,7 +179,7 @@ impl RowWriter for CsvRows {
 
 /// JSON array of objects.
 struct JsonRows {
-    out: Box<dyn Write>,
+    out: Box<dyn Write + Send>,
     names: Vec<String>,
     first: bool,
 }
@@ -224,7 +224,7 @@ impl RowWriter for JsonRows {
 
 /// SQL INSERT dump of one table (the file is shared by all tables).
 struct SqlRows<'a> {
-    out: &'a mut dyn Write,
+    out: &'a mut (dyn Write + Send),
     d: Box<dyn Dialect>,
     table: TableRef,
     cols: Vec<String>,
@@ -330,7 +330,7 @@ impl RowWriter for XlsxRows {
 }
 
 /// Opens an output file, gzip-wrapped when asked.
-fn create_out(path: &Path, gzip: bool) -> Result<Box<dyn Write>, IoError> {
+fn create_out(path: &Path, gzip: bool) -> Result<Box<dyn Write + Send>, IoError> {
     let f = BufWriter::new(File::create(path)?);
     Ok(if gzip { Box::new(GzEncoder::new(f, Compression::default())) } else { Box::new(f) })
 }
@@ -442,7 +442,7 @@ async fn export_sql(conn: &mut dyn Conn, driver: DriverId, sources: &[ExportSour
             }
             let mut rows = SqlRows { out: &mut *out, d: dialect_for(driver), table: table.clone(), cols: Vec::new(), pending: Vec::new(), data: opts.sql.data };
             let sql = select_sql(d.as_ref(), src);
-            let mut writer: Box<dyn RowWriter + '_> = Box::new(SqlRowsRef(&mut rows));
+            let mut writer: Box<dyn RowWriter + Send + '_> = Box::new(SqlRowsRef(&mut rows));
             stream_into(conn, &sql, writer.as_mut(), &table.name, i, sources.len(), progress, cancel).await?;
             writer.finish()?;
         }

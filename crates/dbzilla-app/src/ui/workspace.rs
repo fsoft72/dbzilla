@@ -1,6 +1,8 @@
 //! An open connection: session, sidebar, tabs, console and the workspace screen (SPEC 7).
 
 use super::console::{self, ConsoleLog};
+use std::sync::Arc;
+use super::jobs::{self, ExportDialog, ImportDialog, JobCenter, JobEnv, JobState};
 use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
@@ -305,6 +307,11 @@ pub struct Workspace {
     ddl_after: HashMap<RequestId, DdlAfter>,
     search: Option<SearchState>,
     db_picker: Option<DbPicker>,
+    jobs: JobCenter,
+    job_env: Option<JobEnv>,
+    repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+    export_dialog: Option<(ExportDialog, Option<String>)>,
+    import_dialog: Option<ImportDialog>,
     db_dialog: Option<DbDialog>,
     level_dialog: Option<LevelDialog>,
     timeout_req: Option<RequestId>,
@@ -374,6 +381,11 @@ impl Workspace {
             ddl_after: HashMap::new(),
             search: None,
             db_picker: None,
+            jobs: JobCenter::default(),
+            job_env: None,
+            repaint: None,
+            export_dialog: None,
+            import_dialog: None,
             db_dialog: None,
             level_dialog: None,
             timeout_req: None,
@@ -403,6 +415,79 @@ impl Workspace {
         while let Some(ev) = self.session.try_recv() {
             self.apply(ev);
         }
+        for (title, state) in self.jobs.poll() {
+            match state {
+                JobState::Done(t) => self.notices.push((false, format!("{title}: {t}"))),
+                JobState::Failed(e) => self.notices.push((true, format!("{title} failed: {e}"))),
+                JobState::Cancelled => self.notices.push((false, format!("{title} cancelled"))),
+                JobState::Running { .. } => {}
+            }
+        }
+    }
+
+    /// Gives the workspace what background jobs need to open their own connection.
+    pub fn set_job_env(&mut self, env: JobEnv, repaint: Arc<dyn Fn() + Send + Sync>) {
+        self.job_env = Some(env);
+        self.repaint = Some(repaint);
+    }
+
+    /// Opens the export dialog, optionally with a table ticked.
+    pub fn open_export(&mut self, table: Option<TableRef>) {
+        let columns = table.as_ref().and_then(|t| self.structures.get(t)).map(|s| s.columns.iter().map(|c| c.name.clone()).collect());
+        self.export_dialog = Some((ExportDialog::new(&self.objects, table.as_ref(), columns), None));
+    }
+
+    /// Opens the import dialog, optionally targeting a table.
+    pub fn open_import(&mut self, table: Option<TableRef>) {
+        self.import_dialog = Some(ImportDialog::new(&self.objects, table));
+    }
+
+    /// Export and import dialogs.
+    fn job_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some((d, err)) = self.export_dialog.as_mut() {
+            match jobs::export_dialog(ctx, d, err) {
+                Some(true) => match d.build() {
+                    Ok((sources, opts)) => {
+                        let title = format!("Export of {}", d.tables.iter().filter(|(_, on)| *on).map(|(t, _)| t.name.as_str()).collect::<Vec<_>>().join(", "));
+                        self.export_dialog = None;
+                        self.start_export(title, sources, opts);
+                    }
+                    Err(e) => *err = Some(e),
+                },
+                Some(false) => self.export_dialog = None,
+                None => {}
+            }
+        }
+        if let Some(d) = self.import_dialog.as_mut() {
+            match jobs::import_dialog(ctx, d, self.conn.driver) {
+                Some(true) => match d.build(self.current_schema.as_deref().filter(|_| self.caps.schemas)) {
+                    Ok(req) => {
+                        let title = format!("Import of {}", std::path::Path::new(d.path.trim()).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()));
+                        self.import_dialog = None;
+                        self.start_import(title, req);
+                    }
+                    Err(e) => d.error = Some(e),
+                },
+                Some(false) => self.import_dialog = None,
+                None => {}
+            }
+        }
+    }
+
+    /// Starts an export job.
+    pub fn start_export(&mut self, title: String, sources: Vec<dbzilla_io::export::ExportSource>, opts: dbzilla_io::export::ExportOptions) {
+        let (Some(env), Some(repaint)) = (self.job_env.clone(), self.repaint.clone()) else {
+            return self.notices.push((true, "Background jobs are not available for this workspace".into()));
+        };
+        self.jobs.spawn_export(&env, repaint, title, sources, opts);
+    }
+
+    /// Starts an import job; the table list refreshes when it ends.
+    pub fn start_import(&mut self, title: String, req: jobs::ImportRequest) {
+        let (Some(env), Some(repaint)) = (self.job_env.clone(), self.repaint.clone()) else {
+            return self.notices.push((true, "Background jobs are not available for this workspace".into()));
+        };
+        self.jobs.spawn_import(&env, repaint, title, req);
     }
 
     /// Applies one event to the state.
@@ -1957,6 +2042,8 @@ impl Workspace {
             }
             Some(SidebarAction::TruncateTable(t)) => self.op_dialog = Some(OpDialog::Truncate { table: t, cascade: false, restart: false }),
             Some(SidebarAction::DropTable(t)) => self.op_dialog = Some(OpDialog::Drop { table: t, cascade: false }),
+            Some(SidebarAction::ExportTable(t)) => self.open_export(Some(t)),
+            Some(SidebarAction::ImportInto(t)) => self.open_import(Some(t)),
             Some(SidebarAction::NewTable) => self.new_table(),
             None => {}
         }
@@ -1996,6 +2083,7 @@ impl Workspace {
     fn modals(&mut self, ctx: &egui::Context) {
         self.table_dialogs(ctx);
         self.database_dialogs(ctx);
+        self.job_dialogs(ctx);
         if let Some(d) = self.save_dialog.as_mut() {
             let mut decision = None;
             widgets::modal(ctx, "Add to Queries", |ui| {
@@ -2350,6 +2438,13 @@ impl Workspace {
                         }
                     }
                 });
+                if widgets::ico_button(ui, Ico::Export, "Export data").clicked() {
+                    self.open_export(None);
+                }
+                if widgets::ico_button(ui, Ico::Import, "Import data").clicked() {
+                    self.open_import(None);
+                }
+                jobs::bell(ui, &mut self.jobs);
                 if widgets::ico_button(ui, Ico::Database, &tip("Open a database", Action::OpenDatabase)).clicked() {
                     self.db_picker = Some(DbPicker { query: String::new(), selected: None });
                 }
@@ -3195,6 +3290,38 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    /// Export and import jobs run on their own connection and report back.
+    #[test]
+    fn export_then_import_jobs_round_trip() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (dir, path, mut ws) = connected(&rt);
+        let cfg = ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: path.to_string_lossy().into_owned(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        ws.set_job_env(JobEnv { rt: rt.handle().clone(), cfg, names: dbzilla_io::naming::NameContext::now("c", "d", "") }, Arc::new(|| {}));
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "t"));
+        let out = dir.path().join("out");
+        let mut d = ExportDialog::new(&ws.objects, Some(&TableRef::simple("t")), None);
+        d.dir = out.to_string_lossy().into_owned();
+        let (sources, opts) = d.build().unwrap();
+        ws.start_export("Export of t".into(), sources, opts);
+        wait(&mut ws, |w| w.jobs.jobs.iter().all(|j| matches!(j.state, JobState::Done(_))));
+        let file = out.join("t.csv");
+        assert!(file.exists(), "the export wrote the file");
+        let mut imp = ImportDialog::new(&ws.objects, None);
+        imp.path = file.to_string_lossy().into_owned();
+        imp.new_name = "t_copy".into();
+        imp.load();
+        assert!(imp.error.is_none(), "{:?}", imp.error);
+        let req = imp.build(None).unwrap();
+        ws.start_import("Import of t.csv".into(), req);
+        wait(&mut ws, |w| w.jobs.jobs.len() == 2 && w.jobs.jobs.iter().all(|j| !matches!(j.state, JobState::Running { .. })));
+        assert!(ws.jobs.jobs.iter().all(|j| matches!(j.state, JobState::Done(_))), "{:?}", ws.jobs.jobs.iter().map(|j| j.state.clone()).collect::<Vec<_>>());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let a: i64 = conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        let b: i64 = conn.query_row("SELECT count(*) FROM t_copy", [], |r| r.get(0)).unwrap();
+        assert_eq!(a, b);
+        assert!(ws.notices.iter().any(|(err, m)| !*err && m.contains("Imported")));
     }
 }
 
