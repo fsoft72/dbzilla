@@ -407,7 +407,7 @@ impl Conn for PgConn {
         Ok(u64::try_from(n).ok())
     }
 
-    async fn cancel_handle(&self) -> DriverResult<Box<dyn CancelToken>> {
+    async fn cancel_handle(&mut self) -> DriverResult<Box<dyn CancelToken>> {
         Ok(Box::new(PgCancel { token: self.client.cancel_token(), tls: self.tls.clone() }))
     }
 

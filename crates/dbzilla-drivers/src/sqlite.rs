@@ -378,7 +378,7 @@ impl Conn for SqliteConn {
         Ok(None)
     }
 
-    async fn cancel_handle(&self) -> DriverResult<Box<dyn CancelToken>> {
+    async fn cancel_handle(&mut self) -> DriverResult<Box<dyn CancelToken>> {
         Ok(Box::new(SqliteCancel(Arc::clone(&self.interrupt))))
     }
 

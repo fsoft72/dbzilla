@@ -477,7 +477,7 @@ impl Conn for MyConn {
         Ok(rows.first().and_then(|r| opt_text(r, 0)).and_then(|s| s.parse().ok()))
     }
 
-    async fn cancel_handle(&self) -> DriverResult<Box<dyn CancelToken>> {
+    async fn cancel_handle(&mut self) -> DriverResult<Box<dyn CancelToken>> {
         Ok(Box::new(MyCancel { cfg: self.cfg.clone(), ssl: self.ssl, id: self.conn.id() }))
     }
 

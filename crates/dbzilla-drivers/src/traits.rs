@@ -31,8 +31,8 @@ pub type DriverResult<T> = Result<T, DriverError>;
 
 pub use dbzilla_core::model::SslMode;
 
-/// Everything needed to open a connection.
-#[derive(Debug, Clone)]
+/// Everything needed to open a connection. `Debug` hides the password (NFR-05).
+#[derive(Clone)]
 pub struct ConnectConfig {
     pub driver: DriverId,
     pub host: String,
@@ -44,6 +44,21 @@ pub struct ConnectConfig {
     pub ssl: SslMode,
     /// SQL run right after connecting.
     pub bootstrap: Vec<String>,
+}
+
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("driver", &self.driver)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("database", &self.database)
+            .field("ssl", &self.ssl)
+            .field("bootstrap", &self.bootstrap)
+            .finish()
+    }
 }
 
 /// One database (or SQLite file) on the server.
@@ -129,7 +144,7 @@ pub trait Conn: Send {
     /// Cheap row count estimate, when the server has one.
     async fn estimate_count(&mut self, t: &TableRef) -> DriverResult<Option<u64>>;
     /// Token that cancels the running query from another task.
-    async fn cancel_handle(&self) -> DriverResult<Box<dyn CancelToken>>;
+    async fn cancel_handle(&mut self) -> DriverResult<Box<dyn CancelToken>>;
     async fn ping(&mut self) -> DriverResult<()>;
     async fn set_database(&mut self, db: &str) -> DriverResult<()>;
     async fn create_database(&mut self, req: &NewDatabase) -> DriverResult<()>;

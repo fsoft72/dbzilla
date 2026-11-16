@@ -1089,6 +1089,15 @@ version = "0.1.0"
 [[package]]
 name = "dbzilla-session"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dbzilla-core",
+ "dbzilla-drivers",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
 
 [[package]]
 name = "dbzilla-store"
