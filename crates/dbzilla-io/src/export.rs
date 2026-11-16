@@ -150,29 +150,62 @@ fn csv_cell(v: &Value, o: &CsvExportOptions) -> String {
     if o.newline_to_space { text.replace("\r\n", " ").replace(['\n', '\r'], " ") } else { text }
 }
 
+/// One CSV field, quoted when it has to be. A text value equal to the NULL marker is quoted so it is not read back as NULL.
+fn csv_field(text: &str, force: bool, o: &CsvExportOptions) -> String {
+    let q = o.quote;
+    let needs = force || o.quote_always || text.contains(o.delimiter) || text.contains(q) || text.contains('\n') || text.contains('\r');
+    if !needs {
+        return text.to_owned();
+    }
+    let doubled = format!("{q}{q}");
+    format!("{q}{}{q}", text.replace(q, &doubled))
+}
+
 /// CSV writer.
 struct CsvRows {
-    w: csv::Writer<Box<dyn Write + Send>>,
+    out: Box<dyn Write + Send>,
     o: CsvExportOptions,
+}
+
+impl CsvRows {
+    /// Writes one record followed by the configured line break.
+    fn record(&mut self, fields: &[String]) -> Result<(), IoError> {
+        let end = match self.o.line_break {
+            LineBreak::Lf => "\n",
+            LineBreak::CrLf => "\r\n",
+            LineBreak::Cr => "\r",
+        };
+        let sep = self.o.delimiter.to_string();
+        write!(self.out, "{}{end}", fields.join(&sep))?;
+        Ok(())
+    }
 }
 
 impl RowWriter for CsvRows {
     fn begin(&mut self, cols: &[ColumnMeta]) -> Result<(), IoError> {
         if self.o.header {
-            self.w.write_record(cols.iter().map(|c| c.name.as_str())).map_err(|e| IoError::Format(e.to_string()))?;
+            let fields: Vec<String> = cols.iter().map(|c| csv_field(&c.name, false, &self.o)).collect();
+            self.record(&fields)?;
         }
         Ok(())
     }
 
     fn rows(&mut self, rows: &[Row]) -> Result<(), IoError> {
         for r in rows {
-            self.w.write_record(r.iter().map(|v| csv_cell(v, &self.o))).map_err(|e| IoError::Format(e.to_string()))?;
+            let fields: Vec<String> = r
+                .iter()
+                .map(|v| {
+                    let marker_clash = !self.o.null_as_empty && matches!(v, Value::Text(t) if t == "NULL");
+                    csv_field(&csv_cell(v, &self.o), marker_clash, &self.o)
+                })
+                .collect();
+            self.record(&fields)?;
         }
         Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), IoError> {
-        self.w.flush()?;
+        self.out.flush()?;
         Ok(())
     }
 }
@@ -428,20 +461,10 @@ pub async fn run_export(conn: &mut dyn Conn, driver: DriverId, sources: &[Export
         let mut writer: Box<dyn RowWriter> = match opts.format {
             ExportFormat::Csv => {
                 let o = opts.csv.clone();
-                let (delim, quote) = (u8::try_from(o.delimiter).map_err(|_| IoError::Format("the CSV delimiter must be an ASCII character".into()))?, u8::try_from(o.quote).map_err(|_| IoError::Format("the CSV quote must be an ASCII character".into()))?);
-                let terminator = match o.line_break {
-                    LineBreak::Lf => csv::Terminator::Any(b'\n'),
-                    LineBreak::CrLf => csv::Terminator::CRLF,
-                    LineBreak::Cr => csv::Terminator::Any(b'\r'),
-                };
-                let w = csv::WriterBuilder::new()
-                    .delimiter(delim)
-                    .quote(quote)
-                    .quote_style(if o.quote_always { csv::QuoteStyle::Always } else { csv::QuoteStyle::Necessary })
-                    .terminator(terminator)
-                    .has_headers(false)
-                    .from_writer(Box::new(create_out(&path, false)?) as Box<dyn Write + Send>);
-                Box::new(CsvRows { w, o })
+                if !o.delimiter.is_ascii() || !o.quote.is_ascii() {
+                    return Err(IoError::Format("the CSV delimiter and quote must be ASCII characters".into()));
+                }
+                Box::new(CsvRows { out: Box::new(create_out(&path, false)?), o })
             }
             ExportFormat::Json => Box::new(JsonRows { out: Box::new(create_out(&path, false)?), names: Vec::new(), first: true }),
             ExportFormat::Xlsx => {

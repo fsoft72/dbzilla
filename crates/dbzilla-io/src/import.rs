@@ -51,30 +51,82 @@ pub fn decode_text(bytes: &[u8], encoding: &str) -> Result<String, IoError> {
     enc.decode_without_bom_handling_and_without_replacement(bytes).map(|c| c.into_owned()).ok_or_else(|| IoError::Format(format!("the file is not valid {encoding}")))
 }
 
+/// Splits CSV text into records of `(text, was_quoted)`; a quoted field is never a NULL marker.
+fn tokenize_csv(text: &str, delimiter: char, quote: char) -> Result<Vec<Vec<(String, bool)>>, IoError> {
+    let mut records: Vec<Vec<(String, bool)>> = Vec::new();
+    let mut record: Vec<(String, bool)> = Vec::new();
+    let (mut field, mut quoted, mut in_quotes, mut started) = (String::new(), false, false, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == quote {
+                if chars.peek() == Some(&quote) {
+                    field.push(quote);
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            c if c == quote && field.is_empty() && !quoted => {
+                in_quotes = true;
+                quoted = true;
+                started = true;
+            }
+            c if c == delimiter => {
+                record.push((std::mem::take(&mut field), quoted));
+                quoted = false;
+                started = true;
+            }
+            '\r' | '\n' => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                if started || !field.is_empty() || quoted {
+                    record.push((std::mem::take(&mut field), quoted));
+                    records.push(std::mem::take(&mut record));
+                }
+                quoted = false;
+                started = false;
+            }
+            c => {
+                field.push(c);
+                started = true;
+            }
+        }
+    }
+    if in_quotes {
+        return Err(IoError::Format("the file ends inside a quoted value".into()));
+    }
+    if started || !field.is_empty() || quoted {
+        record.push((field, quoted));
+        records.push(record);
+    }
+    Ok(records)
+}
+
 /// Parses CSV text.
 pub fn parse_csv(bytes: &[u8], o: &CsvImportOptions) -> Result<Parsed, IoError> {
     let text = decode_text(bytes, &o.encoding)?;
-    let ascii = |c: char, what: &str| u8::try_from(c).map_err(|_| IoError::Format(format!("the CSV {what} must be an ASCII character")));
-    let mut reader = csv::ReaderBuilder::new().delimiter(ascii(o.delimiter, "delimiter")?).quote(ascii(o.quote, "quote")?).has_headers(false).flexible(true).from_reader(text.as_bytes());
+    let records = tokenize_csv(&text, o.delimiter, o.quote)?;
     let mut headers: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    let mut first = true;
-    let mut line = 0usize;
-    for rec in reader.records() {
-        let rec = rec.map_err(|e| IoError::Format(e.to_string()))?;
-        line += 1;
-        if first {
-            first = false;
+    for (n, rec) in records.into_iter().enumerate() {
+        if n == 0 {
             if o.header {
-                headers = rec.iter().map(str::to_owned).collect();
+                headers = rec.into_iter().map(|(t, _)| t).collect();
                 continue;
             }
             headers = (1..=rec.len()).map(|i| format!("column{i}")).collect();
         }
         if rec.len() > headers.len() {
-            return Err(IoError::Format(format!("row {line} has {} cells but there are only {} columns", rec.len(), headers.len())));
+            return Err(IoError::Format(format!("row {} has {} cells but there are only {} columns", n + 1, rec.len(), headers.len())));
         }
-        let mut cells: Vec<Option<String>> = rec.iter().map(|c| if o.null_text.as_deref() == Some(c) { None } else { Some(c.to_owned()) }).collect();
+        let mut cells: Vec<Option<String>> = rec.into_iter().map(|(t, quoted)| if !quoted && o.null_text.as_deref() == Some(t.as_str()) { None } else { Some(t) }).collect();
         cells.resize(headers.len(), None);
         rows.push(cells);
     }

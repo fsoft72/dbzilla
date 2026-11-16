@@ -77,3 +77,18 @@ fn type_detection() {
     use DetectedType::*;
     assert_eq!(detect_types(&p), vec![Integer, Real, Text, Text, Text]);
 }
+
+#[test]
+fn quoted_null_marker_is_text() {
+    let p = parse_csv(b"a,b,c\nNULL,\"NULL\",\n", &CsvImportOptions::default()).unwrap();
+    assert_eq!(p.rows[0], vec![None, Some("NULL".to_owned()), Some(String::new())]);
+}
+
+#[test]
+fn tokenizer_handles_quotes_newlines_and_blank_lines() {
+    let p = parse_csv(b"a,b\r\n\"x,\"\"y\"\"\",\"l1\nl2\"\r\n\r\n3,4", &CsvImportOptions::default()).unwrap();
+    assert_eq!(p.rows.len(), 2);
+    assert_eq!(p.rows[0], vec![Some("x,\"y\"".to_owned()), Some("l1\nl2".to_owned())]);
+    assert_eq!(p.rows[1], vec![Some("3".to_owned()), Some("4".to_owned())]);
+    assert!(parse_csv(b"a\n\"open\n", &CsvImportOptions::default()).is_err(), "an unterminated quote is reported");
+}

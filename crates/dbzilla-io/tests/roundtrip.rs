@@ -251,3 +251,20 @@ async fn failed_import_into_a_new_table_leaves_nothing() {
     let tables = rows(&mut c, "SELECT count(*) FROM sqlite_master WHERE name = 'fresh'").await;
     assert_eq!(tables[0][0], Value::I64(0));
 }
+
+/// A text value "NULL" survives a CSV round trip next to a real NULL: quoted means text.
+#[tokio::test]
+async fn csv_round_trip_tells_the_text_null_from_a_real_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = new_db(dir.path(), "src.sqlite3", "CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO w VALUES (1, 'NULL'), (2, NULL), (3, ''), (4, 'a');");
+    let files = export(&src, dir.path(), &opts(ExportFormat::Csv, dir.path()), &[table("w")]).await;
+    let text = std::fs::read_to_string(&files[0]).unwrap();
+    assert_eq!(text, "id,v\n1,\"NULL\"\n2,NULL\n3,\n4,a\n");
+    let dst = new_db(dir.path(), "dst.sqlite3", "CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT);");
+    let parsed = parse_csv(text.as_bytes(), &CsvImportOptions::default()).unwrap();
+    let mut c = open(&dst).await;
+    let plan = ImportPlan { table: TableRef::simple("w"), create: None, mapping: mapping_for(&parsed, &["INTEGER", "TEXT"]), mode: InsertMode::StopOnError, key_columns: vec![] };
+    run_import(c.as_mut(), DriverId::Sqlite, &plan, &parsed, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+    let mut s = open(&src).await;
+    assert_eq!(rows(&mut c, "SELECT id, v FROM w ORDER BY id").await, rows(&mut s, "SELECT id, v FROM w ORDER BY id").await);
+}
