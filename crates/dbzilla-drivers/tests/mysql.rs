@@ -297,3 +297,36 @@ async fn no_backslash_escapes_is_switched_off_for_the_session() {
     assert_eq!(result[0][0], dbzilla_core::value::Value::I64(0), "the mode is off for our session");
     assert_eq!(result[0][1], dbzilla_core::value::Value::I64(3), "'a\\\\b' is a, one backslash, b");
 }
+
+/// Changing a column on a real server keeps AUTO_INCREMENT, ON UPDATE, collation and comment.
+async fn modify_keeps_attributes(srv: &Container, db: &str) {
+    use dbzilla_core::ddl::{generate_ddl, ColumnDef, StructuralOp};
+    use dbzilla_core::dialect::dialect_for;
+    use dbzilla_core::model::TableRef;
+    let mut c = fresh(srv, db).await;
+    c.execute_batch(&["CREATE TABLE m (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT 'the key', name VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL COMMENT 'it''s a name', touched TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)".into()], false).await.unwrap();
+    let t = TableRef { database: Some(db.to_owned()), schema: None, name: "m".into() };
+    for (col, new_type) in [("id", "bigint"), ("name", "varchar(80)"), ("touched", "timestamp")] {
+        let st = c.table_structure(&t).await.unwrap();
+        let meta = st.columns.iter().find(|m| m.name == col).unwrap();
+        let old = ColumnDef { name: meta.name.clone(), type_name: meta.type_name.clone(), nullable: meta.nullable, default: meta.default.clone(), extra: None };
+        let new = ColumnDef { type_name: new_type.to_owned(), extra: dbzilla_core::ddl::mysql_column_attrs(&meta.extra, new_type), ..old.clone() };
+        let stmts = generate_ddl(&StructuralOp::AlterColumn { table: t.clone(), old, new, current: None }, dialect_for(DriverId::MySql).as_ref()).unwrap();
+        c.execute_batch(&stmts, false).await.unwrap_or_else(|e| panic!("{stmts:?}: {e}"));
+    }
+    let st = c.table_structure(&t).await.unwrap();
+    let get = |n: &str| st.columns.iter().find(|m| m.name == n).unwrap().clone();
+    assert!(get("id").extra.get("extra").is_some_and(|e| e.contains("auto_increment")), "{:?}", get("id").extra);
+    assert_eq!(get("id").extra.get("comment").map(String::as_str), Some("the key"));
+    assert_eq!(get("name").extra.get("collation").map(String::as_str), Some("utf8mb4_bin"));
+    assert_eq!(get("name").extra.get("comment").map(String::as_str), Some("it's a name"));
+    assert!(get("touched").extra.get("extra").is_some_and(|e| e.to_lowercase().contains("on update")), "{:?}", get("touched").extra);
+}
+
+#[tokio::test]
+async fn modify_column_keeps_attributes_on_mysql_and_mariadb() {
+    let mysql = require!(mysql8());
+    modify_keeps_attributes(mysql, "dbz_modify").await;
+    let maria = require!(mariadb());
+    modify_keeps_attributes(maria, "dbz_modify").await;
+}

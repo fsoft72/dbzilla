@@ -79,6 +79,28 @@ pub fn mysql_column_suffix(extra: &str) -> Option<String> {
     if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
+/// True for column types that carry a character set and collation.
+fn is_textual(type_name: &str) -> bool {
+    let t = type_name.to_ascii_lowercase();
+    ["char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"].iter().any(|w| t == *w || t.starts_with(&format!("{w}(")) || t.starts_with(&format!("{w} ")))
+}
+
+/// The MySQL attributes a MODIFY/CHANGE must repeat for a column read from the server:
+/// AUTO_INCREMENT, ON UPDATE, the collation of text columns and the comment.
+pub fn mysql_column_attrs(extra: &std::collections::BTreeMap<String, String>, type_name: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(e) = mysql_column_suffix(extra.get("extra").map_or("", String::as_str)) {
+        parts.push(e);
+    }
+    if let Some(c) = extra.get("collation").filter(|c| !c.is_empty() && is_textual(type_name)) {
+        parts.push(format!("COLLATE {c}"));
+    }
+    if let Some(c) = extra.get("comment").filter(|c| !c.is_empty()) {
+        parts.push(format!("COMMENT '{}'", c.replace('\\', "\\\\").replace('\'', "''")));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+}
+
 /// `"name" type [NOT NULL] [DEFAULT x]`.
 fn col_sql(d: &dyn Dialect, c: &ColumnDef) -> String {
     let mut s = format!("{} {}", d.quote_ident(&c.name), c.type_name);
@@ -121,7 +143,7 @@ fn create_table_sql(d: &dyn Dialect, table: &TableRef, cols: &[ColumnDef], pk: &
 
 /// Converts introspected metadata to a column definition.
 fn def_from_meta(c: &ColumnMeta) -> ColumnDef {
-    ColumnDef { name: c.name.clone(), type_name: c.type_name.clone(), nullable: c.nullable, default: c.default.clone(), extra: mysql_column_suffix(c.extra.get("extra").map_or("", String::as_str)) }
+    ColumnDef { name: c.name.clone(), type_name: c.type_name.clone(), nullable: c.nullable, default: c.default.clone(), extra: mysql_column_attrs(&c.extra, &c.type_name) }
 }
 
 /// Foreign keys implied by column metadata.

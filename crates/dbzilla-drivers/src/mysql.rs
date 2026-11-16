@@ -327,7 +327,7 @@ impl Conn for MyConn {
         let mut st = TableStructure { table: TableRef { database: Some(db.clone()), schema: None, name: t.name.clone() }, ..Default::default() };
         let cols = self
             .rows(&format!(
-                "SELECT column_name, column_type, is_nullable, column_default, column_key, extra FROM information_schema.columns \
+                "SELECT column_name, column_type, is_nullable, column_default, column_key, extra, column_comment, collation_name FROM information_schema.columns \
                  WHERE table_schema = {sdb} AND table_name = {stable} ORDER BY ordinal_position"
             ))
             .await?;
@@ -344,6 +344,12 @@ impl Conn for MyConn {
             };
             if !extra.is_empty() {
                 meta.extra.insert("extra".into(), extra);
+            }
+            if let Some(comment) = opt_text(r, 6).filter(|c| !c.is_empty()) {
+                meta.extra.insert("comment".into(), comment);
+            }
+            if let Some(collation) = opt_text(r, 7).filter(|c| !c.is_empty()) {
+                meta.extra.insert("collation".into(), collation);
             }
             st.columns.push(meta);
         }

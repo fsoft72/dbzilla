@@ -210,3 +210,12 @@ fn clone_table() {
 fn raw_passes_through() {
     assert_eq!(ddl(DriverId::Sqlite, StructuralOp::Raw("CREATE VIEW v AS SELECT 1".into())).unwrap(), vec!["CREATE VIEW v AS SELECT 1"]);
 }
+
+/// Comment and collation are repeated for text columns only, and quotes in the comment are escaped.
+#[test]
+fn mysql_attrs_include_comment_and_collation() {
+    use std::collections::BTreeMap;
+    let extra = BTreeMap::from([("collation".to_owned(), "utf8mb4_bin".to_owned()), ("comment".to_owned(), "it's a \\ test".to_owned())]);
+    assert_eq!(dbzilla_core::ddl::mysql_column_attrs(&extra, "varchar(40)").as_deref(), Some("COLLATE utf8mb4_bin COMMENT 'it''s a \\\\ test'"));
+    assert_eq!(dbzilla_core::ddl::mysql_column_attrs(&extra, "int").as_deref(), Some("COMMENT 'it''s a \\\\ test'"), "no collation on a number");
+}

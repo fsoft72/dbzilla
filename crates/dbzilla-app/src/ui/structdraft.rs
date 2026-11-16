@@ -54,7 +54,7 @@ impl ColDraft {
 
     /// Definition for DDL.
     fn def(&self) -> ColumnDef {
-        ColumnDef { name: self.name.trim().to_owned(), type_name: self.type_name.trim().to_owned(), nullable: self.nullable, default: if self.default.trim().is_empty() { None } else { Some(self.default.trim().to_owned()) }, extra: self.orig.as_ref().and_then(|o| dbzilla_core::ddl::mysql_column_suffix(o.extra.get("extra").map_or("", String::as_str))) }
+        ColumnDef { name: self.name.trim().to_owned(), type_name: self.type_name.trim().to_owned(), nullable: self.nullable, default: if self.default.trim().is_empty() { None } else { Some(self.default.trim().to_owned()) }, extra: self.orig.as_ref().and_then(|o| dbzilla_core::ddl::mysql_column_attrs(&o.extra, self.type_name.trim())) }
     }
 
     /// True when name, type, nullability or default differ from the original.
