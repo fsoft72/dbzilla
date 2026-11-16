@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 async-trait = "0.1.92"
 chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
-dbzilla-core = { version = "0.1.0", path = "../dbzilla-core" }
+dbzilla-core = { version = "0.1.1", path = "../dbzilla-core" }
 futures-util = { version = "0.3.34", optional = true }
 mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"], optional = true }
 rusqlite = { version = "0.43.0", features = ["bundled", "column_decltype"], optional = true }

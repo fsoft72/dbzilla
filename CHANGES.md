@@ -37,3 +37,4 @@
 - Structure: the PK checkbox is editable on existing tables (new `SetPrimaryKey` op: PostgreSQL assumes `<table>_pkey`, MySQL drop+add, SQLite rebuild only when the table has no PK yet). It must be applied separately from other column changes.
 - Structure: the delete (trash) button of a column moved next to the row number so it stays on screen.
 - Added scripts/release.sh (version bump, tag, push) and the tag-triggered release workflow that builds Linux, macOS and Windows binaries into GitHub Releases.
+- Release 0.1.1.
