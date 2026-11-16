@@ -233,3 +233,19 @@ async fn rename_database_never_overwrites() {
     c.rename_database("a.sqlite3", "c.sqlite3").await.unwrap();
     assert!(dir.path().join("c.sqlite3").exists() && dir.path().join("c.sqlite3-wal").exists() && !dir.path().join("a.sqlite3-wal").exists());
 }
+
+/// A rename that fails half way puts the files back.
+#[tokio::test]
+async fn failed_rename_restores_the_files() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["a.sqlite3", "open.sqlite3"] {
+        rusqlite::Connection::open(dir.path().join(n)).unwrap();
+    }
+    std::fs::write(dir.path().join("a.sqlite3-wal"), b"w").unwrap();
+    std::fs::create_dir_all(dir.path().join("c.sqlite3-wal").join("blocker")).unwrap();
+    let cfg = dbzilla_drivers::ConnectConfig { driver: dbzilla_core::dialect::DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: dir.path().join("open.sqlite3").to_string_lossy().into_owned(), ssl: dbzilla_drivers::SslMode::Disabled, bootstrap: vec![] };
+    let mut c = dbzilla_drivers::driver_for(dbzilla_core::dialect::DriverId::Sqlite).unwrap().connect(&cfg).await.unwrap();
+    assert!(c.rename_database("a.sqlite3", "c.sqlite3").await.is_err());
+    assert!(dir.path().join("a.sqlite3").exists() && dir.path().join("a.sqlite3-wal").exists(), "the original files are back");
+    assert!(!dir.path().join("c.sqlite3").exists());
+}

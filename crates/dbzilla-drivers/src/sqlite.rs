@@ -415,11 +415,18 @@ impl Conn for SqliteConn {
         if dir.join(to).exists() {
             return Err(DriverError::Other(format!("{to} already exists")));
         }
-        std::fs::rename(dir.join(from), dir.join(to)).map_err(|e| DriverError::Other(format!("rename failed: {e}")))?;
-        for suffix in ["-wal", "-shm"] {
-            let side = dir.join(format!("{from}{suffix}"));
-            if side.exists() {
-                std::fs::rename(&side, dir.join(format!("{to}{suffix}"))).map_err(|e| DriverError::Other(format!("rename failed: {e}")))?;
+        // the main file and its sidecars move together; on a failure everything moved so far goes back
+        let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let (src, dst) = (dir.join(format!("{from}{suffix}")), dir.join(format!("{to}{suffix}")));
+            if suffix.is_empty() || src.exists() {
+                if let Err(e) = std::fs::rename(&src, &dst) {
+                    for (s, d) in moved.iter().rev() {
+                        let _ = std::fs::rename(d, s);
+                    }
+                    return Err(DriverError::Other(format!("rename failed: {e}")));
+                }
+                moved.push((src, dst));
             }
         }
         Ok(())
