@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: [ACTIONS="click:X,Y;key:ctrl+k;type:text;sleep:1"] scripts/screenshot.sh OUT.png [WAIT_SECONDS] [-- app args...]
+# Usage: [ACTIONS="click:X,Y|key:ctrl+k|type:text|sleep:1"] (steps are separated by |) scripts/screenshot.sh OUT.png [WAIT_SECONDS] [-- app args...]
 # Launches the debug binary, optionally replays actions (coordinates relative to the window),
 # captures its window on X11, then closes it.
 set -u
@@ -11,7 +11,7 @@ PID=$!
 sleep "$WAIT"
 WID=$(xdotool search --pid "$PID" 2>/dev/null | tail -1)
 if [ -z "$WID" ]; then echo "no window found" >&2; kill "$PID" 2>/dev/null; exit 1; fi
-IFS=';' read -ra STEPS <<< "${ACTIONS:-}"
+IFS='|' read -ra STEPS <<< "${ACTIONS:-}"
 for step in "${STEPS[@]:-}"; do
   [ -z "$step" ] && continue
   kind="${step%%:*}"; arg="${step#*:}"
@@ -20,7 +20,7 @@ for step in "${STEPS[@]:-}"; do
     dclick) xdotool mousemove --window "$WID" "${arg%,*}" "${arg#*,}"; sleep 0.15; xdotool click --repeat 2 --delay 80 1; sleep 0.8 ;;
     rclick) xdotool mousemove --window "$WID" "${arg%,*}" "${arg#*,}"; sleep 0.15; xdotool click 3; sleep 0.5 ;;
     key) xdotool key --window "$WID" "$arg"; sleep 0.4 ;;
-    type) xdotool type --window "$WID" --delay 40 "$arg"; sleep 0.4 ;;
+    type) xdotool type --window "$WID" --delay 40 -- "$arg"; sleep 0.4 ;;
     sleep) sleep "$arg" ;;
   esac
 done

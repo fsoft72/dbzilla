@@ -11,6 +11,7 @@ pub mod pending;
 pub mod quicklook;
 pub mod sidebar;
 pub mod settings;
+pub mod sqltab;
 pub mod tabs;
 pub mod workspace;
 pub mod widgets;

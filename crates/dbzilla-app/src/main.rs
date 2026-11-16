@@ -8,6 +8,8 @@ mod cli;
 mod fuzzy;
 mod glyphs;
 mod keymap;
+mod sqlhl;
+mod sqltext;
 mod theme;
 mod ui;
 

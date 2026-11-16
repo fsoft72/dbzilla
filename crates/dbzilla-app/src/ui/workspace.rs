@@ -6,17 +6,21 @@ use super::details::{self, DetailsAction, DetailsState};
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
 use super::sidebar::{self, SidebarAction, SidebarState, SidebarTab};
+use super::sqltab::{self, ResStatus, ResultTab, SqlAction, SqlEnv, SqlTab};
 use super::tabs::{decide_open, OpenDecision, OpenMode, TabId, TabMeta, TabTarget};
 use super::widgets;
 use super::Toasts;
 use crate::glyphs::Ico;
 use crate::keymap::{Action, KeyMap};
+use crate::sqlhl;
+use crate::sqltext;
 use crate::theme;
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::changes::generate_sql;
 use dbzilla_core::copyfmt::CsvOptions;
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
+use dbzilla_core::rowlimit::apply_row_limit;
 use dbzilla_core::model::{ObjectInfo, ObjectKind, TableRef, TableStructure};
 use dbzilla_drivers::DatabaseInfo;
 use dbzilla_session::gate::{gate_check, verify_password, GateDecision};
@@ -26,7 +30,7 @@ use dbzilla_store::settings::Settings;
 use dbzilla_store::tags::TagStore;
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Stroke};
 use egui_dock::{DockArea, DockState, Style, TabViewer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Connection state shown in the UI.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,10 +56,18 @@ enum ReqKind {
     Page,
     Count,
     Commit,
+    Sql,
+}
+
+/// What a confirmed gate does.
+enum GateAction {
+    Commit,
+    Run { labels: Vec<Option<String>> },
 }
 
 /// A statement list waiting for the safe-mode answer.
 struct GateModal {
+    action: GateAction,
     statements: Vec<String>,
     needs_password: bool,
     input: String,
@@ -73,7 +85,8 @@ struct KeyDialog {
 
 /// What a tab holds.
 pub enum TabKind {
-    Table(TableTab),
+    Table(Box<TableTab>),
+    Sql(Box<SqlTab>),
 }
 
 /// A tab of the dock.
@@ -94,6 +107,7 @@ impl Tab {
     fn title(&self) -> String {
         match &self.kind {
             TabKind::Table(t) => t.table.name.clone(),
+            TabKind::Sql(s) => format!("SQL {}", s.no),
         }
     }
 }
@@ -146,6 +160,12 @@ pub struct Workspace {
     req_map: HashMap<RequestId, (TabId, ReqKind)>,
     /// Password of the connection, used to unlock the safe modes.
     pub password: Option<String>,
+    pub keywords: HashSet<String>,
+    sql_counter: usize,
+    fmt_width: u8,
+    fmt_with: dbzilla_store::settings::IndentWith,
+    fmt_kind: dbzilla_store::settings::IndentType,
+    fmt_upper: bool,
     pub details: DetailsState,
     gate: Option<GateModal>,
     preview: Option<Vec<String>>,
@@ -182,6 +202,12 @@ impl Workspace {
             page_size,
             req_map: HashMap::new(),
             password,
+            keywords: sqlhl::keyword_set(dialect_for(conn_driver).keywords()),
+            sql_counter: 0,
+            fmt_width: 4,
+            fmt_with: dbzilla_store::settings::IndentWith::Spaces,
+            fmt_kind: dbzilla_store::settings::IndentType::Standard,
+            fmt_upper: true,
             details: DetailsState::default(),
             gate: None,
             preview: None,
@@ -213,9 +239,21 @@ impl Workspace {
                 self.objects = objects;
             }
             Event::Structure(st) => self.apply_structure(*st),
-            Event::RowBatch { req, columns, rows, .. } => self.on_rows(req, columns, rows),
-            Event::QueryDone { req, summary, .. } => self.on_page_done(req, summary.elapsed),
-            Event::QueryError { req, error, .. } => self.on_page_error(req, error),
+            Event::StatementStarted { req, index, sql } => self.on_statement_started(req, index, sql),
+            Event::RowBatch { req, index, columns, rows } => match self.req_map.get(&req).copied() {
+                Some((id, ReqKind::Sql)) => self.on_sql_rows(id, index, columns, rows),
+                _ => self.on_rows(req, columns, rows),
+            },
+            Event::QueryDone { req, index, summary } => match self.req_map.get(&req).copied() {
+                Some((id, ReqKind::Sql)) => self.on_sql_done(id, index, ResStatus::Done { elapsed: summary.elapsed, affected: summary.affected, messages: summary.messages }),
+                _ => self.on_page_done(req, summary.elapsed),
+            },
+            Event::QueryError { req, index, error, cancelled } => match self.req_map.get(&req).copied() {
+                Some((id, ReqKind::Sql)) => self.on_sql_done(id, index, if cancelled { ResStatus::Cancelled } else { ResStatus::Error(error) }),
+                _ => self.on_page_error(req, error),
+            },
+            Event::RunFinished { req } => self.on_run_finished(req),
+            Event::Timeout { .. } => self.notices.push((true, "The server is taking too long to respond".into())),
             Event::Count { req, count } => self.on_total(req, Total::Exact(count)),
             Event::Estimate { req, count } => self.on_total(req, count.map_or(Total::Unknown, Total::Estimated)),
             Event::CommitDone { req, counts } => self.on_commit_done(req, counts.len()),
@@ -240,9 +278,9 @@ impl Workspace {
 
     /// Table tab with the given id.
     fn table_tab_mut(&mut self, id: TabId) -> Option<&mut TableTab> {
-        self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).map(|t| {
-            let TabKind::Table(tt) = &mut t.kind;
-            tt
+        self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).and_then(|t| match &mut t.kind {
+            TabKind::Table(tt) => Some(tt.as_mut()),
+            TabKind::Sql(_) => None,
         })
     }
 
@@ -357,7 +395,7 @@ impl Workspace {
     /// Stores a structure and hands it to the tabs showing that table.
     fn apply_structure(&mut self, st: TableStructure) {
         for (_, tab) in self.dock.iter_all_tabs_mut() {
-            let TabKind::Table(t) = &mut tab.kind;
+            let TabKind::Table(t) = &mut tab.kind else { continue };
             if t.table == st.table {
                 t.structure = Some(st.clone());
                 t.error = None;
@@ -375,6 +413,7 @@ impl Workspace {
             .iter_all_tabs()
             .map(|(_, t)| match &t.kind {
                 TabKind::Table(tt) => TabMeta { id: t.id, target: TabTarget::Table(tt.table.clone()), pinned: t.pinned, dirty: false },
+                TabKind::Sql(sq) => TabMeta { id: t.id, target: TabTarget::Sql(t.id), pinned: true, dirty: !sq.text.is_empty() },
             })
             .collect()
     }
@@ -386,8 +425,9 @@ impl Workspace {
 
     /// Table of the focused tab.
     fn active_table(&mut self) -> Option<TableRef> {
-        self.dock.find_active_focused().map(|(_, t)| match &t.kind {
-            TabKind::Table(tt) => tt.table.clone(),
+        self.dock.find_active_focused().and_then(|(_, t)| match &t.kind {
+            TabKind::Table(tt) => Some(tt.table.clone()),
+            TabKind::Sql(_) => None,
         })
     }
 
@@ -410,7 +450,7 @@ impl Workspace {
             if let Some(st) = ws.structures.get(&table) {
                 data.key_cols = default_key_columns(Some(st));
             }
-            Tab { id, pinned, kind: TabKind::Table(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data, is_view }) }
+            Tab { id, pinned, kind: TabKind::Table(Box::new(TableTab { structure: ws.structures.get(&table).cloned(), table: table.clone(), error: None, data, is_view })) }
         };
         let mut touched: Option<TabId> = None;
         match decision {
@@ -493,6 +533,12 @@ impl Workspace {
                 }
             }
             Action::ReloadWorkspace => self.load_schema(),
+            Action::NewSqlEditor => self.open_sql(String::new()),
+            Action::RunCurrent => self.run_sql(false),
+            Action::RunAll => self.run_sql(true),
+            Action::Cancel => self.cancel_sql(),
+            Action::Beautify => self.sql_action(SqlAction::Beautify),
+            Action::ToggleComment => self.sql_action(SqlAction::Comment),
             Action::Commit => self.commit_active(),
             Action::Preview => self.preview_active(),
             Action::Discard => self.discard_active(),
@@ -524,11 +570,161 @@ impl Workspace {
 
     /// The focused table tab.
     fn active_tab_mut(&mut self) -> Option<(TabId, &mut TableTab)> {
-        self.dock.find_active_focused().map(|(_, t)| {
+        self.dock.find_active_focused().and_then(|(_, t)| {
             let id = t.id;
-            let TabKind::Table(tt) = &mut t.kind;
-            (id, tt)
+            match &mut t.kind {
+                TabKind::Table(tt) => Some((id, tt.as_mut())),
+                TabKind::Sql(_) => None,
+            }
         })
+    }
+
+    /// The focused SQL tab.
+    fn active_sql_mut(&mut self) -> Option<(TabId, &mut SqlTab)> {
+        self.dock.find_active_focused().and_then(|(_, t)| {
+            let id = t.id;
+            match &mut t.kind {
+                TabKind::Sql(sq) => Some((id, sq.as_mut())),
+                TabKind::Table(_) => None,
+            }
+        })
+    }
+
+    /// SQL tab with the given id.
+    fn sql_tab_mut(&mut self, id: TabId) -> Option<&mut SqlTab> {
+        self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).and_then(|t| match &mut t.kind {
+            TabKind::Sql(sq) => Some(sq.as_mut()),
+            TabKind::Table(_) => None,
+        })
+    }
+
+    /// Opens a new SQL editor tab.
+    pub fn open_sql(&mut self, text: String) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.sql_counter += 1;
+        self.dock.push_to_focused_leaf(Tab { id, pinned: true, kind: TabKind::Sql(Box::new(SqlTab::new(self.sql_counter, text))) });
+        if let Some(loc) = self.tab_location(id) {
+            self.dock.set_active_tab(loc);
+        }
+    }
+
+    /// Runs the statements of the focused SQL tab through the safe-mode gate.
+    pub fn run_sql(&mut self, all: bool) {
+        let driver = self.conn.driver;
+        let Some((id, tab)) = self.active_sql_mut() else { return };
+        if tab.running {
+            return;
+        }
+        let stmts = tab.statements_to_run(all, driver);
+        if stmts.is_empty() {
+            return self.notices.push((false, "There is nothing to run".into()));
+        }
+        let limit = tab.row_limit;
+        let texts: Vec<String> = stmts.iter().map(|s| apply_row_limit(&s.text, limit)).collect();
+        let labels: Vec<Option<String>> = stmts.iter().map(|s| s.label.clone()).collect();
+        match gate_check(self.conn.safe_level, driver, &texts) {
+            GateDecision::Allow => self.send_run(id, texts, labels),
+            GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::Run { labels }, statements: t, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
+            GateDecision::Password(t) => {
+                let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                self.gate = Some(GateModal { action: GateAction::Run { labels }, statements: t, needs_password: known, input: String::new(), reveal: false, tab: id, error: None });
+            }
+        }
+    }
+
+    /// Sends the statements of a SQL tab to the session.
+    fn send_run(&mut self, id: TabId, statements: Vec<String>, labels: Vec<Option<String>>) {
+        let req = RequestId::next();
+        let Some(tab) = self.sql_tab_mut(id) else { return };
+        tab.results.retain(|r| r.pinned);
+        tab.active_result = 0;
+        tab.running = true;
+        tab.run_req = Some(req);
+        tab.labels = labels;
+        tab.total = statements.len();
+        self.req_map.insert(req, (id, ReqKind::Sql));
+        self.session.send(Command::RunSql { req, statements, opts: dbzilla_drivers::QueryOpts::default(), stop_on_error: false });
+    }
+
+    /// Cancels the running statement of the focused SQL tab.
+    fn cancel_sql(&mut self) {
+        if let Some((_, tab)) = self.active_sql_mut() {
+            if let Some(req) = tab.run_req {
+                self.session.send(Command::Cancel(req));
+            }
+        }
+    }
+
+    /// A statement of a SQL tab started: create its result tab.
+    fn on_statement_started(&mut self, req: RequestId, index: usize, sql: String) {
+        let Some((id, ReqKind::Sql)) = self.req_map.get(&req).copied() else { return };
+        let Some(tab) = self.sql_tab_mut(id) else { return };
+        let single = tab.total > sqltab::MAX_RESULT_TABS;
+        let title = if single { "Query".to_owned() } else { tab.labels.get(index).cloned().flatten().unwrap_or_else(|| format!("Query {}", index + 1)) };
+        if single {
+            tab.results.retain(|r| r.pinned);
+        }
+        tab.results.push(ResultTab::running(index, title, sql));
+        tab.active_result = tab.results.len() - 1;
+    }
+
+    /// Rows of a result arrived.
+    fn on_sql_rows(&mut self, id: TabId, index: usize, columns: Option<Vec<dbzilla_core::model::ColumnMeta>>, rows: Vec<dbzilla_core::model::Row>) {
+        let Some(tab) = self.sql_tab_mut(id) else { return };
+        let Some(r) = tab.results.iter_mut().rev().find(|r| r.index == index && r.status == ResStatus::Running) else { return };
+        if let Some(c) = columns {
+            r.columns = c;
+        }
+        r.rows.extend(rows);
+    }
+
+    /// A statement finished.
+    fn on_sql_done(&mut self, id: TabId, index: usize, status: ResStatus) {
+        let Some(tab) = self.sql_tab_mut(id) else { return };
+        if let Some(r) = tab.results.iter_mut().rev().find(|r| r.index == index && r.status == ResStatus::Running) {
+            r.status = status;
+        }
+    }
+
+    /// The whole run finished.
+    fn on_run_finished(&mut self, req: RequestId) {
+        let Some((id, ReqKind::Sql)) = self.req_map.remove(&req) else { return };
+        let Some(tab) = self.sql_tab_mut(id) else { return };
+        tab.running = false;
+        tab.run_req = None;
+        if let Some(i) = tab.results.iter().position(|r| !r.columns.is_empty()) {
+            tab.active_result = i;
+        } else {
+            tab.active_result = tab.results.len().saturating_sub(1);
+        }
+    }
+
+    /// Editor shortcuts on the focused SQL tab.
+    fn sql_action(&mut self, a: SqlAction) {
+        let driver = self.conn.driver;
+        let (width, with, kind, upper) = (self.fmt_width, self.fmt_with, self.fmt_kind, self.fmt_upper);
+        match a {
+            SqlAction::RunCurrent => self.run_sql(false),
+            SqlAction::RunAll => self.run_sql(true),
+            SqlAction::Cancel => self.cancel_sql(),
+            SqlAction::Beautify => {
+                if let Some((_, t)) = self.active_sql_mut() {
+                    t.beautify(driver, |s| sqltext::beautify(s, width, with, kind, upper));
+                }
+            }
+            SqlAction::Minify => {
+                if let Some((_, t)) = self.active_sql_mut() {
+                    t.beautify(driver, sqltext::minify);
+                }
+            }
+            SqlAction::Comment => {
+                if let Some((_, t)) = self.active_sql_mut() {
+                    t.toggle_comment();
+                }
+            }
+            SqlAction::Toast(m) => self.notices.push((false, m)),
+        }
     }
 
     /// True when the focused tab has pending changes.
@@ -577,10 +773,10 @@ impl Workspace {
         };
         match gate_check(self.conn.safe_level, self.conn.driver, &statements) {
             GateDecision::Allow => self.send_commit(id, statements),
-            GateDecision::Confirm(s) => self.gate = Some(GateModal { statements: s, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
+            GateDecision::Confirm(s) => self.gate = Some(GateModal { action: GateAction::Commit, statements: s, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
             GateDecision::Password(s) => {
                 let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
-                self.gate = Some(GateModal { statements: s, needs_password: known, input: String::new(), reveal: false, tab: id, error: None });
+                self.gate = Some(GateModal { action: GateAction::Commit, statements: s, needs_password: known, input: String::new(), reveal: false, tab: id, error: None });
             }
         }
     }
@@ -690,14 +886,14 @@ impl Workspace {
             egui::SidePanel::right("ws_details").default_width(300.0).width_range(240.0..=520.0).resizable(true).frame(Frame::new().fill(theme::DEEP_DARK).inner_margin(Margin::same(10))).show(ctx, |ui| {
                 let Workspace { dock, details, .. } = &mut *self;
                 match dock.find_active_focused() {
-                    Some((_, t)) => {
+                    Some((_, t)) if matches!(t.kind, TabKind::Table(_)) => {
                         let id = t.id;
-                        let TabKind::Table(tt) = &mut t.kind;
+                        let TabKind::Table(tt) = &mut t.kind else { return };
                         let cols = datatab::merge_columns(&tt.data.columns, tt.structure.as_ref());
                         let selected = tt.data.grid.selection.selected_rows();
                         detail_actions = details::show(ui, details, id, &cols, &tt.data.rows, &selected, !tt.is_view);
                     }
-                    None => {
+                    _ => {
                         ui.label(widgets::semibold("Details", 15.0).color(theme::TEXT));
                         widgets::muted(ui, "Open a table to see the fields of its rows.");
                     }
@@ -709,6 +905,11 @@ impl Workspace {
         }
         let mut requests = Vec::new();
         let mut data_actions: Vec<(TabId, DataAction)> = Vec::new();
+        let mut sql_actions: Vec<(TabId, SqlAction)> = Vec::new();
+        self.fmt_width = env.settings.indent_width;
+        self.fmt_with = env.settings.indent_with;
+        self.fmt_kind = env.settings.indent_type;
+        self.fmt_upper = env.settings.uppercase_keywords;
         self.page_size = env.settings.page_size;
         let csv = CsvOptions { delimiter: env.settings.csv.delimiter, quote: env.settings.csv.quote, quote_always: env.settings.csv.quote_always, line_break: env.settings.csv.line_break.clone(), decimal: env.settings.csv.decimal, null_as_empty: false };
         let row_height = (env.settings.table_row_padding + 12.0).clamp(20.0, 60.0);
@@ -739,7 +940,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -752,6 +953,9 @@ impl Workspace {
                     self.set_pinned(id, !pinned);
                 }
             }
+        }
+        for (_, a) in sql_actions {
+            self.sql_action(a);
         }
         for (id, a) in data_actions {
             match a {
@@ -885,7 +1089,10 @@ impl Workspace {
                     let ok = !g.needs_password || self.password.as_deref().is_some_and(|p| verify_password(p, &g.input));
                     if ok {
                         if let Some(g) = self.gate.take() {
-                            self.send_commit(g.tab, g.statements);
+                            match g.action {
+                                GateAction::Commit => self.send_commit(g.tab, g.statements),
+                                GateAction::Run { labels } => self.send_run(g.tab, g.statements, labels),
+                            }
                         }
                     } else if let Some(g) = self.gate.as_mut() {
                         g.error = Some("The password is not correct".into());
@@ -952,6 +1159,9 @@ impl Workspace {
                 });
                 ui.add_space(6.0);
                 widgets::ico_button(ui, Ico::Shield, &format!("Safe mode: {}", super::connform::safe_label(self.conn.safe_level)));
+                if widgets::ico_button(ui, Ico::File, &tip("New SQL editor", Action::NewSqlEditor)).clicked() {
+                    self.open_sql(String::new());
+                }
                 if widgets::ico_button(ui, Ico::Search, &tip("Open anything", Action::OpenAnything)).clicked() {
                     self.palette = Some(PaletteState::default());
                 }
@@ -1013,6 +1223,10 @@ struct Viewer<'a> {
     alternating: bool,
     row_height: f32,
     structures: &'a HashMap<TableRef, TableStructure>,
+    sql_actions: &'a mut Vec<(TabId, SqlAction)>,
+    keywords: &'a HashSet<String>,
+    driver: DriverId,
+    font_size: f32,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -1025,7 +1239,16 @@ impl TabViewer for Viewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         let id = tab.id;
-        let TabKind::Table(t) = &mut tab.kind;
+        let t = match &mut tab.kind {
+            TabKind::Table(t) => t,
+            TabKind::Sql(sq) => {
+                let env = SqlEnv { keywords: self.keywords, driver: self.driver, font_size: self.font_size, alternating: self.alternating, row_height: self.row_height };
+                for a in sqltab::show(ui, sq, &env) {
+                    self.sql_actions.push((id, a));
+                }
+                return;
+            }
+        };
         let table = t.table.clone();
         let env = DataEnv { dialect: self.dialect, csv: self.csv, alternating: self.alternating, row_height: self.row_height, table: &table, structure: self.structures.get(&table), is_view: t.is_view };
         for a in datatab::show(ui, &mut t.data, &env) {
@@ -1172,6 +1395,104 @@ mod tests {
         let c = rusqlite::Connection::open(&path).unwrap();
         let v: String = c.query_row("SELECT name FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(v, "alpha", "nothing was sent yet");
+    }
+
+    /// Opens an SQL editor with `text` and focuses it.
+    fn open_sql_focused(ws: &mut Workspace, text: &str) {
+        ws.open_sql(text.to_owned());
+        let loc = ws.dock.iter_all_tabs().last().map(|(l, _)| l).expect("a tab");
+        ws.dock.set_focused_node_and_surface(loc);
+    }
+
+    fn sql_running(ws: &mut Workspace) -> bool {
+        ws.active_sql_mut().is_some_and(|(_, t)| t.running)
+    }
+
+    /// A script runs statement by statement: named tabs, an error does not stop the others.
+    #[test]
+    fn sql_script_with_named_results_and_an_error() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "-- name: First\nSELECT 1 AS a;\nSELEC bad;\nSELECT 2 AS b");
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        let (_, t) = ws.active_sql_mut().unwrap();
+        let titles: Vec<&str> = t.results.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, vec!["First", "Query 2", "Query 3"]);
+        assert!(matches!(t.results[0].status, ResStatus::Done { .. }));
+        assert_eq!(t.results[0].rows, vec![vec![Value::I64(1)]]);
+        assert!(matches!(&t.results[1].status, ResStatus::Error(e) if e.to_lowercase().contains("syntax") || e.contains("SELEC")));
+        assert_eq!(t.results[2].rows, vec![vec![Value::I64(2)]]);
+    }
+
+    /// The row limit is applied to SELECTs without a LIMIT, and only to them.
+    #[test]
+    fn sql_row_limit_is_applied() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "SELECT * FROM t");
+        ws.active_sql_mut().unwrap().1.row_limit = Some(1);
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        assert_eq!(ws.active_sql_mut().unwrap().1.results[0].rows.len(), 1);
+        ws.active_sql_mut().unwrap().1.row_limit = None;
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        assert_eq!(ws.active_sql_mut().unwrap().1.results[0].rows.len(), 2);
+    }
+
+    /// Pinned results survive the next run; the others are replaced.
+    #[test]
+    fn pinned_results_survive_a_rerun() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "SELECT 1");
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        ws.active_sql_mut().unwrap().1.results[0].pinned = true;
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        assert_eq!(ws.active_sql_mut().unwrap().1.results.len(), 2);
+    }
+
+    /// A running statement can be cancelled and the editor stays usable.
+    #[test]
+    fn sql_cancel() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500000000) SELECT count(*) FROM c");
+        ws.active_sql_mut().unwrap().1.row_limit = None;
+        ws.run_sql(true);
+        wait(&mut ws, |w| w.active_sql_mut().is_some_and(|(_, t)| !t.results.is_empty()));
+        std::thread::sleep(Duration::from_millis(200));
+        ws.cancel_sql();
+        wait(&mut ws, |w| !sql_running(w));
+        assert_eq!(ws.active_sql_mut().unwrap().1.results[0].status, ResStatus::Cancelled);
+        ws.active_sql_mut().unwrap().1.text = "SELECT 5".into();
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        assert_eq!(ws.active_sql_mut().unwrap().1.results[0].rows, vec![vec![Value::I64(5)]]);
+    }
+
+    /// NFR-01: a million streamed rows never block a frame for long.
+    #[test]
+    fn million_rows_stream_without_blocking_frames() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 1000000) SELECT x, 'row ' || x FROM c");
+        ws.active_sql_mut().unwrap().1.row_limit = None;
+        ws.run_sql(true);
+        let (mut worst, mut frames) = (Duration::ZERO, 0u32);
+        let start = Instant::now();
+        while sql_running(&mut ws) && start.elapsed() < Duration::from_secs(60) {
+            let t0 = Instant::now();
+            ws.poll();
+            worst = worst.max(t0.elapsed());
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert_eq!(ws.active_sql_mut().unwrap().1.results[0].rows.len(), 1_000_000);
+        assert!(worst < Duration::from_millis(250), "slowest frame took {worst:?} over {frames} frames");
     }
 }
 
