@@ -23,6 +23,8 @@ pub struct ColumnDef {
     pub nullable: bool,
     /// Raw SQL default expression.
     pub default: Option<String>,
+    /// MySQL attributes that must survive MODIFY/CHANGE: `AUTO_INCREMENT`, `ON UPDATE ...`.
+    pub extra: Option<String>,
 }
 
 /// A foreign key definition.
@@ -62,6 +64,19 @@ pub enum StructuralOp {
     CloneTable { source: TableRef, target: TableRef, with_data: bool },
     /// Raw SQL (view or function definitions typed in a DDL editor).
     Raw(String),
+}
+
+/// Keeps what MySQL reports in `EXTRA` and a MODIFY/CHANGE would otherwise drop.
+pub fn mysql_column_suffix(extra: &str) -> Option<String> {
+    let lower = extra.to_ascii_lowercase();
+    let mut parts = Vec::new();
+    if lower.contains("auto_increment") {
+        parts.push("AUTO_INCREMENT".to_owned());
+    }
+    if let Some(i) = lower.find("on update ") {
+        parts.push(format!("ON UPDATE {}", extra[i + "on update ".len()..].trim()));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
 /// `"name" type [NOT NULL] [DEFAULT x]`.
@@ -106,7 +121,7 @@ fn create_table_sql(d: &dyn Dialect, table: &TableRef, cols: &[ColumnDef], pk: &
 
 /// Converts introspected metadata to a column definition.
 fn def_from_meta(c: &ColumnMeta) -> ColumnDef {
-    ColumnDef { name: c.name.clone(), type_name: c.type_name.clone(), nullable: c.nullable, default: c.default.clone() }
+    ColumnDef { name: c.name.clone(), type_name: c.type_name.clone(), nullable: c.nullable, default: c.default.clone(), extra: mysql_column_suffix(c.extra.get("extra").map_or("", String::as_str)) }
 }
 
 /// Foreign keys implied by column metadata.
@@ -242,8 +257,12 @@ fn alter_column(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &Column
             Ok(v)
         }
         DriverId::MySql => {
-            let def = col_sql(d, new).replacen(&d.quote_ident(&new.name), "", 1);
-            let def = def.trim_start();
+            let mut def = col_sql(d, new).replacen(&d.quote_ident(&new.name), "", 1).trim_start().to_owned();
+            if let Some(extra) = &new.extra {
+                def.push(' ');
+                def.push_str(extra);
+            }
+            let def = def.as_str();
             if old.name != new.name {
                 Ok(vec![format!("ALTER TABLE {t} CHANGE COLUMN {} {} {def}", d.quote_ident(&old.name), d.quote_ident(&new.name))])
             } else {

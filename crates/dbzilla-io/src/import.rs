@@ -276,7 +276,7 @@ fn convert_batch(plan: &ImportPlan, parsed: &Parsed, start: usize, end: usize) -
 pub async fn run_import(conn: &mut dyn Conn, driver: DriverId, plan: &ImportPlan, parsed: &Parsed, progress: ProgressFn<'_>, cancel: &AtomicBool) -> Result<ImportSummary, IoError> {
     let d = dialect_for(driver);
     if let Some(cols) = &plan.create {
-        let columns = cols.iter().map(|(n, t)| ColumnDef { name: n.clone(), type_name: t.clone(), nullable: true, default: None }).collect();
+        let columns = cols.iter().map(|(n, t)| ColumnDef { name: n.clone(), type_name: t.clone(), nullable: true, default: None, extra: None }).collect();
         let ops = StructuralOp::CreateTable { table: plan.table.clone(), columns, primary_key: vec![], foreign_keys: vec![] };
         let stmts = generate_ddl(&ops, d.as_ref()).map_err(|e| IoError::Format(e.to_string()))?;
         conn.execute_batch(&stmts, false).await?;

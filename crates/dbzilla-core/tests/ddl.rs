@@ -5,7 +5,7 @@ use dbzilla_core::dialect::{dialect_for, DriverId};
 use dbzilla_core::model::{ColumnMeta, IndexInfo, TableRef, TableStructure};
 
 fn col(name: &str, ty: &str, nullable: bool, default: Option<&str>) -> ColumnDef {
-    ColumnDef { name: name.into(), type_name: ty.into(), nullable, default: default.map(str::to_owned) }
+    ColumnDef { name: name.into(), type_name: ty.into(), nullable, default: default.map(str::to_owned), extra: None }
 }
 
 fn ddl(id: DriverId, op: StructuralOp) -> Result<Vec<String>, DdlError> {
@@ -91,6 +91,17 @@ fn alter_column_mysql_uses_change_or_modify() {
     assert_eq!(ddl(DriverId::MySql, rename).unwrap(), vec!["ALTER TABLE `a` CHANGE COLUMN `c` `d` bigint"]);
     let modify = StructuralOp::AlterColumn { table: t("a"), old: col("c", "int", true, None), new: col("c", "bigint", true, None), current: None };
     assert_eq!(ddl(DriverId::MySql, modify).unwrap(), vec!["ALTER TABLE `a` MODIFY COLUMN `c` bigint"]);
+}
+
+/// Review I7: a MySQL MODIFY keeps AUTO_INCREMENT and ON UPDATE.
+#[test]
+fn mysql_modify_keeps_auto_increment_and_on_update() {
+    let mut new = col("id", "bigint", false, None);
+    new.extra = dbzilla_core::ddl::mysql_column_suffix("auto_increment");
+    let op = StructuralOp::AlterColumn { table: t("a"), old: col("id", "int", false, None), new, current: None };
+    assert_eq!(ddl(DriverId::MySql, op).unwrap(), vec!["ALTER TABLE `a` MODIFY COLUMN `id` bigint NOT NULL AUTO_INCREMENT"]);
+    assert_eq!(dbzilla_core::ddl::mysql_column_suffix("DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)").as_deref(), Some("ON UPDATE CURRENT_TIMESTAMP(3)"));
+    assert_eq!(dbzilla_core::ddl::mysql_column_suffix(""), None);
 }
 
 fn current_structure() -> TableStructure {
