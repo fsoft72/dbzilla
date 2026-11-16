@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod app;
+mod autocomplete;
 mod cli;
 mod fuzzy;
 mod glyphs;

@@ -2,6 +2,7 @@
 
 use super::grid::{self, GridEvent, GridInput, GridState};
 use super::pending::Pending;
+use crate::autocomplete::{self, Kind, Suggestion};
 use super::widgets;
 use crate::glyphs::Ico;
 use crate::sqlhl;
@@ -11,15 +12,18 @@ use dbzilla_core::dialect::DriverId;
 use dbzilla_core::model::{ColumnMeta, Row};
 use dbzilla_core::rowlimit::ROW_LIMITS;
 use dbzilla_core::splitter::{split_statements, Statement};
+use dbzilla_store::settings::CompleteKey;
 use dbzilla_session::RequestId;
 use eframe::egui::text::{CCursor, CCursorRange, LayoutJob};
-use eframe::egui::{self, Align, Align2, FontId, Layout, RichText, Sense, Shape, Stroke, TextEdit, Ui};
-use std::collections::HashSet;
+use eframe::egui::{self, Align, Align2, FontId, Key, Layout, Modifiers, Order, RichText, Sense, Shape, Stroke, TextEdit, Ui};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Width reserved for line numbers.
 const GUTTER: f32 = 44.0;
+/// Width of the completion popup.
+const POPUP_WIDTH: f32 = 320.0;
 /// Single result tab used when a script has more statements than this.
 pub const MAX_RESULT_TABS: usize = 100;
 
@@ -81,6 +85,17 @@ impl ResultTab {
     }
 }
 
+/// State of the completion popup.
+#[derive(Default)]
+pub struct Completion {
+    pub items: Vec<Suggestion>,
+    pub selected: usize,
+    pub start: usize,
+    pub open: bool,
+    pub explicit: bool,
+    dismissed_key: Option<u64>,
+}
+
 /// Find and replace bar state.
 #[derive(Default)]
 pub struct FindState {
@@ -105,6 +120,15 @@ pub struct SqlTab {
     pub labels: Vec<Option<String>>,
     /// Number of statements of the current run.
     pub total: usize,
+    /// The statements as typed (without the injected row limit), for the history.
+    pub run_texts: Vec<String>,
+    /// Saved query file this tab edits, relative to the queries folder.
+    pub file: Option<String>,
+    pub query_keywords: Vec<String>,
+    pub saved_text: String,
+    pub last_edit: Option<Instant>,
+    pub complete: Completion,
+    last_key: u64,
     edit_id: egui::Id,
     hl: Option<(u64, LayoutJob)>,
     pending_selection: Option<(usize, usize)>,
@@ -128,6 +152,13 @@ impl SqlTab {
             selection: (0, 0),
             labels: Vec::new(),
             total: 0,
+            run_texts: Vec::new(),
+            file: None,
+            query_keywords: Vec::new(),
+            saved_text: String::new(),
+            last_edit: None,
+            complete: Completion::default(),
+            last_key: 0,
             edit_id: egui::Id::new(("sql_editor", no)),
             hl: None,
             pending_selection: None,
@@ -186,6 +217,17 @@ pub struct SqlEnv<'a> {
     pub font_size: f32,
     pub alternating: bool,
     pub row_height: f32,
+    /// Tables and views `(name, is_view)`.
+    pub tables: &'a [(&'a str, bool)],
+    pub columns: crate::autocomplete::ColumnLookup<'a>,
+    pub dialect_keywords: &'a [&'a str],
+    pub saved: &'a HashMap<String, String>,
+    pub uppercase_keywords: bool,
+    pub complete_key: CompleteKey,
+    pub quote: &'a dyn Fn(&str) -> String,
+    pub completion: bool,
+    /// Changes whenever the schema knowledge changes, so suggestions are recomputed.
+    pub schema_rev: usize,
 }
 
 /// What the tab asks the workspace to do.
@@ -197,6 +239,8 @@ pub enum SqlAction {
     Beautify,
     Minify,
     Comment,
+    SaveQuery,
+    NeedStructure(String),
     Toast(String),
 }
 
@@ -227,7 +271,7 @@ pub fn show(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv) -> Vec<SqlAction> {
         if tab.find.is_some() {
             find_bar(ui, tab);
         }
-        editor(ui, tab, env);
+        editor(ui, tab, env, &mut actions);
     });
     actions
 }
@@ -252,6 +296,9 @@ fn run_bar(ui: &mut Ui, tab: &mut SqlTab, actions: &mut Vec<SqlAction>) {
         }
         if widgets::ico_button(ui, Ico::Minus, "Minify the statement").clicked() {
             actions.push(SqlAction::Minify);
+        }
+        if widgets::ico_button(ui, Ico::Bookmark, "Add to Queries").clicked() {
+            actions.push(SqlAction::SaveQuery);
         }
         if widgets::ico_button(ui, Ico::Search, "Find (Ctrl+F)").clicked() {
             tab.find = if tab.find.is_some() { None } else { Some(FindState { focus: true, ..Default::default() }) };
@@ -330,7 +377,7 @@ fn replace_case_insensitive(text: &str, needle: &str, with: &str) -> String {
 }
 
 /// The text editor with highlighting, line numbers and the current statement band.
-fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv) {
+fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv, actions: &mut Vec<SqlAction>) {
     let font = FontId::monospace(env.font_size);
     let row_h = ui.fonts(|f| f.row_height(&font));
     let avail_h = ui.available_height();
@@ -340,6 +387,12 @@ fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv) {
             ui.spacing_mut().item_spacing.x = 0.0;
             let (gutter_rect, _) = ui.allocate_exact_size(egui::vec2(GUTTER, row_h), Sense::hover());
             let band = ui.painter().add(Shape::Noop);
+            let focused = ui.memory(|m| m.has_focus(tab.edit_id));
+            let mut accept = false;
+            if env.completion && focused {
+                intercept_keys(ui, tab, env.complete_key, &mut accept);
+            }
+            let before = hl_key(&tab.text, 0.0);
             let SqlTab { text, hl, edit_id, .. } = tab;
             let mut layouter = |ui: &Ui, t: &str, wrap: f32| {
                 let key = hl_key(t, env.font_size);
@@ -362,8 +415,127 @@ fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv) {
             }
             paint_band(ui, tab, env, &out, band);
             paint_gutter(ui, &out, env.font_size, gutter_rect.right());
+            if hl_key(&tab.text, 0.0) != before {
+                tab.last_edit = Some(Instant::now());
+            }
+            if env.completion {
+                completion(ui, tab, env, &out, focused, accept, actions);
+            }
         });
     });
+}
+
+/// Handles the navigation keys of the popup before the editor sees them.
+fn intercept_keys(ui: &mut Ui, tab: &mut SqlTab, key: CompleteKey, accept: &mut bool) {
+    let c = &mut tab.complete;
+    let explicit_requested = ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space));
+    if explicit_requested {
+        c.explicit = true;
+        c.dismissed_key = None;
+        tab.last_key = 0;
+    }
+    if !c.open || c.items.is_empty() {
+        return;
+    }
+    let n = c.items.len();
+    ui.input_mut(|i| {
+        if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+            c.selected = (c.selected + 1) % n;
+        }
+        if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+            c.selected = (c.selected + n - 1) % n;
+        }
+        if matches!(key, CompleteKey::Both | CompleteKey::EnterOnly) && i.consume_key(Modifiers::NONE, Key::Enter) {
+            *accept = true;
+        }
+        if matches!(key, CompleteKey::Both | CompleteKey::TabOnly) && i.consume_key(Modifiers::NONE, Key::Tab) {
+            *accept = true;
+        }
+        if i.consume_key(Modifiers::NONE, Key::Escape) {
+            c.open = false;
+            c.dismissed_key = Some(1);
+        }
+    });
+}
+
+/// Recomputes the suggestions, draws the popup and applies an accepted one.
+fn completion(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv, out: &egui::text_edit::TextEditOutput, focused: bool, accept: bool, actions: &mut Vec<SqlAction>) {
+    let cursor = byte_index(&tab.text, out.cursor_range.map_or(0, |r| r.primary.ccursor.index));
+    if accept {
+        if let Some(item) = tab.complete.items.get(tab.complete.selected).cloned() {
+            let start = tab.complete.start.min(cursor);
+            tab.text.replace_range(start..cursor, &item.insert);
+            tab.set_selection((start + item.insert.len(), start + item.insert.len()));
+            tab.complete.open = false;
+            tab.complete.dismissed_key = Some(1);
+            ui.ctx().request_repaint();
+            return;
+        }
+    }
+    let key = hl_key(&tab.text, 1.0) ^ (cursor as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (env.schema_rev as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    if key != tab.last_key {
+        tab.last_key = key;
+        if tab.complete.dismissed_key != Some(1) || !tab.complete.open {
+            tab.complete.dismissed_key = None;
+        }
+        let ctx = autocomplete::context(&tab.text, cursor, env.driver);
+        let items = match (&ctx, focused) {
+            (Some(c), true) => {
+                for (t, _) in &c.tables {
+                    if (env.columns)(t).is_none() && env.tables.iter().any(|(n, _)| n.eq_ignore_ascii_case(t)) {
+                        actions.push(SqlAction::NeedStructure(t.clone()));
+                    }
+                }
+                let schema = autocomplete::Schema { tables: env.tables.to_vec(), columns: env.columns, keywords: env.dialect_keywords, saved: env.saved };
+                autocomplete::suggest(c, &schema, tab.complete.explicit, env.uppercase_keywords, env.quote)
+            }
+            _ => Vec::new(),
+        };
+        tab.complete.explicit = false;
+        tab.complete.start = ctx.as_ref().map_or(cursor, |c| c.start);
+        tab.complete.selected = tab.complete.selected.min(items.len().saturating_sub(1));
+        tab.complete.open = !items.is_empty();
+        tab.complete.items = items;
+    }
+    if !focused || !tab.complete.open || tab.complete.items.is_empty() {
+        return;
+    }
+    let caret = out.galley.pos_from_ccursor(CCursor::new(out.cursor_range.map_or(0, |r| r.primary.ccursor.index)));
+    let pos = out.galley_pos + egui::vec2(caret.left(), caret.bottom() + 4.0);
+    let mut clicked = None;
+    egui::Area::new(egui::Id::new((tab.edit_id, "complete"))).order(Order::Tooltip).fixed_pos(pos).show(ui.ctx(), |ui| {
+        egui::Frame::new().fill(theme::SURFACE).stroke(Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER)).corner_radius(theme::RADIUS_CARD).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            ui.set_width(POPUP_WIDTH);
+            for (i, it) in tab.complete.items.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::click());
+                if i == tab.complete.selected || resp.hovered() {
+                    ui.painter().rect_filled(rect, theme::RADIUS_CTRL, if i == tab.complete.selected { theme::INPUT_FILL_BLUE } else { theme::FIELD_ROW_BG });
+                }
+                let (badge, color) = match it.kind {
+                    Kind::Table => ("T", theme::SECONDARY),
+                    Kind::View => ("V", theme::SECONDARY),
+                    Kind::Column => ("C", theme::OK),
+                    Kind::Keyword => ("K", theme::LABEL),
+                    Kind::Snippet => ("S", theme::TERTIARY),
+                };
+                ui.painter().text(rect.left_center() + egui::vec2(8.0, 0.0), Align2::LEFT_CENTER, badge, FontId::new(11.0, theme::semibold()), color);
+                ui.painter().text(rect.left_center() + egui::vec2(24.0, 0.0), Align2::LEFT_CENTER, &it.label, FontId::monospace(12.5), theme::TEXT);
+                ui.painter().text(rect.right_center() - egui::vec2(8.0, 0.0), Align2::RIGHT_CENTER, &it.detail, FontId::new(11.0, egui::FontFamily::Proportional), theme::MUTED);
+                if resp.clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    });
+    if let Some(i) = clicked {
+        tab.complete.selected = i;
+        if let Some(item) = tab.complete.items.get(i).cloned() {
+            let start = tab.complete.start.min(cursor);
+            tab.text.replace_range(start..cursor, &item.insert);
+            tab.set_selection((start + item.insert.len(), start + item.insert.len()));
+            tab.complete.open = false;
+        }
+    }
 }
 
 /// Highlights the statement under the cursor.

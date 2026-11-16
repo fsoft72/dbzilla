@@ -7,7 +7,7 @@ use crate::theme;
 use crate::ui::connform::{self, config_for, ConnForm, FormAction, TestState};
 use crate::ui::connlist::{self, ListAction, ListState};
 use crate::ui::settings::{self, SettingsTab};
-use crate::ui::workspace::{Workspace, WsEnv, WsOutput};
+use crate::ui::workspace::{Stores, Workspace, WsEnv, WsOutput};
 use crate::ui::{widgets, Toasts};
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::dialect::DriverId;
@@ -15,7 +15,9 @@ use dbzilla_core::url::{format_url, parse_url};
 use dbzilla_drivers::driver_for;
 use dbzilla_session::{default_factory, spawn, Command, SessionConfig};
 use dbzilla_store::connections::{ConnectionStore, PasswordMode, StoredConnection};
+use dbzilla_store::history::HistoryStore;
 use dbzilla_store::paths::AppPaths;
+use dbzilla_store::queries::QueryStore;
 use dbzilla_store::secrets::{secret_key, KeyringStore, MemorySecretStore, SecretStore};
 use dbzilla_store::settings::Settings;
 use dbzilla_store::tags::TagStore;
@@ -207,7 +209,7 @@ impl App {
         let repaint_ctx = ctx.clone();
         let session = spawn(self.rt.handle(), cfg, default_factory(), Arc::new(move || repaint_ctx.request_repaint()));
         session.send(Command::Connect(config_for(&conn, password.clone())));
-        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries, self.settings.page_size, password));
+        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries, self.settings.page_size, password, Stores { history: HistoryStore::new(self.paths.history_dir(), self.settings.history_enabled), queries: QueryStore::new(self.paths.queries_dir()) }));
         self.section = Section::Workspace(self.workspaces.len() - 1);
     }
 

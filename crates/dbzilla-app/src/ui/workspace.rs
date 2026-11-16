@@ -5,7 +5,7 @@ use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::details::{self, DetailsAction, DetailsState};
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
-use super::sidebar::{self, SidebarAction, SidebarState, SidebarTab};
+use super::sidebar::{self, ExtraAction, SidebarAction, SidebarState, SidebarTab};
 use super::sqltab::{self, ResStatus, ResultTab, SqlAction, SqlEnv, SqlTab};
 use super::tabs::{decide_open, OpenDecision, OpenMode, TabId, TabMeta, TabTarget};
 use super::widgets;
@@ -17,7 +17,7 @@ use crate::sqltext;
 use crate::theme;
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::changes::generate_sql;
-use dbzilla_core::copyfmt::CsvOptions;
+use dbzilla_core::copyfmt::{format_rows, CopyContext, CopyFormat, CsvOptions};
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::rowlimit::apply_row_limit;
@@ -26,11 +26,25 @@ use dbzilla_drivers::DatabaseInfo;
 use dbzilla_session::gate::{gate_check, verify_password, GateDecision};
 use dbzilla_session::{Command, Event, PageRequest, RequestId, SessionHandle};
 use dbzilla_store::connections::StoredConnection;
+use dbzilla_store::history::{HistoryEntry, HistoryKind, HistoryStore};
+use dbzilla_store::queries::{QueryEntry, QuerySort, QueryStore};
 use dbzilla_store::settings::Settings;
 use dbzilla_store::tags::TagStore;
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Stroke};
 use egui_dock::{DockArea, DockState, Style, TabViewer};
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Quotes an identifier only when it is not a plain lower-case word.
+fn quote_if_needed(d: &dyn Dialect, name: &str) -> String {
+    let plain = !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if plain { name.to_owned() } else { d.quote_ident(name) }
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
 
 /// Connection state shown in the UI.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +64,19 @@ pub struct TableTab {
     pub is_view: bool,
 }
 
+/// The persistent stores a workspace writes to.
+pub struct Stores {
+    pub history: HistoryStore,
+    pub queries: QueryStore,
+}
+
+/// Dialog saving a statement as a query file.
+struct SaveDialog {
+    name: String,
+    keywords: String,
+    sql: String,
+}
+
 /// What a request of a tab is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReqKind {
@@ -62,7 +89,7 @@ enum ReqKind {
 /// What a confirmed gate does.
 enum GateAction {
     Commit,
-    Run { labels: Vec<Option<String>> },
+    Run { labels: Vec<Option<String>>, originals: Vec<String> },
 }
 
 /// A statement list waiting for the safe-mode answer.
@@ -161,6 +188,19 @@ pub struct Workspace {
     /// Password of the connection, used to unlock the safe modes.
     pub password: Option<String>,
     pub keywords: HashSet<String>,
+    history: HistoryStore,
+    queries: QueryStore,
+    history_cache: Vec<HistoryEntry>,
+    history_for: Option<String>,
+    history_dirty: bool,
+    queries_cache: Vec<QueryEntry>,
+    queries_sort: QuerySort,
+    queries_dirty: bool,
+    saved_keywords: HashMap<String, String>,
+    save_dialog: Option<SaveDialog>,
+    requested_structs: HashSet<String>,
+    commit_log: HashMap<RequestId, (Vec<String>, Option<String>)>,
+    log_original: bool,
     sql_counter: usize,
     fmt_width: u8,
     fmt_with: dbzilla_store::settings::IndentWith,
@@ -176,7 +216,7 @@ pub struct Workspace {
 
 impl Workspace {
     /// Creates the workspace of a connection whose session is already connecting.
-    pub fn new(conn: StoredConnection, session: SessionHandle, console_entries: usize, page_size: u64, password: Option<String>) -> Self {
+    pub fn new(conn: StoredConnection, session: SessionHandle, console_entries: usize, page_size: u64, password: Option<String>, stores: Stores) -> Self {
         let caps = Capabilities::for_driver(conn.driver);
         let conn_driver = conn.driver;
         Self {
@@ -203,6 +243,19 @@ impl Workspace {
             req_map: HashMap::new(),
             password,
             keywords: sqlhl::keyword_set(dialect_for(conn_driver).keywords()),
+            history: stores.history,
+            queries: stores.queries,
+            history_cache: Vec::new(),
+            history_for: None,
+            history_dirty: true,
+            queries_cache: Vec::new(),
+            queries_sort: QuerySort::Name,
+            queries_dirty: true,
+            saved_keywords: HashMap::new(),
+            save_dialog: None,
+            requested_structs: HashSet::new(),
+            commit_log: HashMap::new(),
+            log_original: false,
             sql_counter: 0,
             fmt_width: 4,
             fmt_with: dbzilla_store::settings::IndentWith::Spaces,
@@ -606,6 +659,7 @@ impl Workspace {
         self.dock.push_to_focused_leaf(Tab { id, pinned: true, kind: TabKind::Sql(Box::new(SqlTab::new(self.sql_counter, text))) });
         if let Some(loc) = self.tab_location(id) {
             self.dock.set_active_tab(loc);
+            self.dock.set_focused_node_and_surface((loc.0, loc.1));
         }
     }
 
@@ -623,18 +677,19 @@ impl Workspace {
         let limit = tab.row_limit;
         let texts: Vec<String> = stmts.iter().map(|s| apply_row_limit(&s.text, limit)).collect();
         let labels: Vec<Option<String>> = stmts.iter().map(|s| s.label.clone()).collect();
+        let originals: Vec<String> = stmts.iter().map(|s| s.text.clone()).collect();
         match gate_check(self.conn.safe_level, driver, &texts) {
-            GateDecision::Allow => self.send_run(id, texts, labels),
-            GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::Run { labels }, statements: t, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
+            GateDecision::Allow => self.send_run(id, texts, labels, originals),
+            GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::Run { labels, originals }, statements: t, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
             GateDecision::Password(t) => {
                 let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
-                self.gate = Some(GateModal { action: GateAction::Run { labels }, statements: t, needs_password: known, input: String::new(), reveal: false, tab: id, error: None });
+                self.gate = Some(GateModal { action: GateAction::Run { labels, originals }, statements: t, needs_password: known, input: String::new(), reveal: false, tab: id, error: None });
             }
         }
     }
 
     /// Sends the statements of a SQL tab to the session.
-    fn send_run(&mut self, id: TabId, statements: Vec<String>, labels: Vec<Option<String>>) {
+    fn send_run(&mut self, id: TabId, statements: Vec<String>, labels: Vec<Option<String>>, originals: Vec<String>) {
         let req = RequestId::next();
         let Some(tab) = self.sql_tab_mut(id) else { return };
         tab.results.retain(|r| r.pinned);
@@ -642,6 +697,7 @@ impl Workspace {
         tab.running = true;
         tab.run_req = Some(req);
         tab.labels = labels;
+        tab.run_texts = originals;
         tab.total = statements.len();
         self.req_map.insert(req, (id, ReqKind::Sql));
         self.session.send(Command::RunSql { req, statements, opts: dbzilla_drivers::QueryOpts::default(), stop_on_error: false });
@@ -682,8 +738,20 @@ impl Workspace {
     /// A statement finished.
     fn on_sql_done(&mut self, id: TabId, index: usize, status: ResStatus) {
         let Some(tab) = self.sql_tab_mut(id) else { return };
+        let sql = tab.run_texts.get(index).cloned();
+        let (ok, ms) = match &status {
+            ResStatus::Done { elapsed, .. } => (true, Some(elapsed.as_millis() as u64)),
+            _ => (false, None),
+        };
         if let Some(r) = tab.results.iter_mut().rev().find(|r| r.index == index && r.status == ResStatus::Running) {
             r.status = status;
+        }
+        if let Some(sql) = sql {
+            let entry = HistoryEntry { ts: now_ms(), sql, kind: HistoryKind::Editor, duration_ms: ms, ok, database: Some(self.current_db.clone()), original_csv: None };
+            if let Err(e) = self.history.append(&self.conn.id, &entry) {
+                self.notices.push((true, format!("Cannot write the history: {e}")));
+            }
+            self.history_dirty = true;
         }
     }
 
@@ -723,7 +791,154 @@ impl Workspace {
                     t.toggle_comment();
                 }
             }
+            SqlAction::SaveQuery => {
+                let driver = self.conn.driver;
+                if let Some((_, t)) = self.active_sql_mut() {
+                    let sql = t.statements_to_run(false, driver).into_iter().next().map_or_else(|| t.text.clone(), |s| s.text);
+                    self.save_dialog = Some(SaveDialog { name: String::new(), keywords: String::new(), sql });
+                }
+            }
+            SqlAction::NeedStructure(name) => {
+                let key = name.to_lowercase();
+                if self.requested_structs.insert(key) {
+                    if let Some(o) = self.objects.iter().find(|o| o.table.name.eq_ignore_ascii_case(&name)) {
+                        self.session.send(Command::LoadStructure(o.table.clone()));
+                    }
+                }
+            }
             SqlAction::Toast(m) => self.notices.push((false, m)),
+        }
+    }
+
+    /// Refreshes the cached history and saved query lists when needed.
+    fn refresh_lists(&mut self) {
+        let query = self.sidebar.search.clone();
+        if self.history_dirty || self.history_for.as_deref() != Some(query.as_str()) && self.sidebar.tab == SidebarTab::History {
+            self.history_cache = self.history.search(&self.conn.id, &query, 200).unwrap_or_default();
+            self.history_for = Some(query);
+            self.history_dirty = false;
+        }
+        if self.queries_dirty {
+            self.queries_cache = self.queries.list(self.queries_sort).unwrap_or_default();
+            self.saved_keywords = self.queries.keyword_map().unwrap_or_default();
+            self.queries_dirty = false;
+        }
+    }
+
+    /// Opens a saved query in its own tab (or focuses the one already open).
+    pub fn open_query(&mut self, rel: &str) {
+        let existing = self.dock.iter_all_tabs().find(|(_, t)| matches!(&t.kind, TabKind::Sql(s) if s.file.as_deref() == Some(rel))).map(|(_, t)| t.id);
+        if let Some(id) = existing {
+            if let Some(loc) = self.tab_location(id) {
+                self.dock.set_active_tab(loc);
+                self.dock.set_focused_node_and_surface((loc.0, loc.1));
+            }
+            return;
+        }
+        match self.queries.read(rel) {
+            Ok(q) => {
+                self.open_sql(q.sql.clone());
+                if let Some((_, t)) = self.active_sql_mut() {
+                    t.file = Some(rel.to_owned());
+                    t.query_keywords = q.keywords;
+                    t.saved_text = q.sql;
+                }
+            }
+            Err(e) => self.notices.push((true, format!("Cannot open the query: {e}"))),
+        }
+    }
+
+    /// Actions of the Queries and History tabs.
+    fn handle_extra(&mut self, ctx: &egui::Context, a: ExtraAction) {
+        match a {
+            ExtraAction::OpenQuery(rel) => self.open_query(&rel),
+            ExtraAction::InsertQuery(rel) => match self.queries.read(&rel) {
+                Ok(q) => match self.active_sql_mut() {
+                    Some((_, t)) => {
+                        let at = t.selection.0.min(t.text.len());
+                        let at = if t.text.is_char_boundary(at) { at } else { t.text.len() };
+                        t.text.insert_str(at, &q.sql);
+                    }
+                    None => self.open_sql(q.sql),
+                },
+                Err(e) => self.notices.push((true, e.to_string())),
+            },
+            ExtraAction::RunQuery(rel) => match self.queries.read(&rel) {
+                Ok(q) => {
+                    self.open_sql(q.sql);
+                    self.run_sql(true);
+                }
+                Err(e) => self.notices.push((true, e.to_string())),
+            },
+            ExtraAction::DeleteQuery(rel) => {
+                if let Err(e) = self.queries.delete(&rel) {
+                    self.notices.push((true, e.to_string()));
+                }
+                self.queries_dirty = true;
+            }
+            ExtraAction::NewQuery => self.save_dialog = Some(SaveDialog { name: String::new(), keywords: String::new(), sql: String::new() }),
+            ExtraAction::SortQueries(s) => {
+                self.queries_sort = s;
+                self.queries_dirty = true;
+            }
+            ExtraAction::HistoryInsert(i) => {
+                if let Some(e) = self.history_cache.get(i).cloned() {
+                    self.open_sql(e.sql);
+                }
+            }
+            ExtraAction::HistoryRun(i) => {
+                if let Some(e) = self.history_cache.get(i).cloned() {
+                    self.open_sql(e.sql);
+                    self.run_sql(true);
+                }
+            }
+            ExtraAction::HistoryCopy(i) => {
+                if let Some(e) = self.history_cache.get(i) {
+                    ctx.copy_text(e.sql.clone());
+                    self.notices.push((false, "Statement copied".into()));
+                }
+            }
+            ExtraAction::HistoryAddToQueries(i) => {
+                if let Some(e) = self.history_cache.get(i).cloned() {
+                    self.save_dialog = Some(SaveDialog { name: String::new(), keywords: String::new(), sql: e.sql });
+                }
+            }
+            ExtraAction::HistoryClear => {
+                if let Err(e) = self.history.clear(&self.conn.id) {
+                    self.notices.push((true, e.to_string()));
+                }
+                self.history_dirty = true;
+            }
+        }
+    }
+
+    /// Writes edited saved queries back to their files once typing pauses.
+    fn autosave_queries(&mut self, ctx: &egui::Context, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        let Workspace { dock, queries, queries_dirty, notices, .. } = self;
+        let mut pending = false;
+        for (_, tab) in dock.iter_all_tabs_mut() {
+            let TabKind::Sql(t) = &mut tab.kind else { continue };
+            let Some(rel) = t.file.clone() else { continue };
+            if t.text == t.saved_text {
+                continue;
+            }
+            if t.last_edit.is_some_and(|at| at.elapsed() > std::time::Duration::from_millis(600)) {
+                match queries.save(&rel, &t.query_keywords, &t.text) {
+                    Ok(()) => {
+                        t.saved_text = t.text.clone();
+                        *queries_dirty = true;
+                    }
+                    Err(e) => notices.push((true, format!("Cannot save {rel}: {e}"))),
+                }
+            } else {
+                pending = true;
+            }
+        }
+        if pending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(700));
         }
     }
 
@@ -784,6 +999,8 @@ impl Workspace {
     /// Sends the statements to the server.
     fn send_commit(&mut self, id: TabId, statements: Vec<String>) {
         let req = RequestId::next();
+        let csv = if self.log_original { self.original_values_csv(id) } else { None };
+        self.commit_log.insert(req, (statements.clone(), csv));
         if let Some(t) = self.table_tab_mut(id) {
             t.data.committing = true;
         }
@@ -793,6 +1010,18 @@ impl Workspace {
 
     /// A commit succeeded: reload the tab.
     fn on_commit_done(&mut self, req: RequestId, statements: usize) {
+        if let Some((stmts, csv)) = self.commit_log.remove(&req) {
+            let mut csv = csv;
+            for sql in stmts {
+                let writes_existing = sql.starts_with("UPDATE") || sql.starts_with("DELETE");
+                let original_csv = if writes_existing { csv.take() } else { None };
+                let entry = HistoryEntry { ts: now_ms(), sql, kind: HistoryKind::Commit, duration_ms: None, ok: true, database: Some(self.current_db.clone()), original_csv };
+                if let Err(e) = self.history.append(&self.conn.id, &entry) {
+                    self.notices.push((true, format!("Cannot write the history: {e}")));
+                }
+            }
+            self.history_dirty = true;
+        }
         let Some((id, ReqKind::Commit)) = self.req_map.remove(&req) else { return };
         if let Some(t) = self.table_tab_mut(id) {
             t.data.committing = false;
@@ -803,11 +1032,26 @@ impl Workspace {
 
     /// A commit failed: nothing is lost, the changes stay pending.
     fn on_commit_error(&mut self, req: RequestId, error: String) {
+        self.commit_log.remove(&req);
         let Some((id, ReqKind::Commit)) = self.req_map.remove(&req) else { return };
         if let Some(t) = self.table_tab_mut(id) {
             t.data.committing = false;
         }
         self.notices.push((true, format!("Commit failed: {error}")));
+    }
+
+    /// CSV of the rows as they were before the pending updates and deletes.
+    fn original_values_csv(&mut self, id: TabId) -> Option<String> {
+        let table = self.tab_table(id);
+        let st = self.structures.get(&table).cloned();
+        let dialect = dialect_for(self.conn.driver);
+        let t = self.table_tab_mut(id)?;
+        let cols = datatab::merge_columns(&t.data.columns, st.as_ref().or(t.structure.as_ref()));
+        let rows: Vec<dbzilla_core::model::Row> = t.data.pending.meta.iter().filter(|m| matches!(m.state, super::pending::RowState::Modified | super::pending::RowState::Deleted)).filter_map(|m| m.original.clone()).collect();
+        if rows.is_empty() {
+            return None;
+        }
+        Some(format_rows(CopyFormat::CsvWithHeader, &cols, &rows, &CopyContext { dialect: dialect.as_ref(), table: None, csv: &CsvOptions::default() }))
     }
 
     /// Applies edits made in the Details panel to every selected row.
@@ -860,6 +1104,9 @@ impl Workspace {
     /// Draws the whole workspace screen.
     pub fn show(&mut self, ctx: &egui::Context, env: &mut WsEnv) -> Vec<WsOutput> {
         let mut out = Vec::new();
+        self.log_original = env.settings.log_original_values;
+        self.refresh_lists();
+        self.autosave_queries(ctx, env.settings.auto_save_queries);
         let pending = self.has_pending();
         self.toolbar(ctx, env, pending, &mut out);
         self.status_bar(ctx, env, &mut out);
@@ -874,11 +1121,8 @@ impl Workspace {
         if self.left_open {
             let active = self.active_table();
             egui::SidePanel::left("ws_sidebar").default_width(260.0).width_range(200.0..=480.0).resizable(true).frame(Frame::new().fill(theme::DEEP_DARK).inner_margin(Margin::same(10))).show(ctx, |ui| {
-                let view = sidebar::SidebarView { objects: &self.objects, schemas: &self.schemas, current_schema: self.current_schema.as_deref(), caps: &self.caps, active: active.as_ref() };
-                sidebar_action = sidebar::show(ui, &mut self.sidebar, &view, &mut |ui, tab| {
-                    ui.add_space(16.0);
-                    widgets::muted(ui, if tab == SidebarTab::Queries { "Saved queries will appear here." } else { "The query history will appear here." });
-                });
+                let view = sidebar::SidebarView { objects: &self.objects, schemas: &self.schemas, current_schema: self.current_schema.as_deref(), caps: &self.caps, active: active.as_ref(), queries: &self.queries_cache, history: &self.history_cache, query_sort: self.queries_sort };
+                sidebar_action = sidebar::show(ui, &mut self.sidebar, &view);
             });
         }
         let mut detail_actions = Vec::new();
@@ -940,7 +1184,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -986,6 +1230,7 @@ impl Workspace {
                 self.load_schema();
             }
             Some(SidebarAction::Refresh) => self.load_schema(),
+            Some(SidebarAction::Extra(a)) => self.handle_extra(ctx, a),
             None => {}
         }
         if self.palette.is_some() {
@@ -1022,6 +1267,48 @@ impl Workspace {
 
     /// Preview, safe-mode and key-column dialogs.
     fn modals(&mut self, ctx: &egui::Context) {
+        if let Some(d) = self.save_dialog.as_mut() {
+            let mut decision = None;
+            widgets::modal(ctx, "Add to Queries", |ui| {
+                widgets::field_label(ui, "Name (use / for folders)");
+                widgets::input(ui, &mut d.name, "monthly report");
+                ui.add_space(4.0);
+                widgets::field_label(ui, "Keywords (comma separated)");
+                widgets::input(ui, &mut d.keywords, "rev, month");
+                ui.add_space(4.0);
+                widgets::field_label(ui, "Query");
+                widgets::text_area(ui, &mut d.sql, 6);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Save").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    let name = d.name.trim().to_owned();
+                    let keywords: Vec<String> = d.keywords.split(',').map(|k| k.trim().to_owned()).filter(|k| !k.is_empty()).collect();
+                    if name.is_empty() {
+                        self.notices.push((true, "Give the query a name".into()));
+                    } else {
+                        match self.queries.save(&name, &keywords, &d.sql) {
+                            Ok(()) => {
+                                self.notices.push((false, "Query saved".into()));
+                                self.queries_dirty = true;
+                                self.save_dialog = None;
+                            }
+                            Err(e) => self.notices.push((true, format!("Cannot save the query: {e}"))),
+                        }
+                    }
+                }
+                Some(false) => self.save_dialog = None,
+                None => {}
+            }
+        }
         if let Some(statements) = self.preview.clone() {
             let mut action = None;
             widgets::modal(ctx, "Pending changes", |ui| {
@@ -1091,7 +1378,7 @@ impl Workspace {
                         if let Some(g) = self.gate.take() {
                             match g.action {
                                 GateAction::Commit => self.send_commit(g.tab, g.statements),
-                                GateAction::Run { labels } => self.send_run(g.tab, g.statements, labels),
+                                GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
                             }
                         }
                     } else if let Some(g) = self.gate.as_mut() {
@@ -1227,6 +1514,10 @@ struct Viewer<'a> {
     keywords: &'a HashSet<String>,
     driver: DriverId,
     font_size: f32,
+    objects: &'a [ObjectInfo],
+    saved: &'a HashMap<String, String>,
+    uppercase_keywords: bool,
+    complete_key: dbzilla_store::settings::CompleteKey,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -1242,7 +1533,34 @@ impl TabViewer for Viewer<'_> {
         let t = match &mut tab.kind {
             TabKind::Table(t) => t,
             TabKind::Sql(sq) => {
-                let env = SqlEnv { keywords: self.keywords, driver: self.driver, font_size: self.font_size, alternating: self.alternating, row_height: self.row_height };
+                let tables: Vec<(&str, bool)> = self
+                    .objects
+                    .iter()
+                    .filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView))
+                    .map(|o| (o.table.name.as_str(), !matches!(o.kind, ObjectKind::Table)))
+                    .collect();
+                let structures = self.structures;
+                let columns = |t: &str| -> Option<Vec<(String, String)>> {
+                    structures.iter().find(|(k, _)| k.name.eq_ignore_ascii_case(t)).map(|(_, st)| st.columns.iter().map(|c| (c.name.clone(), c.type_name.clone())).collect())
+                };
+                let dialect = self.dialect;
+                let quote = |n: &str| quote_if_needed(dialect, n);
+                let env = SqlEnv {
+                    keywords: self.keywords,
+                    driver: self.driver,
+                    font_size: self.font_size,
+                    alternating: self.alternating,
+                    row_height: self.row_height,
+                    tables: &tables,
+                    columns: &columns,
+                    dialect_keywords: dialect.keywords(),
+                    saved: self.saved,
+                    uppercase_keywords: self.uppercase_keywords,
+                    complete_key: self.complete_key,
+                    quote: &quote,
+                    completion: true,
+                    schema_rev: self.structures.len() * 1000 + self.objects.len() + self.saved.len(),
+                };
                 for a in sqltab::show(ui, sq, &env) {
                     self.sql_actions.push((id, a));
                 }
@@ -1303,7 +1621,8 @@ mod tests {
         conn.database = path.to_string_lossy().into_owned();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: conn.database.clone(), ssl: SslMode::Disabled, bootstrap: vec![] }));
-        let mut ws = Workspace::new(conn, session, 1000, 300, None);
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), queries: QueryStore::new(dir.path().join("queries")) };
+        let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && !w.objects.is_empty());
         (dir, path, ws)
     }
@@ -1493,6 +1812,72 @@ mod tests {
         }
         assert_eq!(ws.active_sql_mut().unwrap().1.results[0].rows.len(), 1_000_000);
         assert!(worst < Duration::from_millis(250), "slowest frame took {worst:?} over {frames} frames");
+    }
+
+    /// Editor statements are logged without the injected LIMIT, failures included.
+    #[test]
+    fn history_records_editor_statements() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "SELECT * FROM t;\nSELEC oops");
+        ws.active_sql_mut().unwrap().1.row_limit = Some(10);
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        let entries = ws.history.search(&ws.conn.id, "", 10).unwrap();
+        assert_eq!(entries.len(), 2);
+        let ok = entries.iter().find(|e| e.sql == "SELECT * FROM t").expect("the typed statement, without LIMIT");
+        assert!(ok.ok && ok.kind == HistoryKind::Editor);
+        assert!(entries.iter().any(|e| e.sql == "SELEC oops" && !e.ok));
+        assert!(ws.history_dirty);
+    }
+
+    /// Commits are logged; with the option on, the rows before the change are kept as CSV.
+    #[test]
+    fn commit_history_keeps_original_values() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.log_original = true;
+        open_t(&mut ws);
+        let (_, t) = ws.active_tab_mut().unwrap();
+        t.data.pending.edit_cell(&mut t.data.rows, 0, 1, CellValue::Value(Value::Text("changed".into())));
+        ws.commit_active();
+        wait(&mut ws, |w| !w.has_pending() && w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && !t.data.committing));
+        let entries = ws.history.search(&ws.conn.id, "UPDATE", 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HistoryKind::Commit);
+        let csv = entries[0].original_csv.as_deref().expect("original rows");
+        assert!(csv.starts_with("id,name") && csv.contains("alpha"), "{csv}");
+    }
+
+    /// Saved queries open once, edits are written back, keywords survive, history clears.
+    #[test]
+    fn saved_queries_autosave_and_history_clear() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.queries.save("reports/q.sql", &["kw".to_owned()], "SELECT 1").unwrap();
+        ws.open_query("reports/q.sql");
+        ws.open_query("reports/q.sql");
+        assert_eq!(ws.dock.iter_all_tabs().count(), 1, "a saved query is opened only once");
+        {
+            let t = ws.active_sql_mut().unwrap().1;
+            assert_eq!(t.text, "SELECT 1");
+            t.text = "SELECT 2".into();
+            t.last_edit = Some(Instant::now() - Duration::from_secs(5));
+        }
+        ws.autosave_queries(&egui::Context::default(), true);
+        let q = ws.queries.read("reports/q.sql").unwrap();
+        assert_eq!((q.sql.as_str(), q.keywords), ("SELECT 2", vec!["kw".to_owned()]));
+        assert!(ws.queries_dirty);
+        ws.refresh_lists();
+        assert_eq!(ws.saved_keywords.get("kw").map(String::as_str), Some("SELECT 2"));
+        open_sql_focused(&mut ws, "SELECT 9");
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        ws.refresh_lists();
+        assert_eq!(ws.history_cache.len(), 1);
+        ws.handle_extra(&egui::Context::default(), ExtraAction::HistoryClear);
+        ws.refresh_lists();
+        assert!(ws.history_cache.is_empty());
     }
 }
 
