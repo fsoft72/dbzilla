@@ -249,3 +249,48 @@ async fn failed_rename_restores_the_files() {
     assert!(dir.path().join("a.sqlite3").exists() && dir.path().join("a.sqlite3-wal").exists(), "the original files are back");
     assert!(!dir.path().join("c.sqlite3").exists());
 }
+
+/// Altering a column of a real table with constraints, a partial index and a trigger keeps all of them.
+#[tokio::test]
+async fn column_rebuild_keeps_constraints_indexes_and_triggers() {
+    use dbzilla_core::ddl::{generate_ddl, ColumnDef, StructuralOp};
+    use dbzilla_core::dialect::{dialect_for, DriverId};
+    use dbzilla_core::model::TableRef;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.sqlite3");
+    rusqlite::Connection::open(&path).unwrap().execute_batch(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE COLLATE NOCASE, qty INTEGER NOT NULL DEFAULT 1 CHECK (qty > 0), note TEXT);
+         CREATE INDEX ix_note ON a (note) WHERE note IS NOT NULL;
+         CREATE INDEX ix_lower ON a (lower(note));
+         CREATE TABLE log (msg TEXT);
+         CREATE TRIGGER trg AFTER INSERT ON a BEGIN INSERT INTO log VALUES ('inserted'); END;
+         INSERT INTO a (email, qty, note) VALUES ('x@y.z', 2, 'n');
+         CREATE TABLE child (aid INTEGER REFERENCES a(id) ON DELETE CASCADE);",
+    ).unwrap();
+    let cfg = dbzilla_drivers::ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: path.to_string_lossy().into_owned(), ssl: dbzilla_drivers::SslMode::Disabled, bootstrap: vec![] };
+    let mut c = dbzilla_drivers::driver_for(DriverId::Sqlite).unwrap().connect(&cfg).await.unwrap();
+    let alter = |st: dbzilla_core::model::TableStructure| StructuralOp::AlterColumn {
+        table: TableRef::simple("a"),
+        old: ColumnDef { name: "note".into(), type_name: "TEXT".into(), nullable: true, default: None, extra: None },
+        new: ColumnDef { name: "note".into(), type_name: "VARCHAR(40)".into(), nullable: true, default: None, extra: None },
+        current: Some(Box::new(st)),
+    };
+    let st = c.table_structure(&TableRef::simple("a")).await.unwrap();
+    assert_eq!(st.referenced_by, vec!["child".to_owned()]);
+    assert!(generate_ddl(&alter(st), dialect_for(DriverId::Sqlite).as_ref()).is_err(), "a referenced table is refused");
+    rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TABLE child;").unwrap();
+    let st = c.table_structure(&TableRef::simple("a")).await.unwrap();
+    assert!(st.referenced_by.is_empty() && st.index_sql.len() == 2);
+    let stmts = generate_ddl(&alter(st), dialect_for(DriverId::Sqlite).as_ref()).unwrap();
+    c.execute_batch(&stmts, true).await.unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM a", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "the data is kept");
+    assert!(db.execute("INSERT INTO a (email, qty) VALUES ('X@Y.Z', 1)", []).is_err(), "UNIQUE with NOCASE still holds");
+    assert!(db.execute("INSERT INTO a (email, qty) VALUES ('q@y.z', 0)", []).is_err(), "CHECK still holds");
+    db.execute("INSERT INTO a (email, qty) VALUES ('ok@y.z', 3)", []).unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM log", [], |r| r.get::<_, i64>(0)).unwrap(), 2, "the trigger fires again (1 original + 1 new)");
+    let objects: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE tbl_name = 'a' ORDER BY name").unwrap().query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
+    assert!(objects.contains(&"ix_note".to_owned()) && objects.contains(&"ix_lower".to_owned()) && objects.contains(&"trg".to_owned()), "{objects:?}");
+    let ddl: String = db.query_row("SELECT sql FROM sqlite_master WHERE name = 'a'", [], |r| r.get(0)).unwrap();
+    assert!(ddl.contains("VARCHAR(40)") && ddl.contains("AUTOINCREMENT"), "{ddl}");
+}

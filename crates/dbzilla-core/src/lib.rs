@@ -10,6 +10,7 @@ pub mod changes;
 pub mod filter;
 pub mod copyfmt;
 pub mod ddl;
+pub mod sqlite_rewrite;
 pub mod url;
 pub mod paging;
 pub mod rowlimit;

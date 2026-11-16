@@ -141,24 +141,28 @@ fn alter_column_sqlite_without_structure_is_an_error() {
     assert!(matches!(ddl(DriverId::Sqlite, op), Err(DdlError::Unsupported(_))));
 }
 
-/// Review I6: the SQLite rebuild refuses tables whose constraints it cannot reproduce.
+/// The SQLite rebuild keeps what the original text says and refuses only what it cannot keep safe.
 #[test]
-fn sqlite_rebuild_refuses_what_it_would_lose() {
-    let alter = |st: TableStructure| StructuralOp::AlterColumn { table: t("a"), old: col("c", "INTEGER", true, None), new: col("c", "TEXT", true, None), current: Some(Box::new(st)) };
-    for ddl_text in ["CREATE TABLE a (id INTEGER PRIMARY KEY, c INTEGER, e TEXT UNIQUE)", "CREATE TABLE a (id INTEGER, c INTEGER CHECK (c > 0))", "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, c INTEGER)", "CREATE TABLE a (id INTEGER, c TEXT COLLATE NOCASE)", "CREATE TABLE a (id INTEGER, c INTEGER, g INTEGER GENERATED ALWAYS AS (c + 1))"] {
+fn sqlite_rebuild_keeps_constraints_and_refuses_the_unsafe() {
+    let alter = |st: TableStructure, new_name: &str| StructuralOp::AlterColumn { table: t("a"), old: col("c", "INTEGER", true, None), new: col(new_name, "TEXT", true, None), current: Some(Box::new(st)) };
+    let with_ddl = |ddl_text: &str| {
         let mut st = current_structure();
         st.ddl = ddl_text.into();
-        assert!(matches!(ddl(DriverId::Sqlite, alter(st)), Err(DdlError::Unsupported(m)) if m.contains("would lose")), "{ddl_text}");
-    }
-    let mut partial = current_structure();
-    partial.indexes[0].condition = Some("c > 0".into());
-    assert!(ddl(DriverId::Sqlite, alter(partial)).is_err());
-    let mut expr = current_structure();
-    expr.indexes[0].columns = vec!["<expression>".into()];
-    assert!(ddl(DriverId::Sqlite, alter(expr)).is_err());
-    let mut plain = current_structure();
-    plain.ddl = "CREATE TABLE a (id INTEGER NOT NULL, c INTEGER, PRIMARY KEY (id))".into();
-    assert!(ddl(DriverId::Sqlite, alter(plain)).is_ok());
+        st
+    };
+    let ok = ddl(DriverId::Sqlite, alter(with_ddl("CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, c INTEGER CHECK (c > 0), e TEXT UNIQUE COLLATE NOCASE)"), "c")).unwrap();
+    assert!(ok[0].contains("\"c\" TEXT CHECK (c > 0)") && ok[0].contains("UNIQUE COLLATE NOCASE") && ok[0].contains("AUTOINCREMENT"), "{}", ok[0]);
+    let refused = |st: TableStructure, name: &str| matches!(ddl(DriverId::Sqlite, alter(st, name)), Err(DdlError::Unsupported(m)) if m.contains("cannot be rebuilt safely"));
+    assert!(refused(with_ddl("CREATE TABLE a (id INTEGER, c INTEGER, g INTEGER GENERATED ALWAYS AS (id + 1))"), "c"));
+    let mut referenced = with_ddl("CREATE TABLE a (id INTEGER, c INTEGER)");
+    referenced.referenced_by = vec!["child".into()];
+    assert!(refused(referenced, "c"));
+    assert!(refused(with_ddl("CREATE TABLE a (id INTEGER, c INTEGER, UNIQUE (c))"), "d"), "a rename that other definitions use");
+    let mut trigger = with_ddl("CREATE TABLE a (id INTEGER, c INTEGER)");
+    trigger.index_sql = vec!["CREATE INDEX ix_c ON a (c) WHERE c > 0".into()];
+    assert!(refused(trigger.clone(), "d"));
+    let kept = ddl(DriverId::Sqlite, alter(trigger, "c")).unwrap();
+    assert_eq!(kept.last().unwrap(), "CREATE INDEX ix_c ON a (c) WHERE c > 0", "the partial index is recreated as written");
 }
 
 #[test]

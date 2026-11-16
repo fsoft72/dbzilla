@@ -239,6 +239,7 @@ fn read_structure(conn: &Connection, t: &TableRef) -> DriverResult<TableStructur
     st.primary_key = pk.into_iter().map(|(_, n)| n).collect();
     read_foreign_keys(conn, &name, &mut st)?;
     read_indexes(conn, &name, &mut st)?;
+    read_rebuild_info(conn, &t.name, &mut st)?;
     st.ddl = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = ?1 AND type IN ('table','view')", [&t.name], |r| r.get::<_, Option<String>>(0))
         .map_err(map_err)?
@@ -254,6 +255,22 @@ fn read_structure(conn: &Connection, t: &TableRef) -> DriverResult<TableStructur
         st.triggers.push(TriggerInfo { name: tname, timing: timing.to_owned(), event: event.to_owned(), statement: sql });
     }
     Ok(st)
+}
+
+/// Original index statements and the tables that reference this one, both needed to rebuild the table safely.
+fn read_rebuild_info(conn: &Connection, table: &str, st: &mut TableStructure) -> DriverResult<()> {
+    let mut stmt = conn.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL ORDER BY name").map_err(map_err)?;
+    st.index_sql = stmt.query_map([table], |r| r.get::<_, String>(0)).map_err(map_err)?.collect::<Result<_, _>>().map_err(map_err)?;
+    let mut tables = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name <> ?1 AND name NOT LIKE 'sqlite_%'").map_err(map_err)?;
+    let names: Vec<String> = tables.query_map([table], |r| r.get::<_, String>(0)).map_err(map_err)?.collect::<Result<_, _>>().map_err(map_err)?;
+    for other in names {
+        let mut fks = conn.prepare(&format!("PRAGMA foreign_key_list({})", quote(&other))).map_err(map_err)?;
+        let refers = fks.query_map([], |r| r.get::<_, String>(2)).map_err(map_err)?.filter_map(Result::ok).any(|t| t.eq_ignore_ascii_case(table));
+        if refers {
+            st.referenced_by.push(other);
+        }
+    }
+    Ok(())
 }
 
 /// Fills the `fk` field of columns from `PRAGMA foreign_key_list`.

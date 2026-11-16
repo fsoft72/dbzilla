@@ -91,6 +91,12 @@ pub struct TableStructure {
     pub indexes: Vec<IndexInfo>,
     pub triggers: Vec<TriggerInfo>,
     pub ddl: String,
+    /// SQLite: the original `CREATE INDEX` statements, kept verbatim for a table rebuild.
+    #[serde(default)]
+    pub index_sql: Vec<String>,
+    /// SQLite: other tables with a foreign key to this one.
+    #[serde(default)]
+    pub referenced_by: Vec<String>,
 }
 
 /// Kinds of objects listed in the sidebar.

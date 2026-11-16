@@ -271,33 +271,48 @@ fn alter_column(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &Column
         }
         DriverId::Sqlite => {
             let st = current.ok_or_else(|| DdlError::Unsupported("altering a SQLite column needs the current table structure".into()))?;
-            if let Some(what) = sqlite_rebuild_loss(st) {
-                return Err(DdlError::Unsupported(format!("rebuilding this SQLite table would lose {what}")));
-            }
-            Ok(sqlite_rebuild(d, table, old, new, st))
+            sqlite_rebuild(d, table, old, new, st)
         }
     }
 }
 
-/// What a rebuild could not reproduce for this table, if anything.
-fn sqlite_rebuild_loss(st: &TableStructure) -> Option<&'static str> {
-    let upper = st.ddl.to_ascii_uppercase();
-    for (word, what) in [("UNIQUE", "UNIQUE constraints"), ("CHECK", "CHECK constraints"), ("COLLATE", "collations"), ("AUTOINCREMENT", "AUTOINCREMENT"), ("GENERATED", "generated columns"), ("WITHOUT ROWID", "WITHOUT ROWID")] {
-        if upper.contains(word) {
-            return Some(what);
+/// SQLite table rebuild: create new, copy, drop old, rename, recreate indexes and triggers.
+/// The new table is the original `CREATE TABLE` text with only the changed column rewritten, so
+/// UNIQUE, CHECK, COLLATE, AUTOINCREMENT and table constraints are kept. When the original text is
+/// not known (empty `ddl`) the table is rebuilt from the model, which only knows plain columns.
+fn sqlite_rebuild(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &ColumnDef, st: &TableStructure) -> Result<Vec<String>, DdlError> {
+    let refuse = |why: String| DdlError::Unsupported(format!("this SQLite table cannot be rebuilt safely: {why}"));
+    if !st.referenced_by.is_empty() {
+        return Err(refuse(format!("{} refer to it by foreign key and dropping it could delete their rows", st.referenced_by.join(", "))));
+    }
+    if st.ddl.trim().is_empty() {
+        return Ok(sqlite_rebuild_from_model(d, table, old, new, st));
+    }
+    let mut tmp = table.clone();
+    tmp.name = format!("{}{REBUILD_SUFFIX}", table.name);
+    let ch = crate::sqlite_rewrite::ColumnChange { old_name: &old.name, new_name: &new.name, new_type: &new.type_name, nullable: new.nullable, default: new.default.as_deref() };
+    let create = crate::sqlite_rewrite::rewrite_create(&st.ddl, &d.quote_table(&tmp), &ch, &|n| d.quote_ident(n)).map_err(refuse)?;
+    let renamed = old.name != new.name;
+    for sql in st.index_sql.iter().chain(st.triggers.iter().map(|t| &t.statement)) {
+        if renamed && crate::sqlite_rewrite::mentions_ident(sql, &old.name) {
+            return Err(refuse("an index or trigger refers to the renamed column".into()));
         }
     }
-    if !st.triggers.is_empty() {
-        return Some("its triggers");
-    }
-    if st.indexes.iter().any(|i| i.condition.is_some() || i.columns.iter().any(|c| c.starts_with('<'))) {
-        return Some("partial or expression indexes");
-    }
-    None
+    let new_names: Vec<String> = st.columns.iter().map(|c| if c.name == old.name { new.name.clone() } else { c.name.clone() }).collect();
+    let old_names: Vec<String> = st.columns.iter().map(|c| c.name.clone()).collect();
+    let mut v = vec![
+        create,
+        format!("INSERT INTO {} ({}) SELECT {} FROM {}", d.quote_table(&tmp), ident_list(d, &new_names), ident_list(d, &old_names), d.quote_table(table)),
+        format!("DROP TABLE {}", d.quote_table(table)),
+        format!("ALTER TABLE {} RENAME TO {}", d.quote_table(&tmp), d.quote_ident(&table.name)),
+    ];
+    v.extend(st.index_sql.iter().cloned());
+    v.extend(st.triggers.iter().map(|t| t.statement.clone()));
+    Ok(v)
 }
 
-/// SQLite table rebuild: create new, copy, drop old, rename, recreate indexes.
-fn sqlite_rebuild(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &ColumnDef, st: &TableStructure) -> Vec<String> {
+/// Rebuild from the column model alone (no original table text available).
+fn sqlite_rebuild_from_model(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &ColumnDef, st: &TableStructure) -> Vec<String> {
     let mut tmp = table.clone();
     tmp.name = format!("{}{REBUILD_SUFFIX}", table.name);
     let rename = |n: &str| if n == old.name { new.name.clone() } else { n.to_owned() };
