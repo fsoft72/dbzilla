@@ -7,3 +7,4 @@
 - Task 2: core model, Value, Dialect quoting/literals (proptest round trip), Capabilities.
 - Task 3: statement splitter (strings, comments, $$ bodies, MySQL DELIMITER, labels) and safe-mode classifier + level matrix.
 - Task 4: filters to WHERE (all operators, ILIKE, Any, Raw) and pending ChangeSet to SQL with undo/redo.
+- Task 5: connection URLs, DDL generation (SQLite rebuild for alter column), copy formats and Copy Script As.
