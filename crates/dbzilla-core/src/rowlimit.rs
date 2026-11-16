@@ -4,7 +4,7 @@
 pub const ROW_LIMITS: [Option<u64>; 9] = [None, Some(100), Some(500), Some(1000), Some(5000), Some(10_000), Some(50_000), Some(100_000), Some(500_000)];
 
 /// Words at the top level of a statement that mean it already limits (or cannot take a limit).
-const BLOCKERS: [&str; 4] = ["LIMIT", "FETCH", "TOP", "INTO"];
+const BLOCKERS: [&str; 9] = ["LIMIT", "FETCH", "TOP", "INTO", "DELETE", "UPDATE", "INSERT", "MERGE", "REPLACE"];
 
 /// Skips a quoted region starting at `i` (quote character `q`); returns the offset after it.
 fn skip_quoted(b: &[u8], i: usize, q: u8) -> usize {

@@ -137,6 +137,21 @@ fn literal_common(
     }
 }
 
+/// PostgreSQL array text such as `{1,"a b",NULL}`.
+fn pg_array_text(items: &[Value]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|v| match v {
+            Value::Null => "NULL".to_owned(),
+            Value::Array(inner) => pg_array_text(inner),
+            Value::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
+            Value::I64(_) | Value::U64(_) | Value::F64(_) | Value::Decimal(_) => v.to_display(),
+            other => format!("\"{}\"", other.to_display().replace('\\', "\\\\").replace('"', "\\\"")),
+        })
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
 /// Converts an array element to JSON for dialects without native array literals.
 fn array_item_json(v: &Value) -> serde_json::Value {
     match v {
@@ -191,6 +206,9 @@ impl Dialect for PostgresDialect {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
     fn literal(&self, v: &Value) -> String {
+        if let Value::Array(items) = v {
+            return quote_text(&pg_array_text(items), false);
+        }
         literal_common(v, false, |b| if b { "TRUE" } else { "FALSE" }, |b| format!("'\\x{}'", hex(b)))
     }
     fn cast_text(&self, expr: &str) -> String {

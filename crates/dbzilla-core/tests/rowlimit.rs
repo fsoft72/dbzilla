@@ -45,3 +45,12 @@ fn menu_values() {
     assert_eq!(ROW_LIMITS[1], Some(100));
     assert_eq!(*ROW_LIMITS.last().unwrap(), Some(500_000));
 }
+
+/// Review M13: data-changing statements and FOR UPDATE never get a LIMIT appended.
+#[test]
+fn data_changing_statements_are_left_alone() {
+    for sql in ["WITH x AS (SELECT 1 AS id) DELETE FROM t USING x WHERE t.id = x.id RETURNING *", "WITH x AS (SELECT 1 AS id) UPDATE t SET a = 1 FROM x WHERE t.id = x.id RETURNING t.a", "SELECT * FROM t FOR UPDATE", "INSERT INTO t SELECT 1"] {
+        assert_eq!(apply_row_limit(sql, Some(10)), sql, "{sql}");
+    }
+    assert_eq!(apply_row_limit("SELECT 'update' AS w FROM t", Some(10)), "SELECT 'update' AS w FROM t\nLIMIT 10");
+}

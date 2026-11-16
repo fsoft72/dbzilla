@@ -110,3 +110,13 @@ proptest! {
         }
     }
 }
+
+/// Review M7: PostgreSQL arrays are written as array text, not as JSON.
+#[test]
+fn postgres_array_literals() {
+    use dbzilla_core::dialect::{dialect_for, DriverId};
+    use dbzilla_core::value::Value;
+    let d = dialect_for(DriverId::Postgres);
+    let v = Value::Array(vec![Value::I64(1), Value::Null, Value::Text("a \"b\" c".into()), Value::Array(vec![Value::Bool(true)])]);
+    assert_eq!(d.literal(&v), "'{1,NULL,\"a \\\"b\\\" c\",{t}}'");
+}
