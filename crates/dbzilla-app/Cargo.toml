@@ -1,0 +1,11 @@
+[package]
+name = "dbzilla-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dbzilla"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }

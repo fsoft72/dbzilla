@@ -1,0 +1,6 @@
+[package]
+name = "dbzilla-session"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
