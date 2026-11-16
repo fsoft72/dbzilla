@@ -3,7 +3,7 @@
 use crate::ui::connform::config_for;
 use async_trait::async_trait;
 use dbzilla_drivers::{driver_for, Conn};
-use dbzilla_mcp::exec::{run_query, run_write};
+use dbzilla_mcp::exec::{run_read_only, run_write};
 use dbzilla_mcp::server::{Activity, ApprovalRequest, Backend, ConnInfo};
 use dbzilla_store::connections::StoredConnection;
 use serde_json::Value;
@@ -76,10 +76,15 @@ impl Backend for AppBackend {
         self.conns.lock().await.remove(id).map(|_| ()).ok_or_else(|| format!("the connection '{id}' is not open"))
     }
 
+    async fn safe_level(&self, id: &str) -> dbzilla_core::safemode::SafeLevel {
+        self.find(id).map(|c| c.safe_level).unwrap_or_default()
+    }
+
     async fn run(&self, id: &str, sql: &str, write: bool) -> Result<Value, String> {
+        let driver = self.find(id)?.driver;
         let mut g = self.conns.lock().await;
         let conn = g.get_mut(id).ok_or_else(|| format!("the connection '{id}' is not open"))?;
-        if write { run_write(conn.as_mut(), sql).await } else { run_query(conn.as_mut(), sql).await }
+        if write { run_write(conn.as_mut(), sql).await } else { run_read_only(conn.as_mut(), driver, sql).await }
     }
 
     async fn approve(&self, req: ApprovalRequest) -> bool {
@@ -93,8 +98,13 @@ impl Backend for AppBackend {
     }
 
     fn log(&self, entry: Activity) {
+        let entry = Activity { detail: dbzilla_session::console::redact_sql(&entry.detail), ..entry };
         let line = serde_json::json!({"token":entry.token,"tool":entry.tool,"detail":entry.detail,"outcome":entry.outcome});
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.activity_file) {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        if let Ok(mut f) = opts.open(&self.activity_file) {
             use std::io::Write;
             let _ = writeln!(f, "{line}");
         }
@@ -152,6 +162,9 @@ impl McpHost {
         if let Some((h, _)) = self.task.take() {
             h.abort();
         }
+        if let Some(old) = self.state.take() {
+            old.active.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         let Some(run) = want else { return };
         self.error = None;
         let tokens = match dbzilla_mcp::tokens::TokenStore::load(&self.tokens_file) {
@@ -159,7 +172,7 @@ impl McpHost {
             Err(e) => return self.error = Some(e),
         };
         let backend = Arc::new(AppBackend::new(self.shared.clone(), self.resolver.clone(), self.approvals_tx.clone(), self.activity_file.clone(), repaint));
-        let state = Arc::new(dbzilla_mcp::server::McpState { backend, tokens: Mutex::new(tokens), approval_needed: run.approval_needed });
+        let state = Arc::new(dbzilla_mcp::server::McpState { backend, tokens: Mutex::new(tokens), approval_needed: run.approval_needed, active: std::sync::atomic::AtomicBool::new(true) });
         match rt.block_on(dbzilla_mcp::server::serve(state.clone(), run.port)) {
             Ok(h) => {
                 self.state = Some(state);

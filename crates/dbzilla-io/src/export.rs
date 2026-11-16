@@ -329,10 +329,42 @@ impl RowWriter for XlsxRows {
     }
 }
 
+/// Output file, optionally gzip compressed; `finish` reports write errors that `Drop` would hide.
+pub enum Out {
+    Plain(BufWriter<File>),
+    Gz(Box<GzEncoder<BufWriter<File>>>),
+}
+
+impl Write for Out {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Out::Plain(w) => w.write(buf),
+            Out::Gz(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Out::Plain(w) => w.flush(),
+            Out::Gz(w) => w.flush(),
+        }
+    }
+}
+
+impl Out {
+    /// Writes the trailer (gzip) and flushes to disk buffers.
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            Out::Plain(mut w) => w.flush(),
+            Out::Gz(w) => (*w).finish()?.flush(),
+        }
+    }
+}
+
 /// Opens an output file, gzip-wrapped when asked.
-fn create_out(path: &Path, gzip: bool) -> Result<Box<dyn Write + Send>, IoError> {
+fn create_out(path: &Path, gzip: bool) -> Result<Out, IoError> {
     let f = BufWriter::new(File::create(path)?);
-    Ok(if gzip { Box::new(GzEncoder::new(f, Compression::default())) } else { Box::new(f) })
+    Ok(if gzip { Out::Gz(Box::new(GzEncoder::new(f, Compression::default()))) } else { Out::Plain(f) })
 }
 
 /// Runs the query of one source into `writer`, honouring cancel and reporting progress.
@@ -391,10 +423,10 @@ pub async fn run_export(conn: &mut dyn Conn, driver: DriverId, sources: &[Export
                     .quote_style(if o.quote_always { csv::QuoteStyle::Always } else { csv::QuoteStyle::Necessary })
                     .terminator(terminator)
                     .has_headers(false)
-                    .from_writer(create_out(&path, false)?);
+                    .from_writer(Box::new(create_out(&path, false)?) as Box<dyn Write + Send>);
                 Box::new(CsvRows { w, o })
             }
-            ExportFormat::Json => Box::new(JsonRows { out: create_out(&path, false)?, names: Vec::new(), first: true }),
+            ExportFormat::Json => Box::new(JsonRows { out: Box::new(create_out(&path, false)?), names: Vec::new(), first: true }),
             ExportFormat::Xlsx => {
                 let mut book = Workbook::new();
                 book.add_worksheet();
@@ -440,7 +472,7 @@ async fn export_sql(conn: &mut dyn Conn, driver: DriverId, sources: &[ExportSour
                 let ddl = st.ddl.trim().trim_end_matches(';').to_owned();
                 writeln!(out, "{ddl};")?;
             }
-            let mut rows = SqlRows { out: &mut *out, d: dialect_for(driver), table: table.clone(), cols: Vec::new(), pending: Vec::new(), data: opts.sql.data };
+            let mut rows = SqlRows { out: &mut out, d: dialect_for(driver), table: table.clone(), cols: Vec::new(), pending: Vec::new(), data: opts.sql.data };
             let sql = select_sql(d.as_ref(), src);
             let mut writer: Box<dyn RowWriter + Send + '_> = Box::new(SqlRowsRef(&mut rows));
             stream_into(conn, &sql, writer.as_mut(), &table.name, i, sources.len(), progress, cancel).await?;
@@ -451,8 +483,7 @@ async fn export_sql(conn: &mut dyn Conn, driver: DriverId, sources: &[ExportSour
     .await;
     match result {
         Ok(()) => {
-            out.flush()?;
-            drop(out);
+            out.finish()?;
             Ok(vec![path])
         }
         Err(e) => {

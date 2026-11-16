@@ -96,19 +96,47 @@ pub fn classify(sql: &str, dialect: DriverId) -> StatementKind {
         return StatementKind::ReadOnly;
     }
     if stmts.len() > 1 {
-        return StatementKind::Write;
+        let strictest = stmts.iter().map(|s| classify_one(&s.text, dialect)).max_by_key(|k| severity(*k)).unwrap_or(StatementKind::Write);
+        return if strictest == StatementKind::ReadOnly { StatementKind::Write } else { strictest };
     }
-    let text = stmts[0].text.as_str();
+    classify_one(stmts[0].text.as_str(), dialect)
+}
+
+/// Introspection pragmas that take an argument but never change anything.
+const READ_PRAGMAS: [&str; 10] = ["table_info", "table_xinfo", "table_list", "index_list", "index_info", "index_xinfo", "foreign_key_list", "database_list", "collation_list", "function_list"];
+
+/// True for `PRAGMA name` without arguments and for the introspection pragmas.
+fn pragma_is_read_only(text: &str) -> bool {
+    if text.contains('=') {
+        return false;
+    }
+    let rest = text.trim_start()[6..].trim_start();
+    let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.').collect();
+    let name = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    !rest.contains('(') || READ_PRAGMAS.contains(&name.as_str())
+}
+
+/// Order of kinds, most dangerous last.
+fn severity(k: StatementKind) -> u8 {
+    match k {
+        StatementKind::ReadOnly => 0,
+        StatementKind::Write => 1,
+        StatementKind::Ddl => 2,
+    }
+}
+
+/// Classifies one statement.
+fn classify_one(text: &str, dialect: DriverId) -> StatementKind {
     match first_keyword(text).as_str() {
         "SHOW" | "DESCRIBE" | "DESC" => StatementKind::ReadOnly,
         "PRAGMA" => {
-            if text.contains('=') { StatementKind::Write } else { StatementKind::ReadOnly }
+            if pragma_is_read_only(text) { StatementKind::ReadOnly } else { StatementKind::Write }
         }
         "EXPLAIN" => {
             let upper = text.to_ascii_uppercase();
             if upper.contains("ANALYZE") || upper.contains("ANALYSE") { StatementKind::Write } else { StatementKind::ReadOnly }
         }
-        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => StatementKind::Ddl,
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" | "DO" | "CALL" | "COPY" | "ATTACH" | "DETACH" => StatementKind::Ddl,
         "SELECT" | "WITH" | "VALUES" | "TABLE" => classify_query(text, dialect),
         _ => StatementKind::Write,
     }

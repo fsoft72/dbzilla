@@ -72,3 +72,18 @@ fn level_matrix() {
     assert!(SafeLevel::Safe2.requires_password(Ddl));
     assert!(SafeLevel::Safe2.requires_confirm(Ddl));
 }
+
+/// Review C1/C2: PRAGMA with arguments, multi-statement scripts and server side code are never read-only or plain writes.
+#[test]
+fn hardened_classification() {
+    use dbzilla_core::dialect::DriverId::{Postgres, Sqlite};
+    assert_eq!(classify("PRAGMA user_version(7)", Sqlite), StatementKind::Write);
+    assert_eq!(classify("PRAGMA writable_schema(1)", Sqlite), StatementKind::Write);
+    assert_eq!(classify("PRAGMA table_info(t)", Sqlite), StatementKind::ReadOnly);
+    assert_eq!(classify("PRAGMA user_version", Sqlite), StatementKind::ReadOnly);
+    assert_eq!(classify("UPDATE t SET a=1; DROP TABLE users", Postgres), StatementKind::Ddl);
+    assert_eq!(classify("SELECT 1; SELECT 2", Postgres), StatementKind::Write);
+    for sql in ["DO $$ BEGIN EXECUTE 'DROP TABLE t'; END $$", "CALL p()", "COPY t TO PROGRAM 'id'", "ATTACH DATABASE '/tmp/x.db' AS x"] {
+        assert_eq!(classify(sql, Postgres), StatementKind::Ddl, "{sql}");
+    }
+}

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use dbzilla_core::dialect::DriverId;
 use dbzilla_drivers::{driver_for, ConnectConfig, Conn, SslMode};
-use dbzilla_mcp::exec::{run_query, run_write};
+use dbzilla_mcp::exec::{run_read_only, run_write};
 use dbzilla_mcp::perm::Permission;
 use dbzilla_mcp::server::*;
 use dbzilla_mcp::tokens::TokenStore;
@@ -15,6 +15,7 @@ struct App {
     path: String,
     conns: tokio::sync::Mutex<HashMap<String, Box<dyn Conn>>>,
     approve: bool,
+    level: dbzilla_core::safemode::SafeLevel,
     approvals: Mutex<Vec<String>>,
     log: Mutex<Vec<Activity>>,
 }
@@ -39,11 +40,14 @@ impl Backend for App {
     async fn run(&self, id: &str, sql: &str, write: bool) -> Result<Value, String> {
         let mut g = self.conns.lock().await;
         let c = g.get_mut(id).ok_or("not open")?;
-        if write { run_write(c.as_mut(), sql).await } else { run_query(c.as_mut(), sql).await }
+        if write { run_write(c.as_mut(), sql).await } else { run_read_only(c.as_mut(), DriverId::Sqlite, sql).await }
     }
     async fn approve(&self, req: ApprovalRequest) -> bool {
         self.approvals.lock().unwrap().push(req.sql);
         self.approve
+    }
+    async fn safe_level(&self, _id: &str) -> dbzilla_core::safemode::SafeLevel {
+        self.level
     }
     fn log(&self, entry: Activity) {
         self.log.lock().unwrap().push(entry);
@@ -53,22 +57,28 @@ impl Backend for App {
 struct Fixture {
     port: u16,
     app: Arc<App>,
+    state: Arc<McpState>,
     secrets: HashMap<&'static str, String>,
     _dir: tempfile::TempDir,
 }
 
 async fn start(approval_needed: bool, approve: bool) -> Fixture {
+    start_at(approval_needed, approve, dbzilla_core::safemode::SafeLevel::Silent).await
+}
+
+async fn start_at(approval_needed: bool, approve: bool, level: dbzilla_core::safemode::SafeLevel) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.sqlite3");
     rusqlite::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1,'a'),(2,'b');").unwrap();
     let mut tokens = TokenStore::load(&dir.path().join("tokens.json")).unwrap();
     let secrets = HashMap::from([("ro", tokens.create("ro", Permission::ReadOnly).unwrap()), ("rw", tokens.create("rw", Permission::ReadWrite).unwrap()), ("full", tokens.create("full", Permission::Full).unwrap())]);
-    let app = Arc::new(App { path: db.to_string_lossy().into_owned(), conns: Default::default(), approve, approvals: Default::default(), log: Default::default() });
-    let state = Arc::new(McpState { backend: app.clone(), tokens: Mutex::new(tokens), approval_needed });
+    let app = Arc::new(App { path: db.to_string_lossy().into_owned(), conns: Default::default(), approve, level, approvals: Default::default(), log: Default::default() });
+    let state = Arc::new(McpState { backend: app.clone(), tokens: Mutex::new(tokens), approval_needed, active: std::sync::atomic::AtomicBool::new(true) });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
-    Fixture { port, app, secrets, _dir: dir }
+    let served = state.clone();
+    tokio::spawn(async move { axum::serve(listener, router(served)).await.unwrap() });
+    Fixture { port, app, state, secrets, _dir: dir }
 }
 
 async fn rpc(f: &Fixture, token: Option<&str>, body: Value) -> (u16, Value) {
@@ -196,4 +206,40 @@ async fn stdio_bridge_forwards_requests() {
     .unwrap();
     assert_eq!(out.lines().count(), 1, "only the request with an id gets a reply: {out}");
     assert!(out.contains(r#""result":{}"#));
+}
+
+#[tokio::test]
+async fn review_fixes_pragma_multi_statement_and_query_only_reset() {
+    let f = start(false, true).await;
+    call(&f, "full", "open_connection", json!({"connection_id":"db1"})).await;
+    let (err, _) = call(&f, "ro", "execute_read_query", json!({"connection_id":"db1","sql":"PRAGMA user_version(7)"})).await;
+    assert!(err, "a PRAGMA with an argument is not read-only");
+    let (err, _) = call(&f, "rw", "execute_query", json!({"connection_id":"db1","sql":"UPDATE t SET name='x'; DROP TABLE t"})).await;
+    assert!(err, "a script containing DDL needs full access");
+    let (_, v) = call(&f, "ro", "execute_read_query", json!({"connection_id":"db1","sql":"SELECT count(*) FROM t"})).await;
+    assert_eq!(v["rows"], json!([[2]]));
+    let (err, v) = call(&f, "rw", "execute_query", json!({"connection_id":"db1","sql":"INSERT INTO t VALUES (9,'z')"})).await;
+    assert!(!err, "query_only was switched off again after the read: {v}");
+}
+
+#[tokio::test]
+async fn stopped_server_refuses_open_connections() {
+    let f = start(false, true).await;
+    assert_eq!(rpc(&f, Some(&f.secrets["ro"]), json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.0, 200);
+    f.state.active.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(rpc(&f, Some(&f.secrets["ro"]), json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.0, 503);
+}
+
+#[tokio::test]
+async fn safe_mode_of_the_connection_applies_to_mcp() {
+    use dbzilla_core::safemode::SafeLevel;
+    let f = start_at(false, true, SafeLevel::Alert1).await;
+    call(&f, "full", "open_connection", json!({"connection_id":"db1"})).await;
+    let (err, _) = call(&f, "full", "execute_query", json!({"connection_id":"db1","sql":"DELETE FROM t"})).await;
+    assert!(!err);
+    assert_eq!(f.app.approvals.lock().unwrap().len(), 1, "Alert levels force the approval even when it is switched off");
+    let g = start_at(false, true, SafeLevel::Safe2).await;
+    call(&g, "full", "open_connection", json!({"connection_id":"db1"})).await;
+    let (err, v) = call(&g, "full", "execute_query", json!({"connection_id":"db1","sql":"DELETE FROM t"})).await;
+    assert!(err && v.as_str().unwrap().contains("password"), "{v}");
 }

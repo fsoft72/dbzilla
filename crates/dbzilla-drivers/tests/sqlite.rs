@@ -217,3 +217,19 @@ async fn database_files_list_create_rename_drop_switch() {
     let objs = c.list_objects("b.db", None).await.unwrap();
     assert!(objs.iter().any(|o| o.table.name == "only_in_b"));
 }
+
+/// Review I9: renaming onto an existing file is refused and the sidecar files move along.
+#[tokio::test]
+async fn rename_database_never_overwrites() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in ["a.sqlite3", "b.sqlite3", "open.sqlite3"] {
+        rusqlite::Connection::open(dir.path().join(n)).unwrap();
+    }
+    std::fs::write(dir.path().join("a.sqlite3-wal"), b"w").unwrap();
+    let cfg = dbzilla_drivers::ConnectConfig { driver: dbzilla_core::dialect::DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: dir.path().join("open.sqlite3").to_string_lossy().into_owned(), ssl: dbzilla_drivers::SslMode::Disabled, bootstrap: vec![] };
+    let mut c = dbzilla_drivers::driver_for(dbzilla_core::dialect::DriverId::Sqlite).unwrap().connect(&cfg).await.unwrap();
+    assert!(c.rename_database("a.sqlite3", "b.sqlite3").await.is_err());
+    assert!(dir.path().join("a.sqlite3").exists());
+    c.rename_database("a.sqlite3", "c.sqlite3").await.unwrap();
+    assert!(dir.path().join("c.sqlite3").exists() && dir.path().join("c.sqlite3-wal").exists() && !dir.path().join("a.sqlite3-wal").exists());
+}

@@ -69,7 +69,11 @@ impl HistoryStore {
             entry.sql.push_str(TRUNCATED);
         }
         fs::create_dir_all(&self.dir)?;
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(self.file(conn_id)?)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(self.file(conn_id)?)?;
         writeln!(f, "{}", serde_json::to_string(&entry)?)?;
         Ok(())
     }

@@ -214,6 +214,11 @@ impl ExportDialog {
         if self.dir.trim().is_empty() {
             return Err("Choose a destination folder".into());
         }
+        for (label, text) in [("filter", &self.where_sql), ("order", &self.order_sql)] {
+            if dbzilla_core::splitter::split_statements(text, DriverId::MySql).len() > 1 {
+                return Err(format!("The {label} must be a single expression, not several statements"));
+            }
+        }
         let single = picked.len() == 1;
         let cols = self.columns.as_ref().filter(|_| single).map(|c| c.iter().filter(|(_, on)| *on).map(|(n, _)| n.clone()).collect::<Vec<_>>());
         if cols.as_ref().is_some_and(Vec::is_empty) {

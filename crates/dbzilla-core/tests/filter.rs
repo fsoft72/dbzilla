@@ -103,3 +103,13 @@ fn any_column_ors_over_text_castable_columns() {
         "(CAST(\"id\" AS text) LIKE '%x%' ESCAPE '!' OR CAST(\"name\" AS text) LIKE '%x%' ESCAPE '!')"
     );
 }
+
+/// Review I3: a raw filter with a second statement never reaches the server.
+#[test]
+fn raw_filter_with_several_statements_matches_nothing() {
+    use dbzilla_core::dialect::{dialect_for, DriverId};
+    use dbzilla_core::filter::*;
+    let f = Filter { enabled: true, column: FilterColumn::Raw, op: FilterOp::Eq, value: "1=1; DELETE FROM orders; -- ".into() };
+    let sql = to_where(dialect_for(DriverId::MySql).as_ref(), &[], &[f], false);
+    assert!(!sql.to_uppercase().contains("DELETE"), "{sql}");
+}

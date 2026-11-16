@@ -52,7 +52,13 @@ pub fn split_statements(sql: &str, dialect: DriverId) -> Vec<Statement> {
             }
             b'-' if b.get(i + 1) == Some(&b'-') => i = skip_line(b, i),
             b'#' if mysql => i = skip_line(b, i),
-            b'/' if b.get(i + 1) == Some(&b'*') => i = skip_block_comment(b, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // MySQL executable comments (/*! ... */) are code, not comments
+                if mysql && b.get(i + 2) == Some(&b'!') {
+                    has_code = true;
+                }
+                i = skip_block_comment(b, i);
+            }
             b'$' if postgres => {
                 has_code = true;
                 i = skip_dollar_quote(b, i);

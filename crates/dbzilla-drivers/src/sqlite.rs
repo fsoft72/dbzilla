@@ -412,7 +412,17 @@ impl Conn for SqliteConn {
             return Err(DriverError::Other("cannot rename the database that is currently open".into()));
         }
         let dir = self.dir().ok_or_else(|| DriverError::Unsupported("in-memory database".into()))?;
-        std::fs::rename(dir.join(from), dir.join(to)).map_err(|e| DriverError::Other(format!("rename failed: {e}")))
+        if dir.join(to).exists() {
+            return Err(DriverError::Other(format!("{to} already exists")));
+        }
+        std::fs::rename(dir.join(from), dir.join(to)).map_err(|e| DriverError::Other(format!("rename failed: {e}")))?;
+        for suffix in ["-wal", "-shm"] {
+            let side = dir.join(format!("{from}{suffix}"));
+            if side.exists() {
+                std::fs::rename(&side, dir.join(format!("{to}{suffix}"))).map_err(|e| DriverError::Other(format!("rename failed: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     async fn drop_database(&mut self, name: &str) -> DriverResult<()> {

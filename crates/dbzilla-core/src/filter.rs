@@ -122,7 +122,14 @@ fn filter_sql(d: &dyn Dialect, cols: &[ColumnMeta], f: &Filter) -> Option<String
     match &f.column {
         FilterColumn::Raw => {
             let raw = f.value.trim();
-            if raw.is_empty() { None } else { Some(raw.to_owned()) }
+            if raw.is_empty() {
+                return None;
+            }
+            // a raw filter is one expression: more than one statement could change data, so it matches nothing
+            if crate::splitter::split_statements(raw, crate::dialect::DriverId::MySql).len() > 1 {
+                return Some("1 = 0".to_owned());
+            }
+            Some(raw.to_owned())
         }
         FilterColumn::Column(name) => {
             let meta = cols.iter().find(|c| &c.name == name);

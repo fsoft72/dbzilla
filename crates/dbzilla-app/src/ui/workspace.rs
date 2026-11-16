@@ -186,6 +186,7 @@ enum GateAction {
     Commit,
     Ddl(DdlAfter),
     DbOp(dbzilla_session::DbOp),
+    Import(String, jobs::ImportRequest),
     Run { labels: Vec<Option<String>>, originals: Vec<String> },
 }
 
@@ -482,8 +483,24 @@ impl Workspace {
         self.jobs.spawn_export(&env, repaint, title, sources, opts);
     }
 
-    /// Starts an import job; the table list refreshes when it ends.
+    /// Starts an import job after the safe-mode check of what it will run.
     pub fn start_import(&mut self, title: String, req: jobs::ImportRequest) {
+        let statements: Vec<String> = match &req {
+            jobs::ImportRequest::Dump(text) => dbzilla_core::splitter::split_statements(text, self.conn.driver).into_iter().map(|s| s.text).collect(),
+            jobs::ImportRequest::Rows { table, parsed, .. } => vec![format!("INSERT INTO {} VALUES (/* {} rows from the file */)", dialect_for(self.conn.driver).quote_table(table), parsed.rows.len())],
+        };
+        match gate_check(self.conn.safe_level, self.conn.driver, &statements) {
+            GateDecision::Allow => self.spawn_import_now(title, req),
+            GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::Import(title, req), statements: t, needs_password: false, input: String::new(), reveal: false, tab: 0, error: None }),
+            GateDecision::Password(t) => {
+                let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                self.gate = Some(GateModal { action: GateAction::Import(title, req), statements: t, needs_password: known, input: String::new(), reveal: false, tab: 0, error: None });
+            }
+        }
+    }
+
+    /// Starts an import job; the table list refreshes when it ends.
+    fn spawn_import_now(&mut self, title: String, req: jobs::ImportRequest) {
         let (Some(env), Some(repaint)) = (self.job_env.clone(), self.repaint.clone()) else {
             return self.notices.push((true, "Background jobs are not available for this workspace".into()));
         };
@@ -531,6 +548,10 @@ impl Workspace {
             }
             Event::DbOpFailed { what, error } => self.notices.push((true, format!("Could not {what}: {error}"))),
             Event::DatabaseChanged(db) => {
+                if let Some(env) = self.job_env.as_mut() {
+                    // later imports and exports must hit the database now in use
+                    env.cfg.database = if env.cfg.driver == DriverId::Sqlite { std::path::Path::new(&env.cfg.database).with_file_name(&db).to_string_lossy().into_owned() } else { db.clone() };
+                }
                 self.current_db = db;
                 self.objects.clear();
                 self.structures.clear();
@@ -1032,7 +1053,7 @@ impl Workspace {
             r.status = status;
         }
         if let Some(sql) = sql {
-            let entry = HistoryEntry { ts: now_ms(), sql, kind: HistoryKind::Editor, duration_ms: ms, ok, database: Some(self.current_db.clone()), original_csv: None };
+            let entry = HistoryEntry { ts: now_ms(), sql: dbzilla_session::console::redact_sql(&sql), kind: HistoryKind::Editor, duration_ms: ms, ok, database: Some(self.current_db.clone()), original_csv: None };
             if let Err(e) = self.history.append(&self.conn.id, &entry) {
                 self.notices.push((true, format!("Cannot write the history: {e}")));
             }
@@ -1343,7 +1364,7 @@ impl Workspace {
             for sql in stmts {
                 let writes_existing = sql.starts_with("UPDATE") || sql.starts_with("DELETE");
                 let original_csv = if writes_existing { csv.take() } else { None };
-                let entry = HistoryEntry { ts: now_ms(), sql, kind: HistoryKind::Commit, duration_ms: None, ok: true, database: Some(self.current_db.clone()), original_csv };
+                let entry = HistoryEntry { ts: now_ms(), sql: dbzilla_session::console::redact_sql(&sql), kind: HistoryKind::Commit, duration_ms: None, ok: true, database: Some(self.current_db.clone()), original_csv };
                 if let Err(e) = self.history.append(&self.conn.id, &entry) {
                     self.notices.push((true, format!("Cannot write the history: {e}")));
                 }
@@ -2197,6 +2218,7 @@ impl Workspace {
                                 GateAction::Commit => self.send_commit(g.tab, g.statements),
                                 GateAction::Ddl(after) => self.send_ddl(g.statements, after),
                                 GateAction::DbOp(op) => self.session.send(Command::DbOp(op)),
+                                GateAction::Import(title, req) => self.spawn_import_now(title, req),
                                 GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
                             }
                         }
@@ -3322,6 +3344,31 @@ mod tests {
         let b: i64 = conn.query_row("SELECT count(*) FROM t_copy", [], |r| r.get(0)).unwrap();
         assert_eq!(a, b);
         assert!(ws.notices.iter().any(|(err, m)| !*err && m.contains("Imported")));
+    }
+
+    /// Review I10: passwords typed in SQL never reach the history file.
+    #[test]
+    fn history_redacts_passwords() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "SELECT 'x' AS a, 1 AS password_note; CREATE USER u IDENTIFIED BY 'S3cret'");
+        ws.run_sql(true);
+        wait(&mut ws, |w| !sql_running(w));
+        let entries = ws.history.search(&ws.conn.id, "", 10).unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|e| !e.sql.contains("S3cret")), "{entries:?}");
+    }
+
+    /// Review I2: an import waits for the safe-mode answer.
+    #[test]
+    fn import_is_gated_by_safe_mode() {
+        use dbzilla_core::safemode::SafeLevel;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.conn.safe_level = SafeLevel::Alert1;
+        ws.start_import("Import of dump.sql".into(), jobs::ImportRequest::Dump("DROP TABLE t".into()));
+        assert!(ws.gate.as_ref().is_some_and(|g| g.statements[0].starts_with("DROP TABLE")), "the dump waits for confirmation");
+        assert!(ws.jobs.jobs.is_empty(), "no job started yet");
     }
 }
 

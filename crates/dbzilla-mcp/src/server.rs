@@ -56,6 +56,10 @@ pub trait Backend: Send + Sync {
     async fn run(&self, id: &str, sql: &str, write: bool) -> Result<Value, String>;
     /// Asks the user to approve a write; true when approved.
     async fn approve(&self, req: ApprovalRequest) -> bool;
+    /// Safe mode level of a saved connection.
+    async fn safe_level(&self, _id: &str) -> dbzilla_core::safemode::SafeLevel {
+        dbzilla_core::safemode::SafeLevel::Silent
+    }
     /// Records an activity line.
     fn log(&self, entry: Activity);
 }
@@ -65,6 +69,8 @@ pub struct McpState {
     pub backend: Arc<dyn Backend>,
     pub tokens: Mutex<TokenStore>,
     pub approval_needed: bool,
+    /// Cleared when the server is stopped, so connections that stay open are refused.
+    pub active: std::sync::atomic::AtomicBool,
 }
 
 /// The router serving `/mcp`.
@@ -108,6 +114,9 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
 
 /// HTTP entry point.
 async fn handle(State(st): State<Arc<McpState>>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    if !st.active.load(std::sync::atomic::Ordering::SeqCst) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "the MCP server was stopped").into_response();
+    }
     let Some(rec) = bearer(&headers).and_then(|s| st.tokens.lock().ok()?.verify(s).cloned()) else {
         return (StatusCode::UNAUTHORIZED, "a valid Bearer token is required").into_response();
     };
@@ -179,7 +188,11 @@ async fn dispatch(st: &McpState, token: &str, perm: Permission, tool: &str, args
             if !perm.allows(kind) {
                 return Err(format!("this token ({}) is not allowed to run {kind:?} statements", perm.label()));
             }
-            if kind != StatementKind::ReadOnly && st.approval_needed && !st.backend.approve(ApprovalRequest { token: token.to_owned(), connection: id.to_owned(), sql: sql.to_owned(), kind }).await {
+            let level = st.backend.safe_level(id).await;
+            if level.requires_password(kind) {
+                return Err(format!("the safe mode of this connection ({level:?}) requires the password for this statement; run it from DBZilla instead"));
+            }
+            if kind != StatementKind::ReadOnly && (st.approval_needed || level.requires_confirm(kind)) && !st.backend.approve(ApprovalRequest { token: token.to_owned(), connection: id.to_owned(), sql: sql.to_owned(), kind }).await {
                 return Err("the user denied the statement".into());
             }
             st.backend.run(id, sql, kind != StatementKind::ReadOnly).await

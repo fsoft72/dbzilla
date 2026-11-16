@@ -34,3 +34,17 @@ pub async fn run_write(conn: &mut dyn Conn, sql: &str) -> Result<Json, String> {
     let affected = conn.execute_batch(&[sql.to_owned()], false).await.map_err(|e| e.to_string())?;
     Ok(json!({ "affected": affected.first().copied().unwrap_or(0) }))
 }
+
+/// Runs a query inside a read-only transaction (or `query_only` on SQLite), so a function with side effects cannot change data.
+pub async fn run_read_only(conn: &mut dyn Conn, driver: dbzilla_core::dialect::DriverId, sql: &str) -> Result<Json, String> {
+    use dbzilla_core::dialect::DriverId;
+    let (begin, end) = match driver {
+        DriverId::Sqlite => ("PRAGMA query_only=ON", "PRAGMA query_only=OFF"),
+        DriverId::Postgres => ("BEGIN READ ONLY", "ROLLBACK"),
+        DriverId::MySql => ("START TRANSACTION READ ONLY", "ROLLBACK"),
+    };
+    conn.execute_batch(&[begin.to_owned()], false).await.map_err(|e| e.to_string())?;
+    let result = run_query(conn, sql).await;
+    let _ = conn.execute_batch(&[end.to_owned()], false).await;
+    result
+}

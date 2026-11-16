@@ -107,3 +107,12 @@ fn unicode_and_unterminated_input_do_not_panic() {
     assert_eq!(texts("SELECT 'è;à'; SELECT 'open", DriverId::Postgres).len(), 2);
     assert_eq!(texts("SELECT /* open", DriverId::Postgres).len(), 1);
 }
+
+/// Review I5: MySQL executable comments are code.
+#[test]
+fn mysql_version_comments_are_kept() {
+    use dbzilla_core::dialect::DriverId;
+    let dump = "/*!40101 SET NAMES utf8mb4 */;\n/*!50003 CREATE TRIGGER x BEFORE INSERT ON t FOR EACH ROW SET NEW.a = 1 */;\nINSERT INTO t VALUES (1);\n/* plain comment */;";
+    let n = dbzilla_core::splitter::split_statements(dump, DriverId::MySql).len();
+    assert_eq!(n, 3, "the two executable comments and the INSERT survive, the plain comment does not");
+}
