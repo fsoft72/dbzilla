@@ -9,12 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1.92"
-dbzilla-core = { version = "0.1.2", path = "../dbzilla-core" }
-dbzilla-drivers = { version = "0.1.2", path = "../dbzilla-drivers" }
-dbzilla-io = { version = "0.1.2", path = "../dbzilla-io" }
-dbzilla-mcp = { version = "0.1.2", path = "../dbzilla-mcp" }
-dbzilla-session = { version = "0.1.2", path = "../dbzilla-session" }
-dbzilla-store = { version = "0.1.2", path = "../dbzilla-store" }
+dbzilla-core = { version = "0.1.3", path = "../dbzilla-core" }
+dbzilla-drivers = { version = "0.1.3", path = "../dbzilla-drivers" }
+dbzilla-io = { version = "0.1.3", path = "../dbzilla-io" }
+dbzilla-mcp = { version = "0.1.3", path = "../dbzilla-mcp" }
+dbzilla-session = { version = "0.1.3", path = "../dbzilla-session" }
+dbzilla-store = { version = "0.1.3", path = "../dbzilla-store" }
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui_dock = "0.16"
 egui_extras = "0.31"
