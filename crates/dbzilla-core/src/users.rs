@@ -201,7 +201,7 @@ pub fn list_sql(driver: DriverId) -> Option<&'static str> {
     match driver {
         DriverId::Postgres => Some("SELECT rolname, rolsuper, rolcreatedb, rolreplication, rolbypassrls FROM pg_roles WHERE rolname !~ '^pg_' AND rolcanlogin ORDER BY rolname"),
         DriverId::MySql => Some("SELECT user, host, max_updates, max_connections, max_questions FROM mysql.user WHERE user <> '' ORDER BY user, host"),
-        DriverId::Sqlite => None,
+        DriverId::Sqlite | DriverId::SqlServer => None,
     }
 }
 

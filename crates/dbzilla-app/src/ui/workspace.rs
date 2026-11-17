@@ -57,7 +57,7 @@ fn view_apply_statements(driver: DriverId, table: &TableRef, ddl: &str) -> Vec<S
     let body = ddl.trim().trim_end_matches(';').to_owned();
     match driver {
         DriverId::Postgres => vec![body],
-        DriverId::MySql => {
+        DriverId::MySql | DriverId::SqlServer => {
             let rest = body.strip_prefix("CREATE").or_else(|| body.strip_prefix("create")).map(str::to_owned);
             vec![rest.map_or(body, |r| format!("ALTER{r}"))]
         }
@@ -2447,6 +2447,7 @@ impl Workspace {
                 d.literal(&dbzilla_core::value::Value::Text(table.name.clone()))
             ),
             DriverId::MySql => format!("SHOW CREATE {} {}.{}", if kind == ObjectKind::Procedure { "PROCEDURE" } else { "FUNCTION" }, d.quote_ident(table.database.as_deref().unwrap_or(&self.current_db)), d.quote_ident(&table.name)),
+            DriverId::SqlServer => format!("SELECT OBJECT_DEFINITION(OBJECT_ID({})) AS definition", d.literal(&dbzilla_core::value::Value::Text(d.quote_table(&TableRef { database: None, schema: table.schema.clone(), name: table.name.clone() })))),
             DriverId::Sqlite => return self.notices.push((true, "SQLite has no stored functions".into())),
         };
         self.open_sql(sql);

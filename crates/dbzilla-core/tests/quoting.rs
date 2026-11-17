@@ -5,7 +5,7 @@ use dbzilla_core::model::TableRef;
 use dbzilla_core::value::Value;
 use proptest::prelude::*;
 use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::{Dialect as SqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect as SqlDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 fn all() -> [Box<dyn Dialect>; 3] {
@@ -72,6 +72,7 @@ fn parse_dialect(id: DriverId) -> Box<dyn SqlDialect> {
         DriverId::Sqlite => Box::new(SQLiteDialect {}),
         DriverId::Postgres => Box::new(PostgreSqlDialect {}),
         DriverId::MySql => Box::new(MySqlDialect {}),
+        DriverId::SqlServer => Box::new(MsSqlDialect {}),
     }
 }
 
@@ -119,4 +120,24 @@ fn postgres_array_literals() {
     let d = dialect_for(DriverId::Postgres);
     let v = Value::Array(vec![Value::I64(1), Value::Null, Value::Text("a \"b\" c".into()), Value::Array(vec![Value::Bool(true)])]);
     assert_eq!(d.literal(&v), "'{1,NULL,\"a \\\"b\\\" c\",{t}}'");
+}
+
+#[test]
+fn sqlserver_quotes_identifiers_with_brackets() {
+    let d = dialect_for(DriverId::SqlServer);
+    assert_eq!(d.quote_ident("a]b"), "[a]]b]");
+    let t = TableRef { database: Some("shop".into()), schema: Some("dbo".into()), name: "orders".into() };
+    assert_eq!(d.quote_table(&t), "[shop].[dbo].[orders]");
+}
+
+#[test]
+fn sqlserver_literals_and_helpers() {
+    let d = dialect_for(DriverId::SqlServer);
+    assert_eq!(d.literal(&Value::Text("it's".into())), "N'it''s'");
+    assert_eq!(d.literal(&Value::Bool(true)), "1");
+    assert_eq!(d.literal(&Value::Bool(false)), "0");
+    assert_eq!(d.literal(&Value::Bytes(vec![0xDE, 0xAD])), "0xDEAD");
+    assert_eq!(d.now_expr(), "GETDATE()");
+    assert_eq!(d.cast_text("x"), "CAST(x AS NVARCHAR(MAX))");
+    assert_eq!(d.insert_defaults("[t]"), "INSERT INTO [t] DEFAULT VALUES");
 }

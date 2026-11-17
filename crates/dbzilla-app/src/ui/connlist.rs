@@ -129,6 +129,7 @@ fn monogram(d: DriverId) -> &'static str {
         DriverId::Postgres => "PG",
         DriverId::MySql => "My",
         DriverId::Sqlite => "SQ",
+        DriverId::SqlServer => "MS",
     }
 }
 
@@ -155,7 +156,7 @@ pub fn show(ui: &mut Ui, state: &mut ListState, store: &ConnectionStore, tags: &
             egui::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                 ui.set_min_width(200.0);
                 widgets::flat_menu_style(ui);
-                for (label, d) in [("PostgreSQL", DriverId::Postgres), ("MySQL / MariaDB", DriverId::MySql), ("SQLite file", DriverId::Sqlite)] {
+                for (label, d) in [("PostgreSQL", DriverId::Postgres), ("MySQL / MariaDB", DriverId::MySql), ("SQL Server", DriverId::SqlServer), ("SQLite file", DriverId::Sqlite)] {
                     if ui.button(label).clicked() {
                         action = Some(ListAction::NewConnection(d));
                     }

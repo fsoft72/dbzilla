@@ -42,6 +42,8 @@ pub async fn run_read_only(conn: &mut dyn Conn, driver: dbzilla_core::dialect::D
         DriverId::Sqlite => ("PRAGMA query_only=ON", "PRAGMA query_only=OFF"),
         DriverId::Postgres => ("BEGIN READ ONLY", "ROLLBACK"),
         DriverId::MySql => ("START TRANSACTION READ ONLY", "ROLLBACK"),
+        // SQL Server has no read-only transaction, so a read-only guarantee cannot be given.
+        DriverId::SqlServer => return Err("read-only queries are not supported for SQL Server".to_owned()),
     };
     conn.execute_batch(&[begin.to_owned()], false).await.map_err(|e| e.to_string())?;
     let result = run_query(conn, sql).await;

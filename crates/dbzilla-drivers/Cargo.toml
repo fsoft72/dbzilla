@@ -24,8 +24,8 @@ uuid = { version = "1.29.2", optional = true }
 [features]
 default = ["sqlite", "postgres", "mysql", "mssql"]
 sqlite = ["dep:rusqlite"]
-mssql = ["dep:tiberius", "dep:tokio-util", "dep:chrono", "dep:uuid", "dep:serde_json"]
-mysql = ["dep:mysql_async", "dep:chrono", "dep:serde_json"]
+mssql = ["dep:tiberius", "dep:tokio-util", "dep:chrono", "dep:uuid", "dep:serde_json", "dep:rustls"]
+mysql = ["dep:mysql_async", "dep:chrono", "dep:serde_json", "dep:rustls"]
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:futures-util", "dep:chrono", "dep:uuid", "dep:serde_json"]
 
 [dev-dependencies]

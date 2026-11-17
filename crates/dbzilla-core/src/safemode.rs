@@ -4,7 +4,7 @@ use crate::dialect::DriverId;
 use crate::splitter::split_statements;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{Query, SetExpr, Statement};
-use sqlparser::dialect::{Dialect as SqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect as SqlDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 /// Kind of a SQL statement for safe-mode purposes.
@@ -69,6 +69,7 @@ fn parser_dialect(d: DriverId) -> Box<dyn SqlDialect> {
         DriverId::Sqlite => Box::new(SQLiteDialect {}),
         DriverId::Postgres => Box::new(PostgreSqlDialect {}),
         DriverId::MySql => Box::new(MySqlDialect {}),
+        DriverId::SqlServer => Box::new(MsSqlDialect {}),
     }
 }
 

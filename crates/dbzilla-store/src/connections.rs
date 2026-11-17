@@ -92,6 +92,7 @@ impl StoredConnection {
             DriverId::Sqlite => "SQLite",
             DriverId::Postgres => "PostgreSQL",
             DriverId::MySql => "MySQL",
+            DriverId::SqlServer => "SQL Server",
         }
     }
 
@@ -139,8 +140,8 @@ pub fn ssl_from_index(driver: DriverId, i: u8) -> SslMode {
     match (driver, i) {
         (_, 1) => SslMode::Disabled,
         (_, 2) => SslMode::Required,
-        (DriverId::Postgres, 4) | (DriverId::MySql, 3) => SslMode::VerifyCa,
-        (DriverId::Postgres, 5) | (DriverId::MySql, 4) => SslMode::VerifyFull,
+        (DriverId::Postgres, 4) | (DriverId::MySql | DriverId::SqlServer, 3) => SslMode::VerifyCa,
+        (DriverId::Postgres, 5) | (DriverId::MySql | DriverId::SqlServer, 4) => SslMode::VerifyFull,
         _ => SslMode::Preferred,
     }
 }

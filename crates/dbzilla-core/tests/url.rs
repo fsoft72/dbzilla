@@ -87,3 +87,16 @@ fn unknown_options_are_preserved() {
     assert_eq!(s.extra.get("lazyload").map(String::as_str), Some("1"));
     assert!(format_url(&s, false).contains("lazyload=1"));
 }
+
+#[test]
+fn sqlserver_schemes_and_default_port() {
+    for scheme in ["sqlserver", "microsoftsqlserver"] {
+        let s = parse_url(&format!("{scheme}://sa:pw@h/db")).unwrap();
+        assert_eq!(s.driver, DriverId::SqlServer);
+        assert_eq!(s.user, "sa");
+        assert_eq!(s.database, "db");
+    }
+    assert_eq!(dbzilla_core::url::default_port(DriverId::SqlServer), Some(1433));
+    let s = parse_url("sqlserver://sa@h:1433/db").unwrap();
+    assert_eq!(format_url(&s, false), "sqlserver://sa@h/db");
+}

@@ -212,7 +212,9 @@ impl DetectedType {
             (DetectedType::Real, DriverId::Sqlite) => "REAL",
             (DetectedType::Real, DriverId::Postgres) => "double precision",
             (DetectedType::Real, DriverId::MySql) => "double",
+            (DetectedType::Real, DriverId::SqlServer) => "float",
             (DetectedType::Text, DriverId::Sqlite) => "TEXT",
+            (DetectedType::Text, DriverId::SqlServer) => "nvarchar(max)",
             (DetectedType::Text, _) => "text",
         }
     }

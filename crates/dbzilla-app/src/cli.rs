@@ -24,7 +24,7 @@ pub struct CliArgs {
 }
 
 /// Help text.
-pub const HELP: &str = "DBZilla - native database client\n\nUSAGE:\n  dbzilla [OPTIONS] [URL | FILE]\n\nOPTIONS:\n  --data-dir <DIR>   store settings and data in DIR\n  -h, --help         show this help\n\nURL examples:\n  postgresql://user@host/db?schema=public&table=orders\n  mysql://root@127.0.0.1/shop\n  sqlite:///path/to/file.sqlite\nFILE: a .sqlite, .sqlite3 or .db file";
+pub const HELP: &str = "DBZilla - native database client\n\nUSAGE:\n  dbzilla [OPTIONS] [URL | FILE]\n\nOPTIONS:\n  --data-dir <DIR>   store settings and data in DIR\n  -h, --help         show this help\n\nURL examples:\n  postgresql://user@host/db?schema=public&table=orders\n  mysql://root@127.0.0.1/shop\n  sqlserver://sa@127.0.0.1/master\n  sqlite:///path/to/file.sqlite\nFILE: a .sqlite, .sqlite3 or .db file";
 
 /// Parses arguments (without the program name). Unknown flags only produce a warning.
 pub fn parse_args(args: &[String]) -> CliArgs {

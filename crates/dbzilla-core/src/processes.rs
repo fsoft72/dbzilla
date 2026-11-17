@@ -23,7 +23,7 @@ pub fn list_sql(driver: DriverId) -> Option<&'static str> {
              FROM pg_stat_activity WHERE backend_type = 'client backend' AND state IS DISTINCT FROM 'idle' AND pid <> pg_backend_pid() ORDER BY query_start DESC NULLS LAST",
         ),
         DriverId::MySql => Some("SELECT id, user, host, db, command, time, state, info FROM information_schema.processlist WHERE id <> CONNECTION_ID() AND command <> 'Daemon' ORDER BY time"),
-        DriverId::Sqlite => None,
+        DriverId::Sqlite | DriverId::SqlServer => None,
     }
 }
 
@@ -37,7 +37,7 @@ pub fn kill_sql(driver: DriverId, id: &str) -> Option<String> {
     match driver {
         DriverId::Postgres => Some(format!("SELECT pg_cancel_backend({id});")),
         DriverId::MySql => Some(format!("KILL QUERY {id};")),
-        DriverId::Sqlite => None,
+        DriverId::Sqlite | DriverId::SqlServer => None,
     }
 }
 

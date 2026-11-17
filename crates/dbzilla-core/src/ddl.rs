@@ -229,7 +229,11 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
                 vec![format!("TRUNCATE TABLE {}{restart}{casc}", q(table))]
             }
         },
-        StructuralOp::AddColumn { table, column } => vec![format!("ALTER TABLE {} ADD COLUMN {}", q(table), col_sql(d, column))],
+        StructuralOp::AddColumn { table, column } => {
+            // T-SQL has no COLUMN keyword in ADD.
+            let keyword = if d.id() == DriverId::SqlServer { "ADD" } else { "ADD COLUMN" };
+            vec![format!("ALTER TABLE {} {keyword} {}", q(table), col_sql(d, column))]
+        }
         StructuralOp::DropColumn { table, column } => vec![format!("ALTER TABLE {} DROP COLUMN {}", q(table), d.quote_ident(column))],
         StructuralOp::AlterColumn { table, old, new, current } => alter_column(d, table, old, new, current.as_deref())?,
         StructuralOp::SetPrimaryKey { table, old, new, current } => set_primary_key(d, table, old, new, current.as_deref())?,
@@ -244,6 +248,7 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
                 vec![format!("DROP INDEX {schema}{}", d.quote_ident(name))]
             }
             DriverId::Sqlite => vec![format!("DROP INDEX {}", d.quote_ident(name))],
+            DriverId::SqlServer => vec![format!("DROP INDEX {} ON {}", d.quote_ident(name), q(table))],
         },
         StructuralOp::AddForeignKey { table, fk, current } => match (d.id(), current) {
             (DriverId::Sqlite, Some(st)) => sqlite_add_fk(d, table, fk, st)?,
@@ -257,7 +262,7 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
         StructuralOp::DropForeignKey { table, name } => match d.id() {
             DriverId::Sqlite => return Err(DdlError::Unsupported("this database cannot drop a foreign key from an existing table".into())),
             DriverId::MySql => vec![format!("ALTER TABLE {} DROP FOREIGN KEY {}", q(table), d.quote_ident(name))],
-            DriverId::Postgres => vec![format!("ALTER TABLE {} DROP CONSTRAINT {}", q(table), d.quote_ident(name))],
+            DriverId::Postgres | DriverId::SqlServer => vec![format!("ALTER TABLE {} DROP CONSTRAINT {}", q(table), d.quote_ident(name))],
         },
         StructuralOp::CloneTable { source, target, with_data } => clone_table(d, source, target, *with_data),
         StructuralOp::CreateTrigger { table, trigger } => vec![create_trigger_sql(d, table, trigger)?],
@@ -287,7 +292,7 @@ fn has_loose_statements(body: &str) -> bool {
 
 /// `CREATE TRIGGER` for PostgreSQL (calls a function) and MySQL (inline body).
 fn create_trigger_sql(d: &dyn Dialect, table: &TableRef, t: &TriggerDef) -> Result<String, DdlError> {
-    if d.id() == DriverId::Sqlite { return Err(DdlError::Unsupported("triggers are read only on this database".into())); }
+    if matches!(d.id(), DriverId::Sqlite | DriverId::SqlServer) { return Err(DdlError::Unsupported("triggers are read only on this database".into())); }
     validate_trigger(d, t)?;
     let head = format!("CREATE TRIGGER {} {} {} ON {}", d.quote_ident(&t.name), t.timing, t.event, d.quote_table(table));
     Ok(match (d.id(), &t.function) {
@@ -303,7 +308,7 @@ fn create_trigger_sql(d: &dyn Dialect, table: &TableRef, t: &TriggerDef) -> Resu
 fn drop_trigger_sql(d: &dyn Dialect, table: &TableRef, name: &str, if_exists: bool) -> Result<String, DdlError> {
     let exists = if if_exists { "IF EXISTS " } else { "" };
     Ok(match d.id() {
-        DriverId::Sqlite => return Err(DdlError::Unsupported("triggers are read only on this database".into())),
+        DriverId::Sqlite | DriverId::SqlServer => return Err(DdlError::Unsupported("triggers are read only on this database".into())),
         DriverId::Postgres => format!("DROP TRIGGER {exists}{} ON {}", d.quote_ident(name), d.quote_table(table)),
         DriverId::MySql => format!("DROP TRIGGER {exists}{}", d.quote_table(&TableRef { database: table.database.clone(), schema: None, name: name.to_owned() })),
     })
@@ -332,6 +337,10 @@ fn clone_table(d: &dyn Dialect, source: &TableRef, target: &TableRef, with_data:
             let tail = if with_data { "" } else { " WHERE 0" };
             vec![format!("CREATE TABLE {t} AS SELECT * FROM {s}{tail}")]
         }
+        DriverId::SqlServer => {
+            let tail = if with_data { "" } else { " WHERE 1 = 0" };
+            vec![format!("SELECT * INTO {t} FROM {s}{tail}")]
+        }
     }
 }
 
@@ -359,6 +368,7 @@ fn set_primary_key(d: &dyn Dialect, table: &TableRef, old: &[String], new: &[Str
             }
             Ok(vec![format!("ALTER TABLE {t} {}", parts.join(", "))])
         }
+        DriverId::SqlServer => Err(DdlError::Unsupported("changing the primary key is not supported on SQL Server yet".into())),
         DriverId::Sqlite => {
             let st = current.ok_or_else(|| DdlError::Unsupported("changing a SQLite primary key needs the current table structure".into()))?;
             sqlite_set_pk(d, table, new, st)
@@ -458,6 +468,7 @@ fn alter_column(d: &dyn Dialect, table: &TableRef, old: &ColumnDef, new: &Column
                 Ok(vec![format!("ALTER TABLE {t} MODIFY COLUMN {} {def}", d.quote_ident(&new.name))])
             }
         }
+        DriverId::SqlServer => Err(DdlError::Unsupported("altering a column is not supported on SQL Server yet".into())),
         DriverId::Sqlite => {
             let st = current.ok_or_else(|| DdlError::Unsupported("altering a SQLite column needs the current table structure".into()))?;
             sqlite_rebuild(d, table, old, new, st)

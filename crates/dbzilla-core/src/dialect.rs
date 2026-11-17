@@ -10,6 +10,7 @@ pub enum DriverId {
     Sqlite,
     Postgres,
     MySql,
+    SqlServer,
 }
 
 /// SQL dialect behaviour. UI code must go through this trait, never match on `DriverId`.
@@ -68,6 +69,7 @@ pub fn dialect_for(id: DriverId) -> Box<dyn Dialect> {
         DriverId::Sqlite => Box::new(SqliteDialect),
         DriverId::Postgres => Box::new(PostgresDialect),
         DriverId::MySql => Box::new(MySqlDialect),
+        DriverId::SqlServer => Box::new(MsSqlDialect),
     }
 }
 
@@ -258,3 +260,49 @@ impl Dialect for MySqlDialect {
         COMMON_KEYWORDS
     }
 }
+
+/// Microsoft SQL Server (T-SQL) dialect.
+pub struct MsSqlDialect;
+
+impl Dialect for MsSqlDialect {
+    fn id(&self) -> DriverId {
+        DriverId::SqlServer
+    }
+    fn quote_ident(&self, name: &str) -> String {
+        format!("[{}]", name.replace(']', "]]"))
+    }
+    fn literal(&self, v: &Value) -> String {
+        match v {
+            Value::Text(s) | Value::Geometry(s) | Value::Other(s) => format!("N{}", quote_text(s, false)),
+            Value::Json(j) => format!("N{}", quote_text(&j.to_string(), false)),
+            other => literal_common(other, false, |b| if b { "1" } else { "0" }, |b| format!("0x{}", hex(b))),
+        }
+    }
+    fn now_expr(&self) -> &'static str {
+        "GETDATE()"
+    }
+    fn cast_text(&self, expr: &str) -> String {
+        format!("CAST({expr} AS NVARCHAR(MAX))")
+    }
+    fn types(&self) -> &'static [&'static str] {
+        &[
+            "int", "bigint", "smallint", "tinyint", "bit", "decimal", "numeric", "money", "float", "real",
+            "nvarchar", "varchar", "nchar", "char", "text", "ntext", "varbinary", "image", "date", "time",
+            "datetime", "datetime2", "datetimeoffset", "uniqueidentifier", "xml",
+        ]
+    }
+    fn keywords(&self) -> &'static [&'static str] {
+        MSSQL_KEYWORDS
+    }
+}
+
+/// Keywords of T-SQL: the common ones plus the SQL Server specific ones.
+const MSSQL_KEYWORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "HAVING", "TOP", "OFFSET", "FETCH", "INSERT", "INTO",
+    "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "ALTER", "DROP", "INDEX", "VIEW", "JOIN",
+    "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "ON", "AS", "AND", "OR", "NOT", "NULL", "IS",
+    "IN", "BETWEEN", "LIKE", "EXISTS", "UNION", "ALL", "DISTINCT", "CASE", "WHEN", "THEN", "ELSE",
+    "END", "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "DEFAULT", "UNIQUE", "CHECK", "CONSTRAINT",
+    "ASC", "DESC", "WITH", "BEGIN", "COMMIT", "ROLLBACK", "TRUNCATE", "TRIGGER", "EXEC", "GO",
+    "IDENTITY", "NOLOCK", "OUTPUT",
+];

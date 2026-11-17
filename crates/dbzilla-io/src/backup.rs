@@ -63,7 +63,7 @@ pub fn default_backup_options(driver: DriverId) -> &'static str {
     match driver {
         DriverId::Postgres => "--format=custom",
         DriverId::MySql => "--single-transaction",
-        DriverId::Sqlite => "",
+        DriverId::Sqlite | DriverId::SqlServer => "",
     }
 }
 
@@ -71,7 +71,7 @@ pub fn default_backup_options(driver: DriverId) -> &'static str {
 pub fn default_restore_options(driver: DriverId) -> &'static str {
     match driver {
         DriverId::Postgres => "--single-transaction",
-        DriverId::MySql | DriverId::Sqlite => "",
+        DriverId::MySql | DriverId::Sqlite | DriverId::SqlServer => "",
     }
 }
 
@@ -82,7 +82,7 @@ pub fn option_choices(driver: DriverId, restore: bool) -> &'static [&'static str
         (DriverId::Postgres, true) => &["--single-transaction", "--clean", "--create", "--exit-on-error", "--no-owner", "--data-only", "--schema-only"],
         (DriverId::MySql, false) => &["--single-transaction", "--no-data", "--no-create-info", "--routines", "--triggers", "--events", "--add-drop-database"],
         (DriverId::MySql, true) => &["--force", "--binary-mode"],
-        (DriverId::Sqlite, _) => &[],
+        (DriverId::Sqlite | DriverId::SqlServer, _) => &[],
     }
 }
 
@@ -147,7 +147,7 @@ fn connection(t: &Target) -> (Vec<String>, Vec<(String, String)>) {
                 env.push(("PGSSLMODE".to_owned(), m.to_owned()));
             }
         }
-        DriverId::MySql | DriverId::Sqlite => {
+        DriverId::MySql | DriverId::Sqlite | DriverId::SqlServer => {
             args.extend(["-h".to_owned(), t.host.clone()]);
             if let Some(p) = t.port {
                 args.extend(["-P".to_owned(), p.to_string()]);
@@ -181,6 +181,7 @@ pub fn backup_plan(t: &Target, database: &str, options: &str, out: &Path, gzip: 
             Ok(ToolPlan { tool: "mysqldump", args, env, io: FileIo::SaveStdout { path: out.to_owned(), gzip } })
         }
         DriverId::Sqlite => Err(IoError::Unsupported("SQLite is archived with sqlite_backup".into())),
+        DriverId::SqlServer => Err(IoError::Unsupported("backup is not supported for SQL Server".into())),
     }
 }
 
@@ -210,6 +211,7 @@ pub fn restore_plan(t: &Target, database: &str, options: &str, file: &Path) -> R
             Ok(ToolPlan { tool: "mysql", args, env, io: FileIo::FeedStdin { path: file.to_owned() } })
         }
         DriverId::Sqlite => Err(IoError::Unsupported("SQLite is restored with sqlite_restore".into())),
+        DriverId::SqlServer => Err(IoError::Unsupported("restore is not supported for SQL Server".into())),
     }
 }
 

@@ -92,6 +92,7 @@ impl ConnForm {
             user: match driver {
                 DriverId::Postgres => "postgres".into(),
                 DriverId::MySql => "root".into(),
+                DriverId::SqlServer => "sa".into(),
                 DriverId::Sqlite => String::new(),
             },
             password: String::new(),
@@ -239,6 +240,7 @@ pub fn driver_label(d: DriverId) -> &'static str {
         DriverId::Sqlite => "SQLite",
         DriverId::Postgres => "PostgreSQL",
         DriverId::MySql => "MySQL / MariaDB",
+        DriverId::SqlServer => "SQL Server",
     }
 }
 

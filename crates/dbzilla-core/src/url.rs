@@ -14,6 +14,7 @@ const ENCODE_PATH: &AsciiSet = &ENCODE.remove(b'/');
 const PG_PORT: u16 = 5432;
 /// Default MySQL port.
 const MYSQL_PORT: u16 = 3306;
+const MSSQL_PORT: u16 = 1433;
 
 /// Errors from URL handling.
 #[derive(Debug, Error, PartialEq)]
@@ -84,6 +85,7 @@ pub fn default_port(d: DriverId) -> Option<u16> {
     match d {
         DriverId::Postgres => Some(PG_PORT),
         DriverId::MySql => Some(MYSQL_PORT),
+        DriverId::SqlServer => Some(MSSQL_PORT),
         DriverId::Sqlite => None,
     }
 }
@@ -103,6 +105,7 @@ pub fn parse_url(input: &str) -> Result<ConnectionSpec, UrlError> {
     let driver = match scheme.as_str() {
         "postgresql" | "postgres" => DriverId::Postgres,
         "mysql" | "mariadb" => DriverId::MySql,
+        "sqlserver" | "microsoftsqlserver" => DriverId::SqlServer,
         "sqlite" => DriverId::Sqlite,
         _ => return Err(UrlError::UnknownScheme(scheme)),
     };
@@ -148,7 +151,11 @@ pub fn format_url(spec: &ConnectionSpec, include_password: bool) -> String {
     if spec.driver == DriverId::Sqlite {
         return format!("sqlite://{}{query}", utf8_percent_encode(&spec.database, ENCODE_PATH));
     }
-    let scheme = if spec.driver == DriverId::Postgres { "postgresql" } else { "mysql" };
+    let scheme = match spec.driver {
+        DriverId::Postgres => "postgresql",
+        DriverId::SqlServer => "sqlserver",
+        _ => "mysql",
+    };
     let password = if include_password { spec.password.as_deref() } else { None };
     let userinfo = match (spec.user.is_empty(), password) {
         (true, None) => String::new(),

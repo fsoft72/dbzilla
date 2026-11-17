@@ -87,6 +87,15 @@ impl Capabilities {
                 process_list: true,
                 ..base
             },
+            DriverId::SqlServer => Self {
+                schemas: true,
+                functions: true,
+                procedures: true,
+                sequences: true,
+                upsert_on_duplicate: false,
+                process_list: true,
+                ..base
+            },
             DriverId::MySql => Self {
                 rename_db: false,
                 encoding_collation_on_create_db: true,
@@ -114,5 +123,9 @@ mod tests {
         assert!(Capabilities::for_driver(DriverId::Postgres).schemas);
         assert!(Capabilities::for_driver(DriverId::Postgres).ilike);
         assert!(!Capabilities::for_driver(DriverId::Sqlite).process_list);
+        let ms = Capabilities::for_driver(DriverId::SqlServer);
+        assert!(ms.schemas && ms.functions && ms.procedures && ms.process_list && ms.triggers);
+        assert!(!ms.materialized_views && !ms.ilike && !ms.upsert_on_duplicate && !ms.replace_into);
+        assert!(!ms.reorder_columns && !ms.truncate_cascade && !ms.drop_cascade);
     }
 }
