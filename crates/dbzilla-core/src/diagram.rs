@@ -32,6 +32,8 @@ pub struct DiagramEdge {
     pub from_column: usize,
     pub to_table: usize,
     pub to_column: Option<usize>,
+    /// Guessed from the column name, there is no foreign key in the database.
+    pub inferred: bool,
 }
 
 /// Order of the tables in the diagram.
@@ -72,10 +74,40 @@ impl Diagram {
                 let target = ordered[to_table];
                 let wanted = fk.columns.first().cloned().or_else(|| target.primary_key.first().cloned());
                 let to_column = wanted.and_then(|w| target.columns.iter().position(|c| c.name == w));
-                edges.push(DiagramEdge { from_table, from_column, to_table, to_column });
+                edges.push(DiagramEdge { from_table, from_column, to_table, to_column, inferred: false });
             }
         }
-        Diagram { tables, edges }
+        let mut diagram = Diagram { tables, edges };
+        diagram.infer_edges(&ordered);
+        diagram
+    }
+
+    /// Adds a dashed link for every column that looks like a reference but has no foreign key:
+    /// `id_user`, `user_id` or `userId` point to the single primary key of `user`, `users` or `user_` + `s`.
+    /// The column and the key must have the same kind of type. Only real edges drive groups and layout.
+    fn infer_edges(&mut self, structures: &[&TableStructure]) {
+        let mut found = Vec::new();
+        for (from_table, s) in structures.iter().enumerate() {
+            for (from_column, col) in s.columns.iter().enumerate() {
+                if col.fk.is_some() || (col.is_pk && s.primary_key.len() == 1) {
+                    continue;
+                }
+                let Some(stem) = reference_stem(&col.name) else { continue };
+                let candidates = table_name_candidates(&stem);
+                let Some(to_table) = structures.iter().position(|t| candidates.contains(&t.table.name.to_lowercase())) else { continue };
+                if to_table == from_table {
+                    continue;
+                }
+                let target = structures[to_table];
+                let [key] = target.primary_key.as_slice() else { continue };
+                let Some(to_column) = target.columns.iter().position(|c| &c.name == key) else { continue };
+                if type_family(&col.type_name) != type_family(&target.columns[to_column].type_name) {
+                    continue;
+                }
+                found.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), inferred: true });
+            }
+        }
+        self.edges.extend(found);
     }
 
     /// Colour group of each table: tables linked by foreign keys share a group, the others get `None`.
@@ -83,7 +115,7 @@ impl Diagram {
     pub fn groups(&self) -> Vec<Option<usize>> {
         let mut parent: Vec<usize> = (0..self.tables.len()).collect();
         let mut linked = vec![false; self.tables.len()];
-        for e in self.edges.iter().filter(|e| e.from_table != e.to_table) {
+        for e in self.edges.iter().filter(|e| e.from_table != e.to_table && !e.inferred) {
             linked[e.from_table] = true;
             linked[e.to_table] = true;
             let (a, b) = (find(&mut parent, e.from_table), find(&mut parent, e.to_table));
@@ -124,7 +156,7 @@ impl Diagram {
             return Vec::new();
         }
         let mut parent: Vec<usize> = (0..n).collect();
-        for e in self.edges.iter().filter(|e| e.from_table != e.to_table) {
+        for e in self.edges.iter().filter(|e| e.from_table != e.to_table && !e.inferred) {
             let (a, b) = (find(&mut parent, e.from_table), find(&mut parent, e.to_table));
             if a != b {
                 parent[a] = b;
@@ -199,7 +231,7 @@ impl Diagram {
         // A table sits right of the tables it references. The relaxation is capped, so a cycle cannot loop.
         for _ in 0..members.len() {
             let mut changed = false;
-            for e in self.edges.iter().filter(|e| e.from_table != e.to_table && members.contains(&e.from_table)) {
+            for e in self.edges.iter().filter(|e| e.from_table != e.to_table && !e.inferred && members.contains(&e.from_table)) {
                 if rank[e.from_table] < rank[e.to_table] + 1 && rank[e.to_table] + 1 < members.len() {
                     rank[e.from_table] = rank[e.to_table] + 1;
                     changed = true;
@@ -219,7 +251,7 @@ impl Diagram {
         for (li, layer) in layers.iter_mut().enumerate() {
             if li > 0 {
                 let key = |t: usize| -> f32 {
-                    let neighbours: Vec<f32> = self.edges.iter().filter(|e| e.from_table == t && rank[e.to_table] < li).map(|e| slot[e.to_table]).collect();
+                    let neighbours: Vec<f32> = self.edges.iter().filter(|e| e.from_table == t && !e.inferred && rank[e.to_table] < li).map(|e| slot[e.to_table]).collect();
                     if neighbours.is_empty() { f32::MAX } else { neighbours.iter().sum::<f32>() / neighbours.len() as f32 }
                 };
                 layer.sort_by(|a, b| key(*a).partial_cmp(&key(*b)).unwrap_or(std::cmp::Ordering::Equal));
@@ -241,6 +273,46 @@ impl Diagram {
             x += layer_width + GAP_X;
         }
         Block { positions, width: (x - GAP_X).max(0.0), height: height.max(0.0) }
+    }
+}
+
+/// The name a reference column talks about: `id_user` and `user_id` give `user`, `userId` gives `user`.
+/// `None` when the name is not of that shape (plain `id`, no stem, ...).
+fn reference_stem(column: &str) -> Option<String> {
+    let lower = column.to_lowercase();
+    let stem = lower.strip_prefix("id_").or_else(|| lower.strip_suffix("_id")).map(str::to_owned).or_else(|| {
+        // camelCase: the original name ends with "Id" after a lower case letter
+        let head = column.strip_suffix("Id")?;
+        head.chars().last().is_some_and(|c| c.is_lowercase()).then(|| head.to_lowercase())
+    })?;
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// Lower case table names a stem may refer to: the stem, its plurals.
+fn table_name_candidates(stem: &str) -> Vec<String> {
+    let mut v = vec![stem.to_owned(), format!("{stem}s"), format!("{stem}es")];
+    if let Some(base) = stem.strip_suffix('y') {
+        v.push(format!("{base}ies"));
+    }
+    v
+}
+
+/// Coarse kind of a SQL type, to compare a reference column with the key it would point to.
+#[derive(Debug, PartialEq, Eq)]
+enum TypeFamily {
+    Int,
+    Text,
+    Other(String),
+}
+
+/// Kind of a type name such as `text(64)`, `INTEGER` or `bigint unsigned`.
+fn type_family(type_name: &str) -> TypeFamily {
+    let lower = type_name.to_lowercase();
+    let base = lower.split(['(', ' ']).next().unwrap_or("");
+    match base {
+        "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "serial" | "bigserial" | "smallserial" | "int2" | "int4" | "int8" => TypeFamily::Int,
+        "text" | "varchar" | "char" | "character" | "nvarchar" | "nchar" | "tinytext" | "mediumtext" | "longtext" | "citext" | "uuid" => TypeFamily::Text,
+        other => TypeFamily::Other(other.to_owned()),
     }
 }
 
@@ -295,8 +367,8 @@ mod tests {
         let names: Vec<_> = d.tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["audit", "customers", "items", "orders"]);
         assert_eq!(d.edges.len(), 2);
-        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0) }));
-        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0) }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0), inferred: false }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0), inferred: false }));
     }
 
     #[test]
@@ -428,6 +500,93 @@ mod tests {
         let before = p.clone();
         d.apply_saved(&mut p, &sizes, &BTreeMap::new());
         assert_eq!(p, before);
+    }
+
+    fn typed(name: &str, ty: &str, pk: bool) -> ColumnMeta {
+        ColumnMeta { name: name.into(), type_name: ty.into(), is_pk: pk, ..Default::default() }
+    }
+
+    fn users_and_notifications(user_col: &str, col_type: &str) -> Vec<TableStructure> {
+        vec![
+            table("users", vec![typed("id", "text(64)", true), typed("email", "text", false)]),
+            table("notifications", vec![typed("id", "text(64)", true), typed(user_col, col_type, false)]),
+        ]
+    }
+
+    fn inferred(d: &Diagram) -> Vec<&DiagramEdge> {
+        d.edges.iter().filter(|e| e.inferred).collect()
+    }
+
+    #[test]
+    fn id_user_points_to_the_key_of_users() {
+        let d = Diagram::build(&users_and_notifications("id_user", "text(64)"), DiagramSort::Name);
+        // sorted: notifications, users
+        assert_eq!(inferred(&d), vec![&DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), inferred: true }]);
+    }
+
+    #[test]
+    fn other_name_shapes_are_recognised() {
+        for col in ["user_id", "USER_ID", "ID_USER", "userId"] {
+            let d = Diagram::build(&users_and_notifications(col, "text(64)"), DiagramSort::Name);
+            assert_eq!(inferred(&d).len(), 1, "{col}");
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_references_are_ignored() {
+        for col in ["id", "user", "identity", "valid", "uuid", "_id", "id_"] {
+            let d = Diagram::build(&users_and_notifications(col, "text(64)"), DiagramSort::Name);
+            assert!(inferred(&d).is_empty(), "{col}");
+        }
+    }
+
+    #[test]
+    fn plurals_are_matched() {
+        let s = vec![
+            table("categories", vec![typed("id", "int", true)]),
+            table("boxes", vec![typed("id", "int", true)]),
+            table("item", vec![typed("id", "int", true), typed("category_id", "integer", false), typed("box_id", "bigint", false)]),
+        ];
+        assert_eq!(inferred(&Diagram::build(&s, DiagramSort::Name)).len(), 2);
+    }
+
+    #[test]
+    fn a_type_of_another_kind_is_not_linked() {
+        let d = Diagram::build(&users_and_notifications("id_user", "INTEGER"), DiagramSort::Name);
+        assert!(inferred(&d).is_empty());
+    }
+
+    #[test]
+    fn a_table_with_a_composite_key_is_not_a_target() {
+        let s = vec![
+            table("users", vec![typed("a", "int", true), typed("b", "int", true)]),
+            table("notes", vec![typed("id", "int", true), typed("user_id", "int", false)]),
+        ];
+        assert!(inferred(&Diagram::build(&s, DiagramSort::Name)).is_empty());
+    }
+
+    #[test]
+    fn a_real_foreign_key_wins_and_nothing_is_guessed_twice() {
+        let s = vec![table("users", vec![col("id", true, None)]), table("notes", vec![col("id", true, None), col("user_id", false, Some(("users", "id")))])];
+        let d = Diagram::build(&s, DiagramSort::Name);
+        assert_eq!(d.edges.len(), 1);
+        assert!(!d.edges[0].inferred);
+    }
+
+    #[test]
+    fn a_table_does_not_point_to_itself() {
+        let s = vec![table("user", vec![typed("id", "int", true), typed("user_id", "int", false)])];
+        assert!(inferred(&Diagram::build(&s, DiagramSort::Name)).is_empty());
+    }
+
+    #[test]
+    fn inferred_links_do_not_change_groups_or_layout() {
+        let plain = users_and_notifications("owner", "text(64)");
+        let guessed = users_and_notifications("id_user", "text(64)");
+        let (a, b) = (Diagram::build(&plain, DiagramSort::Name), Diagram::build(&guessed, DiagramSort::Name));
+        let sizes = vec![(100.0, 50.0); 2];
+        assert_eq!(b.groups(), vec![None, None]);
+        assert_eq!(a.layout(&sizes), b.layout(&sizes));
     }
 
     #[test]

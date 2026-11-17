@@ -49,6 +49,8 @@ pub struct DiagramTab {
     zoom: f32,
     fit_pending: bool,
     selected: Option<usize>,
+    /// Draw the dashed links guessed from column names.
+    show_inferred: bool,
     dragging: Option<usize>,
     search: String,
     found: Vec<usize>,
@@ -75,6 +77,7 @@ impl DiagramTab {
             zoom: 1.0,
             fit_pending: true,
             selected: None,
+            show_inferred: true,
             dragging: None,
             search: String::new(),
             found: Vec::new(),
@@ -136,10 +139,15 @@ impl DiagramTab {
         self.diagram.tables.len()
     }
 
-    /// Number of foreign key lines in the diagram.
+    /// Number of foreign key lines in the diagram, with or without the guessed ones.
     #[cfg(test)]
-    pub fn edge_count(&self) -> usize {
-        self.diagram.edges.len()
+    pub fn edge_count(&self, inferred: bool) -> usize {
+        self.diagram.edges.iter().filter(|e| e.inferred == inferred).count()
+    }
+
+    /// Number of links guessed from column names.
+    fn inferred_count(&self) -> usize {
+        self.diagram.edges.iter().filter(|e| e.inferred).count()
     }
 
     /// Position of the table called `name`.
@@ -236,6 +244,9 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
                 actions.push(DiagramAction::Rearrange);
             }
             ui.separator();
+            let guessed = tab.inferred_count();
+            ui.add_enabled(guessed > 0, egui::Checkbox::new(&mut tab.show_inferred, format!("Inferred links ({guessed})"))).on_hover_text("Dashed lines for columns named like id_user or user_id when the database has no foreign key");
+            ui.separator();
             let r = widgets::search_box(ui, &mut tab.search, "Find table or column");
             if r.changed() {
                 tab.refresh_search();
@@ -331,10 +342,10 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
     let z = tab.zoom;
     let show_text = z >= TEXT_ZOOM;
     let focus = tab.selected;
-    for e in &tab.diagram.edges {
+    for e in tab.diagram.edges.iter().filter(|e| tab.show_inferred || !e.inferred) {
         let involved = focus.is_some_and(|f| f == e.from_table || f == e.to_table);
-        let base = group_color(tab.groups[e.from_table]).unwrap_or(theme::LABEL);
-        let color = if involved { base } else if focus.is_some() { base.gamma_multiply(0.25) } else { base.gamma_multiply(0.7) };
+        let base = if e.inferred { theme::LABEL } else { group_color(tab.groups[e.from_table]).unwrap_or(theme::LABEL) };
+        let color = if involved && e.inferred { theme::TEXT } else if involved { base } else if focus.is_some() { base.gamma_multiply(0.25) } else { base.gamma_multiply(0.7) };
         let width = if involved { 2.0_f32 } else { 1.2_f32 };
         paint_edge(p, tab, origin, e, Stroke::new(width, color));
     }
@@ -397,7 +408,13 @@ fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &dbzilla_cor
         let (a, b) = (pos2(from.max.x, y1), pos2(to.max.x, y2));
         (a, b, a + vec2(reach, 0.0), b + vec2(reach, 0.0))
     };
-    p.add(egui::epaint::CubicBezierShape::from_points_stroke([a, c1, c2, b], false, Color32::TRANSPARENT, stroke));
+    let curve = egui::epaint::CubicBezierShape::from_points_stroke([a, c1, c2, b], false, Color32::TRANSPARENT, stroke);
+    if e.inferred {
+        let dash = 6.0 * z.max(0.6);
+        p.extend(egui::Shape::dashed_line(&curve.flatten(Some(0.5)), stroke, dash, dash * 0.7));
+    } else {
+        p.add(curve);
+    }
     p.circle_filled(a, 2.5 * z.max(0.6), stroke.color);
     // the referenced end gets a small arrow head
     let dir = if (b.x - c2.x).abs() < f32::EPSILON { vec2(1.0, 0.0) } else { (b - c2).normalized() };

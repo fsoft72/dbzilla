@@ -3358,10 +3358,26 @@ mod tests {
         wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
         let d = ws.diagram_tab_mut().unwrap();
         assert_eq!(d.table_count(), 3, "t, p and c; the view is left out");
-        assert_eq!(d.edge_count(), 1);
+        assert_eq!(d.edge_count(false), 1);
+        assert_eq!(d.edge_count(true), 0);
         assert!(d.skipped.is_empty(), "{:?}", d.skipped);
         ws.diagram_action(ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id, DiagramAction::Close);
         assert!(ws.diagram_tab_mut().is_none());
+    }
+
+    /// A column named like a reference, with no foreign key, gets a guessed link.
+    #[test]
+    fn diagram_guesses_links_from_column_names() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, id_user INTEGER);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let d = ws.diagram_tab_mut().unwrap();
+        assert_eq!(d.edge_count(false), 0);
+        assert_eq!(d.edge_count(true), 1);
     }
 
     /// Moved tables come back where they were; Rearrange forgets them.
