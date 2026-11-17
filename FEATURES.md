@@ -31,21 +31,10 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 - [x] Warn in the link dialog when the two columns have different types
 - [x] Export the diagram as an SVG image (PNG not done)
 
-## Connections
-
-- [ ] SSH tunnel
-- [ ] Import and export of connection files (6.5)
-- [ ] Reopen last session: save the open workspaces and tabs on quit and restore them at launch (6.7). The setting exists but does nothing yet
-- [ ] Passcode to protect the application (14.6)
-
 ## Editor and settings
 
 - [ ] Keymap editor (14.5)
 - [ ] Verify the Vim key binding visually and fix what is off
-
-## AI
-
-- [ ] AI assistant (15): chat UI, OpenAI-compatible, Anthropic and Ollama providers with streaming, database access for the model, privacy options
 
 ## Other databases
 
