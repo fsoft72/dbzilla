@@ -17,7 +17,7 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 
 ## Tables and structure
 
-- [ ] Trigger editor: add, edit and delete triggers, `Mod+I` for a new one (8.8). Today the Structure tab only lists them
+- [x] Trigger editor: add, edit and delete triggers, `Mod+I` for a new one (8.8): MySQL/MariaDB and PostgreSQL, SQLite read only
 - [ ] Delete a real foreign key from the ER diagram (drop through the safe-mode gate)
 
 ## ER diagram

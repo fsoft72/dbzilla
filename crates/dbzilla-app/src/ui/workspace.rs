@@ -7,6 +7,7 @@ use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
 use super::diagram::{self, DiagramAction, DiagramTab};
+use super::triggers::{TriggerAction, TriggerEditor, TriggerEnv};
 use super::metrics::{self, MetricsAction, MetricsTab};
 use super::backup::{self, BackupAction, BackupSheet};
 use super::process::{self, ProcessAction, ProcessList};
@@ -121,6 +122,8 @@ impl TableTab {
 #[derive(Debug, Clone, Default)]
 struct DdlAfter {
     closed: Option<TableRef>,
+    /// A table whose structure is read again once the statements are over, done or failed.
+    reload: Option<TableRef>,
     message: String,
 }
 
@@ -386,7 +389,8 @@ pub struct Workspace {
     link_dialog: Option<LinkDialog>,
     /// The kind chosen the last time, offered again next time.
     link_kind: LinkKind,
-    triggers_for: Option<TabId>,
+    /// The trigger window, when open.
+    triggers: Option<TriggerEditor>,
     /// Functions a PostgreSQL trigger can call, as last listed by the server.
     trigger_functions: Vec<TableRef>,
     pending_copy: Option<(TableRef, ScriptKind)>,
@@ -478,7 +482,7 @@ impl Workspace {
             fk_dialog: None,
             link_dialog: None,
             link_kind: LinkKind::DiagramOnly,
-            triggers_for: None,
+            triggers: None,
             trigger_functions: Vec::new(),
             pending_copy: None,
             clipboard_out: None,
@@ -1037,6 +1041,12 @@ impl Workspace {
             Action::Redo => self.row_op(|t| {
                 t.data.pending.redo(&mut t.data.rows);
             }),
+            Action::AddRow if self.triggers.is_some() => {
+                let driver = self.conn.driver;
+                if let Some(t) = self.triggers.as_mut() {
+                    t.start_new(driver);
+                }
+            }
             Action::AddRow => self.row_op(|t| {
                 let cols = super::datatab::merge_columns(&t.data.columns, t.structure.as_ref());
                 if !cols.is_empty() {
@@ -1149,7 +1159,7 @@ impl Workspace {
                 if let Err(e) = generate_ddl(&op, dialect_for(self.conn.driver).as_ref()) {
                     return reopen(self, dialog, e.to_string());
                 }
-                self.submit_ddl(vec![op], DdlAfter { closed: None, message: format!("Foreign key from {}.{} to {}.{} created", l.from_table, l.from_column, l.to_table, l.to_column) });
+                self.submit_ddl(vec![op], DdlAfter { closed: None, reload: None, message: format!("Foreign key from {}.{} to {}.{} created", l.from_table, l.from_column, l.to_table, l.to_column) });
             }
         }
     }
@@ -1879,6 +1889,7 @@ impl Workspace {
                     self.retain_tabs(|t| !matches!(&t.kind, TabKind::Table(tt) if tt.table == closed));
                 }
                 self.notices.push((false, if after.message.is_empty() { "Done".into() } else { after.message }));
+                self.reload_structure(after.reload);
                 self.load_schema();
                 if let Some(d) = self.diagram_tab_mut() {
                     d.start_loading();
@@ -1915,10 +1926,18 @@ impl Workspace {
         self.fetch_tab_forced(id);
     }
 
+    /// Reads the structure of a table again, so what the tab shows is what the database has.
+    fn reload_structure(&mut self, table: Option<TableRef>) {
+        let Some(table) = table else { return };
+        self.structures.remove(&table);
+        self.session.send(Command::LoadStructure(table));
+    }
+
     /// A commit failed: nothing is lost, the changes stay pending.
     fn on_commit_error(&mut self, req: RequestId, error: String) {
         self.commit_log.remove(&req);
-        self.ddl_after.remove(&req);
+        let reload = self.ddl_after.remove(&req).and_then(|a| a.reload);
+        self.reload_structure(reload);
         let Some((id, kind)) = self.req_map.remove(&req) else { return };
         if kind == ReqKind::Commit {
             if let Some(t) = self.table_tab_mut(id) {
@@ -2350,7 +2369,7 @@ impl Workspace {
                 let first = self.objects.iter().find(|o| o.kind == ObjectKind::Table).map(|o| o.table.name.clone()).unwrap_or_default();
                 self.fk_dialog = Some(FkDialog { tab: id, col, ref_table: first, ref_columns: "id".into(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into() });
             }
-            StructAction::ShowTriggers => self.triggers_for = Some(id),
+            StructAction::ShowTriggers => self.open_triggers(id),
         }
     }
 
@@ -2890,12 +2909,12 @@ impl Workspace {
                                     let mut target = source.clone();
                                     target.name = name.trim().to_owned();
                                     let msg = format!("Cloned {} to {}", source.name, target.name);
-                                    self.submit_ddl(vec![StructuralOp::CloneTable { source, target, with_data }], DdlAfter { closed: None, message: msg });
+                                    self.submit_ddl(vec![StructuralOp::CloneTable { source, target, with_data }], DdlAfter { closed: None, reload: None, message: msg });
                                 }
                             }
                             OpDialog::Truncate { table, cascade, restart } => {
                                 let msg = format!("Truncated {}", table.name);
-                                self.submit_ddl(vec![StructuralOp::Truncate { table: table.clone(), cascade, restart_identity: restart }], DdlAfter { closed: None, message: msg });
+                                self.submit_ddl(vec![StructuralOp::Truncate { table: table.clone(), cascade, restart_identity: restart }], DdlAfter { closed: None, reload: None, message: msg });
                                 let tabs: Vec<TabId> = self.dock.iter_all_tabs().filter(|(_, t)| matches!(&t.kind, TabKind::Table(tt) if tt.table == table)).map(|(_, t)| t.id).collect();
                                 for id in tabs {
                                     if let Some(t) = self.table_tab_mut(id) {
@@ -2905,7 +2924,7 @@ impl Workspace {
                             }
                             OpDialog::Drop { table, cascade } => {
                                 let msg = format!("Deleted {}", table.name);
-                                self.submit_ddl(vec![StructuralOp::DropTable { table: table.clone(), cascade }], DdlAfter { closed: Some(table), message: msg });
+                                self.submit_ddl(vec![StructuralOp::DropTable { table: table.clone(), cascade }], DdlAfter { closed: Some(table), reload: None, message: msg });
                             }
                         }
                     }
@@ -3020,24 +3039,34 @@ impl Workspace {
                 None => {}
             }
         }
-        if let Some(id) = self.triggers_for {
-            let triggers = self.table_tab_mut(id).and_then(|t| t.structure.as_ref().map(|s| s.triggers.clone())).unwrap_or_default();
-            let mut close = false;
-            widgets::modal(ctx, "Triggers", |ui| {
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for t in &triggers {
-                        ui.label(widgets::semibold(format!("{}  {} {}", t.name, t.timing, t.event), 13.0).color(theme::SECONDARY));
-                        ui.add(egui::Label::new(RichText::new(&t.statement).monospace().color(theme::TEXT)).selectable(true));
-                        ui.add_space(6.0);
-                    }
-                });
-                if widgets::secondary_button(ui, "Close").clicked() {
-                    close = true;
-                }
-            });
-            if close {
-                self.triggers_for = None;
+        if self.triggers.is_some() {
+            self.triggers_window(ctx);
+        }
+    }
+
+    /// Opens the trigger window of a table tab and asks for the functions a PostgreSQL trigger can call.
+    fn open_triggers(&mut self, id: TabId) {
+        let Some(table) = self.table_tab_mut(id).map(|t| t.table.clone()) else { return };
+        if self.conn.driver == DriverId::Postgres {
+            self.session.send(Command::LoadTriggerFunctions { schema: table.schema.clone() });
+        }
+        self.triggers = Some(TriggerEditor::new(id, table));
+    }
+
+    /// Draws the trigger window and runs what it asks for.
+    fn triggers_window(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.triggers.take() else { return };
+        let triggers = self.table_tab_mut(editor.tab).and_then(|t| t.structure.as_ref().map(|s| s.triggers.clone())).unwrap_or_default();
+        let env = TriggerEnv { driver: self.conn.driver, triggers: &triggers, functions: &self.trigger_functions };
+        let mut keep = true;
+        for a in editor.show(ctx, &env) {
+            match a {
+                TriggerAction::Close => keep = false,
+                TriggerAction::Submit { ops, message } => self.submit_ddl(ops, DdlAfter { closed: None, reload: Some(editor.table.clone()), message }),
             }
+        }
+        if keep {
+            self.triggers = Some(editor);
         }
     }
 
@@ -3739,7 +3768,7 @@ mod tests {
         assert_eq!(count("t_clone"), 2);
         ws.submit_ddl(vec![StructuralOp::Truncate { table: TableRef::simple("t_clone"), cascade: false, restart_identity: false }], DdlAfter::default());
         wait(&mut ws, |_| count("t_clone") == 0);
-        ws.submit_ddl(vec![StructuralOp::DropTable { table: TableRef::simple("t"), cascade: false }], DdlAfter { closed: Some(TableRef::simple("t")), message: String::new() });
+        ws.submit_ddl(vec![StructuralOp::DropTable { table: TableRef::simple("t"), cascade: false }], DdlAfter { closed: Some(TableRef::simple("t")), reload: None, message: String::new() });
         wait(&mut ws, |w| !w.objects.iter().any(|o| o.table.name == "t") && w.dock.iter_all_tabs().next().is_none());
     }
 
@@ -4011,6 +4040,149 @@ mod tests {
         let req = RequestId::next();
         ws.apply(Event::Timeout { req });
         assert_eq!(ws.timeout_req, Some(req));
+    }
+
+    /// Triggers of the active table tab, once its structure is there.
+    fn active_triggers(ws: &mut Workspace) -> Vec<String> {
+        ws.active_tab_mut().and_then(|(_, t)| t.structure.as_ref().map(|s| s.triggers.iter().map(|t| t.name.clone()).collect())).unwrap_or_default()
+    }
+
+    /// SQLite triggers are shown but never edited: no draft can be started and nothing reaches the gate.
+    #[test]
+    fn triggers_window_is_read_only_on_sqlite() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;").unwrap();
+        open_t(&mut ws);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| t.structure.is_some()));
+        let id = ws.active_tab_mut().unwrap().0;
+        ws.reload_structure(Some(TableRef::simple("t")));
+        wait(&mut ws, |w| active_triggers(w) == vec!["trg".to_owned()]);
+        ws.open_triggers(id);
+        assert!(ws.triggers.is_some());
+        ws.handle_action(Action::AddRow);
+        assert!(ws.triggers.as_ref().unwrap().draft().is_none(), "Mod+I starts nothing on SQLite");
+        assert!(ws.gate.is_none());
+        assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM sqlite_master WHERE type = 'trigger'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    /// Create, edit and delete a trigger through the workspace, checking the server after every step.
+    fn exercise_triggers(rt: &tokio::runtime::Runtime, cfg: ConnectConfig, create: &[&str], count_sql: &str) {
+        use super::super::triggers::TriggerDraft;
+        server_exec(rt, &cfg, create);
+        let (_dir, mut ws) = remote(rt, cfg.clone());
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "items"));
+        let target = ws.objects.iter().find(|o| o.table.name == "items").map(|o| o.table.clone()).unwrap();
+        ws.open_table(target.clone(), OpenMode::Pin);
+        let loc = ws.dock.iter_all_tabs().next().map(|(l, _)| l).unwrap();
+        ws.dock.set_focused_node_and_surface(loc);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| t.structure.is_some()));
+        let id = ws.active_tab_mut().unwrap().0;
+        ws.open_triggers(id);
+        let driver = ws.conn.driver;
+        if driver == DriverId::Postgres {
+            wait(&mut ws, |w| !w.trigger_functions.is_empty());
+        }
+        // Mod+I starts a new trigger
+        ws.handle_action(Action::AddRow);
+        assert!(ws.triggers.as_ref().unwrap().draft().is_some());
+        let mut draft = TriggerDraft::blank(driver);
+        draft.name = "trg_items".into();
+        draft.function = ws.trigger_functions.first().cloned();
+        draft.body = "SET NEW.qty = 1".into();
+        let table = ws.table_tab_mut(id).unwrap().table.clone();
+        let save = |ws: &mut Workspace, d: &TriggerDraft| {
+            let ops = d.to_ops(&table).unwrap();
+            ws.submit_ddl(ops, DdlAfter { closed: None, reload: Some(table.clone()), message: "saved".into() });
+        };
+        save(&mut ws, &draft);
+        wait(&mut ws, |w| active_triggers(w) == vec!["trg_items".to_owned()]);
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(1));
+        // edit: AFTER instead of BEFORE, same name
+        let info = ws.active_tab_mut().unwrap().1.structure.as_ref().unwrap().triggers[0].clone();
+        assert_eq!(info.timing, "BEFORE");
+        let mut edited = TriggerDraft::from_info(&info, driver);
+        edited.timing = "AFTER".into();
+        if driver == DriverId::MySql {
+            edited.body = "SET @x = 1".into();
+        }
+        save(&mut ws, &edited);
+        wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| t.structure.as_ref().is_some_and(|s| s.triggers.len() == 1 && s.triggers[0].timing == "AFTER")));
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(1), "the edit replaced the trigger, it did not add one");
+        // a form with no name never reaches the server
+        let mut bad = TriggerDraft::from_info(&ws.active_tab_mut().unwrap().1.structure.as_ref().unwrap().triggers[0].clone(), driver);
+        bad.name.clear();
+        assert!(bad.to_ops(&table).is_err());
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(1));
+        // delete
+        ws.submit_ddl(super::super::triggers::delete_ops(&table, "trg_items"), DdlAfter { closed: None, reload: Some(table.clone()), message: "deleted".into() });
+        wait(&mut ws, |w| active_triggers(w).is_empty());
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(0));
+        // an edit the server refuses: PostgreSQL rolls the drop back, MySQL cannot, and either way the list shows the truth
+        save(&mut ws, &draft);
+        wait(&mut ws, |w| active_triggers(w) == vec!["trg_items".to_owned()]);
+        let info = ws.active_tab_mut().unwrap().1.structure.as_ref().unwrap().triggers[0].clone();
+        let mut refused = TriggerDraft::from_info(&info, driver);
+        if driver == DriverId::MySql {
+            refused.body = "SET NEW.qty = =".into();
+        } else {
+            refused.function = Some(TableRef { database: None, schema: Some("public".into()), name: "missing".into() });
+        }
+        ws.notices.clear();
+        save(&mut ws, &refused);
+        wait(&mut ws, |w| w.notices.iter().any(|n| n.0));
+        let expected = if driver == DriverId::MySql { 0 } else { 1 };
+        wait(&mut ws, |w| active_triggers(w).len() == expected);
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(expected as i64));
+    }
+
+    /// The trigger editor on a real PostgreSQL server.
+    #[test]
+    fn postgres_trigger_create_edit_delete() {
+        const LABEL: &str = "dbzilla-test-app-pg-trg";
+        let Some(c) = crate::testsupport::start(LABEL, "postgres:16-alpine", &[("POSTGRES_PASSWORD", "pw")], 5432) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cfg = ConnectConfig { driver: DriverId::Postgres, host: "127.0.0.1".into(), port: Some(c.port), user: "postgres".into(), password: Some("pw".into()), database: "postgres".into(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        wait_for_server(&rt, &cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_triggers(
+                &rt,
+                cfg.clone(),
+                &["CREATE TABLE items (id serial PRIMARY KEY, name text, qty int)", "CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"],
+                "SELECT count(*) FROM pg_trigger WHERE tgname = 'trg_items' AND NOT tgisinternal",
+            );
+        }));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// The trigger editor on a real MySQL server.
+    #[test]
+    fn mysql_trigger_create_edit_delete() {
+        const LABEL: &str = "dbzilla-test-app-mysql-trg";
+        let Some(c) = crate::testsupport::start(LABEL, "mysql:8.4", &[("MYSQL_ROOT_PASSWORD", "pw"), ("MYSQL_DATABASE", "shop")], 3306) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cfg = ConnectConfig { driver: DriverId::MySql, host: "127.0.0.1".into(), port: Some(c.port), user: "root".into(), password: Some("pw".into()), database: "shop".into(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        wait_for_server(&rt, &cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_triggers(
+                &rt,
+                cfg.clone(),
+                &["CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(40), qty INT) ENGINE=InnoDB"],
+                "SELECT count(*) FROM information_schema.triggers WHERE trigger_schema = 'shop' AND trigger_name = 'trg_items'",
+            );
+        }));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     // ---- real PostgreSQL and MySQL servers (skipped without Docker) ----
