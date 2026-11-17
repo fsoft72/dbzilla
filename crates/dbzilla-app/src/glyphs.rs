@@ -47,6 +47,8 @@ pub enum Ico {
     Plug,
     Info,
     Warning,
+    /// Circle with an exclamation mark (notifications).
+    Alert,
     Menu,
     Grip,
     File,
@@ -223,6 +225,11 @@ pub fn paint(p: &Painter, rect: Rect, ico: Ico, color: Color32) {
             ring(8.0, 8.0, 6.0);
             dot(8.0, 5.0, 0.9);
             line(pt(8.0, 7.5), pt(8.0, 11.5));
+        }
+        Ico::Alert => {
+            ring(8.0, 8.0, 6.0);
+            line(pt(8.0, 4.5), pt(8.0, 9.0));
+            dot(8.0, 11.2, 0.9);
         }
         Ico::Warning => {
             poly(&[(8.0, 2.5), (14.0, 13.0), (2.0, 13.0)], true);
