@@ -234,6 +234,10 @@ impl Actor {
                 Ok((tables, skipped)) => self.out.emit(Event::Diagram { schema, tables, skipped }).await,
                 Err(e) => self.out.emit(Event::Error { error: format!("cannot read the schema for the diagram: {e}") }).await,
             },
+            Command::LoadTriggerFunctions { schema } => match conn.trigger_functions(schema.as_deref()).await {
+                Ok(functions) => self.out.emit(Event::TriggerFunctions { schema, functions }).await,
+                Err(e) => self.out.emit(Event::Error { error: format!("cannot list the trigger functions: {e}") }).await,
+            },
             Command::EstimateCount { req, table } => {
                 let count = conn.estimate_count(&table).await.unwrap_or(None);
                 self.out.emit(Event::Estimate { req, count }).await;

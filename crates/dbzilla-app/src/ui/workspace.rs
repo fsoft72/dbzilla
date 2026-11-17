@@ -387,6 +387,8 @@ pub struct Workspace {
     /// The kind chosen the last time, offered again next time.
     link_kind: LinkKind,
     triggers_for: Option<TabId>,
+    /// Functions a PostgreSQL trigger can call, as last listed by the server.
+    trigger_functions: Vec<TableRef>,
     pending_copy: Option<(TableRef, ScriptKind)>,
     clipboard_out: Option<String>,
     /// The process list sheet, when open.
@@ -477,6 +479,7 @@ impl Workspace {
             link_dialog: None,
             link_kind: LinkKind::DiagramOnly,
             triggers_for: None,
+            trigger_functions: Vec::new(),
             pending_copy: None,
             clipboard_out: None,
             process: None,
@@ -626,6 +629,7 @@ impl Workspace {
                 self.objects = objects;
             }
             Event::Structure(st) => self.apply_structure(*st),
+            Event::TriggerFunctions { functions, .. } => self.trigger_functions = functions,
             Event::Diagram { tables, skipped, .. } => {
                 let key = self.diagram_key();
                 let (saved, links) = (self.diagrams.load(&key), self.diagrams.load_links(&key));

@@ -86,6 +86,17 @@ async fn connect_then_introspect() {
 }
 
 #[tokio::test]
+async fn load_trigger_functions_on_sqlite_returns_an_empty_list() {
+    let (_d, path) = make_db();
+    let (mut h, _) = start(SessionConfig::default());
+    h.send(Command::Connect(sqlite_cfg(&path)));
+    until(&mut h, |e| matches!(e, Event::Connected { .. })).await;
+    h.send(Command::LoadTriggerFunctions { schema: None });
+    let events = until(&mut h, |e| matches!(e, Event::TriggerFunctions { .. })).await;
+    assert!(matches!(events.last(), Some(Event::TriggerFunctions { schema: None, functions }) if functions.is_empty()));
+}
+
+#[tokio::test]
 async fn connect_failure_is_reported() {
     let (_d, path) = make_db();
     let (mut h, _) = start(SessionConfig::default());
