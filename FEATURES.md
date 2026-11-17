@@ -39,7 +39,7 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 ## Other databases
 
 - [x] SQL Server driver (SPEC 1.1, Tier 2): browse, structure, data with paging, editor, pending changes, cancel with `KILL`, process list with kill. Needs `DBZILLA_TEST_MSSQL=1` for its tests
-- [ ] SQL Server, still missing: editing columns, primary keys and triggers, backup and restore, user management, encoding menu, Windows authentication and Entra ID login, named instances, MCP read-only queries
+- [ ] SQL Server, still missing: editing columns, primary keys and triggers, backup and restore, user management, encoding menu, Windows authentication and Entra ID login, named instances, MCP read-only queries, `GO` batch separator and `CREATE PROCEDURE/TRIGGER` bodies in the editor (the splitter cuts at every `;`), PRINT messages, `LIKE` filters with `[`, rename table, `IDENTITY` in the copied `CREATE TABLE`
 - [ ] Tier 2 drivers, still missing: DuckDB, CockroachDB/Redshift/Greenplum, ClickHouse
 - [ ] Tier 3 document-style databases (13)
 

@@ -79,3 +79,19 @@ fn other_dialects_keep_the_limit_suffix() {
         assert_eq!(apply_row_limit_for(dialect_for(id).as_ref(), "SELECT * FROM t", Some(100)), "SELECT * FROM t\nLIMIT 100");
     }
 }
+
+#[test]
+fn sqlserver_leaves_statements_alone_when_an_order_by_would_be_an_error() {
+    let d = dialect_for(DriverId::SqlServer);
+    for sql in [
+        "SELECT a FROM t UNION SELECT a FROM u",
+        "SELECT a FROM t INTERSECT SELECT a FROM u",
+        "SELECT a FROM t EXCEPT SELECT a FROM u",
+        "SELECT DISTINCT a FROM t",
+        "SELECT a FROM t FOR JSON PATH",
+        "SELECT a FROM t OPTION (MAXDOP 1)",
+    ] {
+        assert_eq!(apply_row_limit_for(d.as_ref(), sql, Some(10)), sql, "{sql}");
+    }
+    assert!(apply_row_limit_for(d.as_ref(), "SELECT COUNT(DISTINCT a) FROM t", Some(10)).ends_with("FETCH NEXT 10 ROWS ONLY"), "DISTINCT inside a function is fine");
+}

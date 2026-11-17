@@ -10,6 +10,8 @@ use dbzilla_core::model::{ObjectKind, TableRef};
 use dbzilla_core::value::Value;
 use dbzilla_core::dialect::dialect_for;
 use dbzilla_drivers::{driver_for, ConnectConfig, Conn, DriverError, NewDatabase, QueryOpts, SslMode};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::{collect, opts, rows_of, Container};
 use uuid::Uuid;
@@ -323,18 +325,6 @@ async fn a_failing_query_is_a_query_error_and_the_connection_survives() {
     assert_eq!(rows_of(&batches), vec![vec![Value::I64(1)]]);
 }
 
-#[tokio::test]
-async fn timeout_fails_and_the_connection_recovers() {
-    let Some(c) = container().await else { return };
-    let mut conn = connect(c.port, "").await;
-    let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let started = Instant::now();
-    let err = conn.query_stream("WAITFOR DELAY '00:00:20'", QueryOpts { timeout: Duration::from_secs(1), ..opts() }, tx).await.expect_err("must time out");
-    assert!(matches!(&err, DriverError::Query(m) if m.contains("timed out")), "{err:?}");
-    assert!(started.elapsed() < Duration::from_secs(10));
-    conn.ping().await.unwrap();
-}
-
 /// Recreates `dbo.<table>` in the `t7_batch` database and returns a connection working in it. Every test has its
 /// own table, so they can run in parallel.
 async fn batch_fixture(port: u16, table: &str) -> Box<dyn Conn> {
@@ -468,23 +458,6 @@ async fn a_cancel_token_taken_after_a_cancel_targets_the_new_session() {
 }
 
 #[tokio::test]
-async fn timeout_stops_the_work_on_the_server() {
-    let Some(c) = container().await else { return };
-    let mut conn = connect(c.port, "").await;
-    let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let err = conn.query_stream("WAITFOR DELAY '00:00:21'", QueryOpts { timeout: Duration::from_secs(1), ..opts() }, tx).await.expect_err("must time out");
-    assert!(matches!(&err, DriverError::Query(m) if m.contains("timed out")), "{err:?}");
-    let mut probe = connect(c.port, "").await;
-    let (batches, _) = collect(
-        &mut probe,
-        "SELECT COUNT(*) FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE t.text LIKE '%00:00:21%' AND t.text NOT LIKE '%dm_exec_requests%'",
-        opts(),
-    )
-    .await;
-    assert_eq!(rows_of(&batches), vec![vec![Value::I64(0)]], "the timed out query is still running on the server");
-}
-
-#[tokio::test]
 async fn a_transaction_opened_in_one_call_spans_the_next_calls() {
     let Some(c) = container().await else { return };
     let mut conn = batch_fixture(c.port, "t8_tx").await;
@@ -555,4 +528,197 @@ async fn the_editor_row_limit_and_top_script_run_on_sql_server() {
     }
     let (top, _) = collect(&mut conn, &d.select_top(&d.quote_table(&app_table("keyed")), 3), opts()).await;
     assert_eq!(rows_of(&top).len(), 3);
+}
+
+const PLAIN_PW: &str = "Plain_Pw_1234!";
+
+/// Creates a login that has no server permissions (and an optional default language).
+async fn make_login(port: u16, name: &str, language: Option<&str>) {
+    let lang = language.map(|l| format!(", DEFAULT_LANGUAGE = [{l}]")).unwrap_or_default();
+    raw_exec(port, &[&format!("IF SUSER_ID('{name}') IS NULL CREATE LOGIN [{name}] WITH PASSWORD = N'{PLAIN_PW}', CHECK_POLICY = OFF{lang}")]).await;
+}
+
+async fn connect_as(port: u16, user: &str) -> Box<dyn Conn> {
+    let mut config = cfg(port, "");
+    config.user = user.into();
+    config.password = Some(PLAIN_PW.into());
+    driver_for(DriverId::SqlServer).unwrap().connect(&config).await.unwrap_or_else(|e| panic!("login {user}: {e}"))
+}
+
+fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, m, d).unwrap()
+}
+
+#[tokio::test]
+async fn a_dmy_language_login_reads_dates_the_way_they_are_written() {
+    let Some(c) = container().await else { return };
+    make_login(c.port, "dmy_user", Some("Italian")).await;
+    let mut conn = connect_as(c.port, "dmy_user").await;
+    let expected = vec![vec![Value::DateTime(day(2026, 11, 5).and_hms_opt(10, 0, 0).unwrap())]];
+    let literal = dialect_for(DriverId::SqlServer).literal(&Value::DateTime(day(2026, 11, 5).and_hms_opt(10, 0, 0).unwrap()));
+    let (b, _) = collect(&mut conn, &format!("SELECT CAST({literal} AS datetime)"), opts()).await;
+    assert_eq!(rows_of(&b), expected, "the literal of the dialect must not depend on the login language");
+    let (b, _) = collect(&mut conn, "SELECT CAST('2026-11-05 10:00:00' AS datetime)", opts()).await;
+    assert_eq!(rows_of(&b), expected, "typed ISO text must be read as year-month-day");
+}
+
+#[tokio::test]
+async fn legacy_datetime_keeps_milliseconds_and_its_literal_is_accepted() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let (b, _) = collect(&mut conn, "SELECT CAST('2020-01-02T03:04:05.997' AS datetime), CAST('2020-01-02T03:04:05.003' AS datetime)", opts()).await;
+    let row = rows_of(&b).remove(0);
+    assert_eq!(row[0], Value::DateTime(day(2020, 1, 2).and_hms_milli_opt(3, 4, 5, 997).unwrap()));
+    assert_eq!(row[1], Value::DateTime(day(2020, 1, 2).and_hms_milli_opt(3, 4, 5, 3).unwrap()));
+    let d = dialect_for(DriverId::SqlServer);
+    for v in [&row[0], &row[1]] {
+        let (back, _) = collect(&mut conn, &format!("SELECT CAST({} AS datetime)", d.literal(v)), opts()).await;
+        assert_eq!(&rows_of(&back)[0][0], v, "{}", d.literal(v));
+    }
+}
+
+static DML: OnceCell<()> = OnceCell::const_new();
+
+/// Table with an audit trigger that does not silence its row counts.
+async fn dml_fixture(port: u16) {
+    DML.get_or_init(|| async move {
+        raw_exec(port, &["IF DB_ID('t12_dml') IS NULL CREATE DATABASE t12_dml"]).await;
+        raw_exec(
+            port,
+            &[
+                "USE t12_dml; CREATE TABLE dbo.items (id int PRIMARY KEY, note nvarchar(50), [Output] int NULL)",
+                "USE t12_dml; CREATE TABLE dbo.audit (id int IDENTITY, msg nvarchar(50))",
+                "USE t12_dml; EXEC('CREATE TRIGGER dbo.trg_items ON dbo.items AFTER UPDATE AS INSERT INTO dbo.audit (msg) SELECT N''u'' FROM inserted')",
+                "USE t12_dml; INSERT INTO dbo.items (id, note) VALUES (1, N'a'), (2, N'b')",
+                "USE t12_dml; CREATE TABLE dbo.plain (id int PRIMARY KEY, note nvarchar(50))",
+                "USE t12_dml; INSERT INTO dbo.plain (id, note) VALUES (7, N'p')",
+            ],
+        )
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn affected_rows_ignore_what_triggers_do_and_words_inside_text() {
+    let Some(c) = container().await else { return };
+    dml_fixture(c.port).await;
+    let mut conn = connect(c.port, "t12_dml").await;
+    for sql in ["UPDATE dbo.items SET note = N'x' WHERE id = 1", "UPDATE dbo.items SET note = N'see output' WHERE id = 1", "UPDATE dbo.items SET [Output] = 3 WHERE id = 1"] {
+        let (_, summary) = collect(&mut conn, sql, opts()).await;
+        assert_eq!(summary.affected, Some(1), "{sql}");
+        assert_eq!(conn.execute_batch(&[sql.to_owned()], false).await.unwrap(), vec![1], "{sql}");
+    }
+    let (batches, summary) = collect(&mut conn, "UPDATE dbo.plain SET note = N'y' OUTPUT inserted.id WHERE id = 7", opts()).await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::I64(7)]]);
+    assert_eq!(summary.affected, Some(1), "a statement with OUTPUT returns its rows and still reports the count");
+}
+
+#[tokio::test]
+async fn a_plain_user_can_cancel_and_a_second_cancel_is_harmless() {
+    let Some(c) = container().await else { return };
+    make_login(c.port, "plain_user", None).await;
+    let mut conn = connect_as(c.port, "plain_user").await;
+    let token = conn.cancel_handle().await.unwrap();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let first = token.cancel().await;
+        let second = token.cancel().await;
+        (first, second)
+    });
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let started = Instant::now();
+    let err = conn.query_stream("WAITFOR DELAY '00:00:30'", opts(), tx).await.expect_err("must be cancelled");
+    assert!(matches!(err, DriverError::Cancelled), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "cancel took {:?}", started.elapsed());
+    let (first, second) = canceller.await.unwrap();
+    assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}: a cancel never fails the caller");
+    conn.ping().await.expect("the connection works after a cancel");
+}
+
+#[tokio::test]
+async fn a_lost_connection_is_reported_not_silently_replaced() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let (b, _) = collect(&mut conn, "SELECT @@SPID", opts()).await;
+    let spid = match &rows_of(&b)[0][0] {
+        Value::I64(n) => *n,
+        other => panic!("{other:?}"),
+    };
+    raw_exec(c.port, &[&format!("KILL {spid}")]).await;
+    assert!(conn.ping().await.is_err(), "the first call after the loss fails");
+    assert!(conn.ping().await.is_err(), "the next one must not open a new session behind the user's back");
+}
+
+#[tokio::test]
+async fn the_default_timeout_does_not_cut_a_query_short() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let started = Instant::now();
+    conn.query_stream("WAITFOR DELAY '00:00:03'", QueryOpts { timeout: Duration::from_secs(1), ..opts() }, tx).await.expect("timing is the caller's business, as for the other drivers");
+    assert!(started.elapsed() >= Duration::from_secs(3));
+}
+
+/// A TCP forwarder that counts the connections it accepts.
+async fn counting_proxy(target: u16) -> (u16, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut out) = TcpStream::connect(("127.0.0.1", target)).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                }
+            });
+        }
+    });
+    (port, count)
+}
+
+#[tokio::test]
+async fn a_refused_login_is_not_retried_without_encryption() {
+    let Some(c) = container().await else { return };
+    let (port, count) = counting_proxy(c.port).await;
+    let mut bad = cfg(port, "");
+    bad.ssl = SslMode::Preferred;
+    bad.password = Some("wrong".into());
+    let err = driver_for(DriverId::SqlServer).unwrap().connect(&bad).await.err().expect("login must fail");
+    assert!(matches!(err, DriverError::Connect(_)), "{err:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "the password must not be sent a second time without TLS");
+}
+
+#[tokio::test]
+async fn renaming_a_database_in_use_fails_and_changes_nothing() {
+    let Some(c) = container().await else { return };
+    raw_exec(c.port, &["IF DB_ID('t8_busy') IS NULL CREATE DATABASE t8_busy"]).await;
+    let _holder = connect(c.port, "t8_busy").await;
+    let mut conn = connect(c.port, "").await;
+    let started = Instant::now();
+    assert!(conn.rename_database("t8_busy", "t8_busy_new").await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(30), "it must fail, not wait");
+    let names: Vec<String> = conn.list_databases().await.unwrap().into_iter().map(|d| d.name).collect();
+    assert!(names.contains(&"t8_busy".to_owned()) && !names.contains(&"t8_busy_new".to_owned()), "{names:?}");
+}
+
+#[tokio::test]
+async fn a_use_typed_in_the_editor_survives_a_reconnect() {
+    let Some(c) = container().await else { return };
+    raw_exec(c.port, &["IF DB_ID('t12_use') IS NULL CREATE DATABASE t12_use"]).await;
+    let mut conn = connect(c.port, "").await;
+    collect(&mut conn, "USE t12_use", opts()).await;
+    let token = conn.cancel_handle().await.unwrap();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        token.cancel().await
+    });
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    assert!(matches!(conn.query_stream("WAITFOR DELAY '00:00:30'", opts(), tx).await, Err(DriverError::Cancelled)));
+    canceller.await.unwrap().unwrap();
+    let (b, _) = collect(&mut conn, "SELECT DB_NAME()", opts()).await;
+    assert_eq!(rows_of(&b), vec![vec![Value::Text("t12_use".into())]], "the session came back in another database");
 }

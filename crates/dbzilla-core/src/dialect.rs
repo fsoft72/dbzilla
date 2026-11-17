@@ -25,6 +25,10 @@ pub trait Dialect: Send + Sync {
     fn limit_offset(&self, limit: u64, offset: u64) -> String {
         format!("LIMIT {limit} OFFSET {offset}")
     }
+    /// Statement that opens a transaction.
+    fn begin_transaction(&self) -> &'static str {
+        "BEGIN"
+    }
     /// Paging clause of the data tab. `has_order_by` is true when the statement already sorts, for the
     /// dialects (SQL Server) where paging is a syntax error without an `ORDER BY`.
     fn page_clause(&self, limit: u64, offset: u64, _has_order_by: bool) -> String {
@@ -267,6 +271,9 @@ impl Dialect for MySqlDialect {
     fn insert_defaults(&self, quoted_table: &str) -> String {
         format!("INSERT INTO {quoted_table} () VALUES ()")
     }
+    fn begin_transaction(&self) -> &'static str {
+        "START TRANSACTION"
+    }
     fn types(&self) -> &'static [&'static str] {
         &[
             "int", "bigint", "smallint", "tinyint", "decimal", "float", "double", "varchar", "char", "text",
@@ -292,8 +299,16 @@ impl Dialect for MsSqlDialect {
         match v {
             Value::Text(s) | Value::Geometry(s) | Value::Other(s) => format!("N{}", quote_text(s, false)),
             Value::Json(j) => format!("N{}", quote_text(&j.to_string(), false)),
+            // ISO 8601 with a `T`: the `YYYY-MM-DD HH:MM:SS` form is read as day-month for the legacy `datetime`
+            // types by logins whose language is Italian, German, French and so on.
+            Value::DateTime(d) => format!("'{}T{}{}'", d.date(), d.time().format("%H:%M:%S"), sql_server_fraction(d.and_utc().timestamp_subsec_nanos())),
+            Value::DateTimeTz(d) => format!("'{}T{}{}{}'", d.date_naive(), d.time().format("%H:%M:%S"), sql_server_fraction(d.timestamp_subsec_nanos()), d.format("%:z")),
             other => literal_common(other, false, |b| if b { "1" } else { "0" }, |b| format!("0x{}", hex(b))),
         }
+    }
+    fn begin_transaction(&self) -> &'static str {
+        // A bare BEGIN starts a block in T-SQL.
+        "BEGIN TRANSACTION"
     }
     fn limit_offset(&self, limit: u64, offset: u64) -> String {
         format!("OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
@@ -306,7 +321,9 @@ impl Dialect for MsSqlDialect {
         self.page_clause(n, 0, has_order_by)
     }
     fn extra_limit_blockers(&self) -> &'static [&'static str] {
-        &["OFFSET"]
+        // OFFSET/FETCH needs an ORDER BY, which is an error after a set operator or DISTINCT (it must name
+        // select-list items) and a syntax error after OPTION or FOR XML/JSON: those statements stay unlimited.
+        &["OFFSET", "UNION", "INTERSECT", "EXCEPT", "DISTINCT", "OPTION", "FOR"]
     }
     fn select_top(&self, quoted_table: &str, n: u64) -> String {
         format!("SELECT TOP {n} * FROM {quoted_table};")
@@ -327,6 +344,13 @@ impl Dialect for MsSqlDialect {
     fn keywords(&self) -> &'static [&'static str] {
         MSSQL_KEYWORDS
     }
+}
+
+/// Fraction of a second for a SQL Server literal: up to seven digits, no trailing zeros, empty for a whole second.
+fn sql_server_fraction(nanos: u32) -> String {
+    let digits = format!("{:07}", (nanos % 1_000_000_000) / 100);
+    let trimmed = digits.trim_end_matches('0');
+    if trimmed.is_empty() { String::new() } else { format!(".{trimmed}") }
 }
 
 /// Keywords of T-SQL: the common ones plus the SQL Server specific ones.

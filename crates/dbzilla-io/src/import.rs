@@ -272,7 +272,7 @@ pub struct ImportSummary {
 
 /// Statement starting a transaction.
 fn begin_sql(driver: DriverId) -> &'static str {
-    if driver == DriverId::MySql { "START TRANSACTION" } else { "BEGIN" }
+    dialect_for(driver).begin_transaction()
 }
 
 /// Multi-row INSERT for a batch.
@@ -282,6 +282,7 @@ fn insert_sql(driver: DriverId, plan: &ImportPlan, cols: &[String], rows: &[Vec<
         (InsertMode::Replace, DriverId::MySql) => "REPLACE INTO",
         (InsertMode::Replace, DriverId::Sqlite) => "INSERT OR REPLACE INTO",
         (InsertMode::Replace, DriverId::Postgres) => return Err(IoError::Unsupported("REPLACE is not available on PostgreSQL; use update on duplicate".into())),
+        (InsertMode::Replace | InsertMode::UpdateOnDuplicate, DriverId::SqlServer) => return Err(IoError::Unsupported("SQL Server has no REPLACE or ON CONFLICT: import into an empty table or stop on error".into())),
         _ => "INSERT INTO",
     };
     let names = cols.iter().map(|c| d.quote_ident(c)).collect::<Vec<_>>().join(", ");
@@ -387,4 +388,27 @@ pub async fn run_sql_dump(conn: &mut dyn Conn, driver: DriverId, text: &str, pro
         progress(Progress { item: "SQL dump".into(), rows: (i + 1) as u64, done_items: i + 1, total_items: total });
     }
     Ok(total as u64)
+}
+
+#[cfg(test)]
+mod sqlserver_tests {
+    use super::*;
+
+    #[test]
+    fn every_driver_opens_its_import_transaction_correctly() {
+        assert_eq!(begin_sql(DriverId::SqlServer), "BEGIN TRANSACTION");
+        assert_eq!(begin_sql(DriverId::MySql), "START TRANSACTION");
+        assert_eq!(begin_sql(DriverId::Postgres), "BEGIN");
+    }
+
+    #[test]
+    fn sqlserver_refuses_the_insert_modes_it_cannot_write() {
+        let plan = |mode| ImportPlan { table: TableRef::simple("t"), create: None, mapping: vec![], mode, key_columns: vec!["id".into()] };
+        let rows = vec![vec![Value::I64(1), Value::Text("a".into())]];
+        let cols = vec!["id".to_owned(), "name".to_owned()];
+        for mode in [InsertMode::Replace, InsertMode::UpdateOnDuplicate] {
+            assert!(matches!(insert_sql(DriverId::SqlServer, &plan(mode), &cols, &rows), Err(IoError::Unsupported(_))), "{mode:?}");
+        }
+        assert!(insert_sql(DriverId::SqlServer, &plan(InsertMode::StopOnError), &cols, &rows).unwrap().starts_with("INSERT INTO [t]"));
+    }
 }

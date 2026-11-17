@@ -411,11 +411,7 @@ impl Actor {
 
 /// The statement that opens a transaction: MySQL has `START TRANSACTION`, and in T-SQL a bare `BEGIN` starts a block.
 fn begin_statement(driver: Option<DriverId>) -> &'static str {
-    match driver {
-        Some(DriverId::MySql) => "START TRANSACTION",
-        Some(DriverId::SqlServer) => "BEGIN TRANSACTION",
-        _ => "BEGIN",
-    }
+    driver.map_or("BEGIN", |d| dbzilla_core::dialect::dialect_for(d).begin_transaction())
 }
 
 /// Runs the statements in one transaction, one at a time. A row statement (UPDATE or DELETE) that

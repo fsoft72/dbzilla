@@ -8,9 +8,11 @@ use dbzilla_core::ddl::create_from_structure;
 use dbzilla_core::model::{ColumnMeta, ForeignKeyRef, IndexInfo, ObjectInfo, ObjectKind, TableRef, TableStructure, TriggerInfo};
 use dbzilla_core::value::Value;
 use futures_util::TryStreamExt;
+use chrono::{Duration as ChronoDuration, Timelike};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tiberius::{AuthMethod, Client, ColumnData, ColumnType, Config, EncryptionLevel, FromSql, QueryItem, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -139,9 +141,8 @@ fn wraps_whole(text: &str) -> bool {
     depth == 0
 }
 
-/// True for an `INSERT`, `UPDATE`, `DELETE` or `MERGE` that returns no rows (no `OUTPUT`). Those run through
-/// `execute`, the only call that reports the number of rows they changed.
-fn is_plain_dml(sql: &str) -> bool {
+/// First word of a statement, upper-cased, after leading comments (empty for an empty statement).
+fn first_word(sql: &str) -> String {
     let mut rest = sql.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
@@ -152,9 +153,28 @@ fn is_plain_dml(sql: &str) -> bool {
             break;
         }
     }
-    let mut words = rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').filter(|w| !w.is_empty());
-    let first = words.next().unwrap_or_default().to_ascii_uppercase();
-    matches!(first.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE") && !words.any(|w| w.eq_ignore_ascii_case("OUTPUT"))
+    rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').find(|w| !w.is_empty()).unwrap_or_default().to_ascii_uppercase()
+}
+
+/// True for a statement that starts with `INSERT`, `UPDATE`, `DELETE` or `MERGE`. Those get a trailing
+/// `SELECT ROWCOUNT_BIG()`: it is the only way to read how many rows the statement itself changed (what
+/// triggers do is not counted, which `execute` would) while keeping the session scope of the batch.
+fn starts_with_dml(sql: &str) -> bool {
+    matches!(first_word(sql).as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+}
+
+/// Column name of the row count appended to a DML statement.
+const COUNT_COLUMN: &str = "__dbzilla_rowcount";
+
+/// The statement followed by the query that reads its row count.
+fn with_row_count(sql: &str) -> String {
+    format!("{sql}\n;SELECT ROWCOUNT_BIG() AS {COUNT_COLUMN}")
+}
+
+/// Rounds to the nearest millisecond.
+fn round_to_millis(d: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+    let millis = (u64::from(d.nanosecond()) + 500_000) / 1_000_000;
+    d.with_nanosecond(0).unwrap_or(d) + ChronoDuration::milliseconds(millis as i64)
 }
 
 /// Converts one cell of a row to a [`Value`].
@@ -176,44 +196,66 @@ fn to_value(row: &Row, i: usize) -> Value {
         ColumnData::Binary(v) => v.as_ref().map_or(Value::Null, |b| Value::Bytes(b.to_vec())),
         ColumnData::Numeric(v) => v.map_or(Value::Null, |n| Value::Decimal(n.to_string())),
         ColumnData::Xml(v) => v.as_ref().map_or(Value::Null, |x| Value::Text(x.to_string())),
-        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
-            chrono::NaiveDateTime::from_sql(data).ok().flatten().map_or(Value::Null, Value::DateTime)
-        }
+        // The legacy datetime counts 1/300 s, which tiberius turns into nanoseconds (.997 arrives as .99666...):
+        // back to the milliseconds the server stores.
+        ColumnData::DateTime(_) => chrono::NaiveDateTime::from_sql(data).ok().flatten().map_or(Value::Null, |d| Value::DateTime(round_to_millis(d))),
+        ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => chrono::NaiveDateTime::from_sql(data).ok().flatten().map_or(Value::Null, Value::DateTime),
         ColumnData::Date(_) => chrono::NaiveDate::from_sql(data).ok().flatten().map_or(Value::Null, Value::Date),
         ColumnData::Time(_) => chrono::NaiveTime::from_sql(data).ok().flatten().map_or(Value::Null, Value::Time),
         ColumnData::DateTimeOffset(_) => chrono::DateTime::<chrono::FixedOffset>::from_sql(data).ok().flatten().map_or(Value::Null, Value::DateTimeTz),
     }
 }
 
-/// Runs one statement and streams its first result set; later result sets are read and dropped.
+/// What the rows that follow a metadata item belong to.
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    Rows,
+    Count,
+    Ignored,
+}
+
+/// Runs one statement and streams its first result set; later result sets are read and dropped. For a DML
+/// statement the last result set is the appended row count, which becomes `affected`.
 async fn run_statement(client: &mut MsClient, sql: &str, opts: &QueryOpts, tx: &RowSink) -> Result<QuerySummary, tiberius::error::Error> {
     let mut summary = QuerySummary::default();
-    if is_plain_dml(sql) {
-        summary.affected = Some(client.execute(sql, &[]).await?.total());
-        return Ok(summary);
-    }
-    let mut stream = client.simple_query(sql).await?;
+    let dml = starts_with_dml(sql);
+    let mut stream = if dml { client.simple_query(with_row_count(sql)).await? } else { client.simple_query(sql).await? };
     let batch_size = opts.batch_size.max(1);
     let (mut batch, mut total, mut width) = (Vec::with_capacity(batch_size), 0u64, 0usize);
     // `skip`: ignore the rows that follow (limit reached or nobody listens); `closed`: the receiver is gone.
     let (mut skip, mut closed) = (false, false);
+    let (mut section, mut streamed) = (Section::Ignored, false);
     while let Some(item) = stream.try_next().await? {
         match item {
-            QueryItem::Metadata(meta) if meta.result_index() == 0 => {
-                let columns: Vec<ColumnMeta> = meta.columns().iter().enumerate().map(|(i, c)| ColumnMeta { name: c.name().to_owned(), type_name: format!("{:?}", c.column_type()).to_lowercase(), nullable: true, ordinal: i, ..Default::default() }).collect();
-                width = columns.len();
-                closed = tx.send(RowBatch { columns: Some(columns), rows: vec![] }).await.is_err();
-                skip = closed;
-            }
-            QueryItem::Row(row) if row.result_index() == 0 && !skip => {
-                batch.push((0..width).map(|i| to_value(&row, i)).collect());
-                total += 1;
-                if batch.len() >= batch_size && tx.send(RowBatch { columns: None, rows: std::mem::take(&mut batch) }).await.is_err() {
-                    closed = true;
+            QueryItem::Metadata(meta) => {
+                let is_count = dml && meta.columns().len() == 1 && meta.columns()[0].name() == COUNT_COLUMN;
+                section = if is_count {
+                    Section::Count
+                } else if streamed {
+                    Section::Ignored
+                } else {
+                    Section::Rows
+                };
+                if section == Section::Rows {
+                    streamed = true;
+                    let columns: Vec<ColumnMeta> = meta.columns().iter().enumerate().map(|(i, c)| ColumnMeta { name: c.name().to_owned(), type_name: format!("{:?}", c.column_type()).to_lowercase(), nullable: true, ordinal: i, ..Default::default() }).collect();
+                    width = columns.len();
+                    closed = tx.send(RowBatch { columns: Some(columns), rows: vec![] }).await.is_err();
+                    skip = closed;
                 }
-                skip = closed || opts.limit.is_some_and(|l| total >= l);
             }
-            _ => {}
+            QueryItem::Row(row) => match section {
+                Section::Count => summary.affected = row.get::<i64, _>(0).and_then(|n| u64::try_from(n).ok()),
+                Section::Rows if !skip => {
+                    batch.push((0..width).map(|i| to_value(&row, i)).collect());
+                    total += 1;
+                    if batch.len() >= batch_size && tx.send(RowBatch { columns: None, rows: std::mem::take(&mut batch) }).await.is_err() {
+                        closed = true;
+                    }
+                    skip = closed || opts.limit.is_some_and(|l| total >= l);
+                }
+                _ => {}
+            },
         }
     }
     if !batch.is_empty() && !closed {
@@ -222,9 +264,16 @@ async fn run_statement(client: &mut MsClient, sql: &str, opts: &QueryOpts, tx: &
     Ok(summary)
 }
 
+/// Runs a DML statement without a sink and returns the rows it changed.
+async fn run_dml_counted(client: &mut MsClient, sql: &str) -> Result<u64, tiberius::error::Error> {
+    let sets = client.simple_query(with_row_count(sql)).await?.into_results().await?;
+    let count = sets.last().and_then(|rows| rows.first()).and_then(|row| row.get::<i64, _>(0)).unwrap_or(0);
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// Builds the tiberius settings. Encryption follows the TLS mode: PREFERRED and REQUIRED encrypt without
 /// checking the certificate (servers usually have a self-signed one), the VERIFY modes check it, and
-/// DISABLED encrypts only the login, as the server insists.
+/// DISABLED sends no encryption request (the server may still encrypt the login itself).
 fn build_config(cfg: &ConnectConfig, database: &str, ssl: SslMode) -> Config {
     let mut c = Config::new();
     c.host(&cfg.host);
@@ -249,34 +298,55 @@ fn build_config(cfg: &ConnectConfig, database: &str, ssl: SslMode) -> Config {
     c
 }
 
+/// Why a connection attempt failed: the server answered and said no (wrong password, no access), or the
+/// transport or the TLS negotiation did not work.
+struct ConnectFailure {
+    error: DriverError,
+    refused_by_server: bool,
+}
+
 /// Opens the socket and logs in.
-async fn connect_client(cfg: &ConnectConfig, database: &str, ssl: SslMode) -> DriverResult<MsClient> {
+async fn connect_client(cfg: &ConnectConfig, database: &str, ssl: SslMode) -> Result<MsClient, ConnectFailure> {
     let config = build_config(cfg, database, ssl);
     let addr = config.get_addr();
+    let failure = |message: String, refused_by_server: bool| ConnectFailure { error: DriverError::Connect(message), refused_by_server };
     let attempt = async {
-        let tcp = TcpStream::connect(&addr).await.map_err(|e| format!("cannot reach {addr}: {e}"))?;
-        tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-        Client::connect(config, tcp.compat_write()).await.map_err(|e| error_text(&e))
+        let tcp = TcpStream::connect(&addr).await.map_err(|e| failure(format!("cannot reach {addr}: {e}"), false))?;
+        tcp.set_nodelay(true).map_err(|e| failure(e.to_string(), false))?;
+        Client::connect(config, tcp.compat_write()).await.map_err(|e| failure(error_text(&e), matches!(e, tiberius::error::Error::Server(_))))
     };
     match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
-        Ok(Ok(client)) => Ok(client),
-        Ok(Err(message)) => Err(DriverError::Connect(message)),
-        Err(_) => Err(DriverError::Connect(format!("timed out connecting to {addr}"))),
+        Ok(result) => result,
+        Err(_) => Err(failure(format!("timed out connecting to {addr}"), false)),
     }
 }
 
-/// Opens a client; PREFERRED falls back to no encryption, as the other drivers do.
+/// Opens a client; PREFERRED falls back to no encryption when the encrypted attempt could not even be made
+/// (as the other drivers do), but never after the server refused the login: that would send the password
+/// again over a link that is not encrypted.
 async fn open_client(cfg: &ConnectConfig, database: &str) -> DriverResult<(MsClient, SslMode)> {
     match connect_client(cfg, database, cfg.ssl).await {
         Ok(c) => Ok((c, cfg.ssl)),
-        Err(_) if cfg.ssl == SslMode::Preferred => Ok((connect_client(cfg, database, SslMode::Disabled).await?, SslMode::Disabled)),
-        Err(e) => Err(e),
+        Err(first) if cfg.ssl == SslMode::Preferred && !first.refused_by_server => match connect_client(cfg, database, SslMode::Disabled).await {
+            Ok(c) => Ok((c, SslMode::Disabled)),
+            Err(second) => Err(second.error),
+        },
+        Err(failure) => Err(failure.error),
     }
 }
 
-/// Session setup: reliable row counts, the bootstrap commands, then the session id and current database.
-async fn init_session(client: &mut MsClient, cfg: &ConnectConfig) -> DriverResult<(i32, String)> {
-    let setup = std::iter::once("SET NOCOUNT OFF").chain(cfg.bootstrap.iter().map(String::as_str));
+/// What a fresh session tells about itself.
+struct SessionInfo {
+    spid: i32,
+    current_db: String,
+    /// `login_time` of the session in ISO 8601, to recognise it again when cancelling.
+    login_time: String,
+}
+
+/// Session setup: reliable row counts, year-month-day dates whatever the login language, the bootstrap
+/// commands, then the session id and current database.
+async fn init_session(client: &mut MsClient, cfg: &ConnectConfig) -> DriverResult<SessionInfo> {
+    let setup = ["SET NOCOUNT OFF", "SET DATEFORMAT ymd"].into_iter().chain(cfg.bootstrap.iter().map(String::as_str));
     for stmt in setup {
         let outcome = match client.simple_query(stmt).await {
             Ok(stream) => stream.into_results().await.map(|_| ()),
@@ -284,35 +354,65 @@ async fn init_session(client: &mut MsClient, cfg: &ConnectConfig) -> DriverResul
         };
         outcome.map_err(|e| DriverError::Connect(format!("bootstrap command failed: {}", error_text(&e))))?;
     }
-    let row = client.simple_query("SELECT CAST(@@SPID AS int), DB_NAME()").await.map_err(map_err)?.into_row().await.map_err(map_err)?;
+    let row = client
+        .simple_query("SELECT CAST(@@SPID AS int), DB_NAME(), CONVERT(varchar(30), login_time, 126) FROM sys.dm_exec_sessions WHERE session_id = @@SPID")
+        .await
+        .map_err(map_err)?
+        .into_row()
+        .await
+        .map_err(map_err)?;
     let row = row.ok_or_else(|| DriverError::Other("the server did not return its session id".into()))?;
-    Ok((row.get::<i32, _>(0).unwrap_or_default(), text(&row, 1)))
+    Ok(SessionInfo { spid: row.get::<i32, _>(0).unwrap_or_default(), current_db: text(&row, 1), login_time: text(&row, 2) })
 }
 
-/// Cancels by running `KILL <spid>` on a second connection. That ends the session and rolls back its
-/// transaction, which is what SQL Server documents for it; the connection reconnects on its next call.
+/// State shared between a connection and the cancel tokens made for it.
+#[derive(Default)]
+struct CancelState {
+    /// Wakes the running query so it can give up locally.
+    abort: Notify,
+    /// True while a statement runs: a token used before or after that does nothing.
+    active: AtomicBool,
+    /// Set when a token fired, so a broken socket reads as a cancel.
+    cancelled: AtomicBool,
+}
+
+/// Cancels a running statement. The statement is abandoned locally and the socket is dropped, which makes the
+/// server stop the request and roll back its transaction; that needs no permission. Then, best effort, a
+/// second connection also runs `KILL <spid>` (SPEC 5.3) to stop work the server would not notice, but only if
+/// the session id still belongs to our session: ids are reused quickly.
 struct MsCancel {
     cfg: ConnectConfig,
     ssl: SslMode,
     spid: i32,
-    /// Shared with the connection, so the broken socket of the killed session reads as a cancel.
-    cancelled: Arc<AtomicBool>,
+    login_time: String,
+    state: Arc<CancelState>,
+    /// A token acts once.
+    fired: AtomicBool,
 }
 
 #[async_trait]
 impl CancelToken for MsCancel {
     async fn cancel(&self) -> DriverResult<()> {
-        self.cancelled.store(true, Ordering::SeqCst);
-        let mut client = connect_client(&self.cfg, "", self.ssl).await?;
-        let kill = match client.simple_query(format!("KILL {}", self.spid)).await {
-            Ok(stream) => stream.into_results().await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        kill.map_err(map_err)
+        if !self.state.active.load(Ordering::SeqCst) || self.fired.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        self.state.abort.notify_one();
+        let kill = format!(
+            "IF EXISTS (SELECT 1 FROM sys.dm_exec_sessions WHERE session_id = {id} AND CONVERT(varchar(30), login_time, 126) = '{time}') KILL {id}",
+            id = self.spid,
+            time = self.login_time.replace('\'', "")
+        );
+        if let Ok(mut client) = connect_client(&self.cfg, &self.cfg.database, self.ssl).await {
+            if let Ok(stream) = client.simple_query(kill).await {
+                let _ = stream.into_results().await;
+            }
+        }
+        Ok(())
     }
 }
 
-/// An open connection. `client` is `None` after the socket died or the session was killed; the next call reconnects.
+/// An open connection. `client` is `None` after the socket was dropped on purpose (a cancel) or was lost.
 struct MsConn {
     client: Option<MsClient>,
     cfg: ConnectConfig,
@@ -320,26 +420,35 @@ struct MsConn {
     ssl: SslMode,
     /// Database the session works in; restored after a reconnect.
     current_db: String,
-    /// Server session id, used to cancel from a second connection.
+    /// Server session id and login time, used to cancel from a second connection.
     spid: i32,
-    /// Set by a cancel token; read by `query_stream` to report `Cancelled` instead of a broken socket.
-    cancelled: Arc<AtomicBool>,
+    login_time: String,
+    /// State of the next (or running) statement, shared with its cancel token.
+    cancel: Arc<CancelState>,
+    /// The socket died by itself: like the other drivers, report it instead of opening a new session behind
+    /// the user's back (an open transaction and the session settings would be gone).
+    lost: bool,
 }
 
 impl MsConn {
     /// Connects and prepares the session.
     async fn open(cfg: ConnectConfig) -> DriverResult<Self> {
         let (mut client, ssl) = open_client(&cfg, &cfg.database).await?;
-        let (spid, current_db) = init_session(&mut client, &cfg).await?;
-        Ok(Self { client: Some(client), cfg, ssl, current_db, spid, cancelled: Arc::new(AtomicBool::new(false)) })
+        let info = init_session(&mut client, &cfg).await?;
+        Ok(Self { client: Some(client), cfg, ssl, current_db: info.current_db, spid: info.spid, login_time: info.login_time, cancel: Arc::new(CancelState::default()), lost: false })
     }
 
-    /// The live client, reconnecting (and returning to `current_db`) when it is gone.
+    /// The live client. After a cancel it reconnects (and returns to `current_db`); after a lost connection it
+    /// reports the loss, and the session actor opens a new connection.
     async fn ensure_client(&mut self) -> DriverResult<&mut MsClient> {
         if self.client.is_none() {
-            let mut client = connect_client(&self.cfg, &self.current_db, self.ssl).await?;
-            let (spid, _) = init_session(&mut client, &self.cfg).await?;
-            self.spid = spid;
+            if self.lost {
+                return Err(DriverError::Connect("the connection to the server was lost".into()));
+            }
+            let mut client = connect_client(&self.cfg, &self.current_db, self.ssl).await.map_err(|f| f.error)?;
+            let info = init_session(&mut client, &self.cfg).await?;
+            self.spid = info.spid;
+            self.login_time = info.login_time;
             self.client = Some(client);
         }
         Ok(self.client.as_mut().expect("client was just set"))
@@ -349,6 +458,7 @@ impl MsConn {
     fn fail(&mut self, e: tiberius::error::Error) -> DriverError {
         if is_broken(&e) {
             self.client = None;
+            self.lost = true;
         }
         map_err(e)
     }
@@ -374,12 +484,19 @@ impl MsConn {
 
     /// Runs one statement and returns the rows it changed (0 when the server does not report a count).
     async fn run_counted(&mut self, sql: &str) -> DriverResult<u64> {
-        if !is_plain_dml(sql) {
+        if !starts_with_dml(sql) {
             return self.run(sql).await.map(|()| 0);
         }
         let client = self.ensure_client().await?;
-        let result = client.execute(sql, &[]).await.map(|r| r.total());
+        let result = run_dml_counted(client, sql).await;
         result.map_err(|e| self.fail(e))
+    }
+
+    /// Reads the database the session is in, after a `USE` typed in the editor.
+    async fn refresh_current_db(&mut self) {
+        if let Some(name) = self.rows("SELECT DB_NAME()").await.ok().and_then(|rows| rows.first().map(|r| text(r, 0))) {
+            self.current_db = name;
+        }
     }
 
     /// Leaves the database `name` for `master` when the session is inside it, so it can be renamed or dropped.
@@ -540,32 +657,39 @@ impl Conn for MsConn {
     async fn query_stream(&mut self, sql: &str, opts: QueryOpts, tx: RowSink) -> DriverResult<QuerySummary> {
         let start = Instant::now();
         self.ensure_client().await?;
-        self.cancelled.store(false, Ordering::SeqCst);
+        let state = Arc::clone(&self.cancel);
+        state.active.store(true, Ordering::SeqCst);
+        // No timeout here: like the other drivers, how long a query may run is up to the session (it asks the user).
         let outcome = {
             let client = self.client.as_mut().expect("client was just ensured");
-            tokio::time::timeout(opts.timeout, run_statement(client, sql, &opts, &tx)).await
-        };
-        if self.cancelled.load(Ordering::SeqCst) {
-            // The session was (or is being) killed: drop the socket so the next call opens a new one.
-            self.client = None;
-            return match outcome {
-                Ok(Ok(mut summary)) => {
-                    summary.elapsed = start.elapsed();
-                    Ok(summary)
-                }
-                _ => Err(DriverError::Cancelled),
-            };
-        }
-        match outcome {
-            Ok(Ok(mut summary)) => {
-                summary.elapsed = start.elapsed();
-                Ok(summary)
+            tokio::select! {
+                result = run_statement(client, sql, &opts, &tx) => Some(result),
+                () = state.abort.notified() => None,
             }
-            Ok(Err(e)) => Err(self.fail(e)),
-            Err(_) => {
-                // The half-read stream leaves the socket unusable: drop it, the next call reconnects.
+        };
+        state.active.store(false, Ordering::SeqCst);
+        let cancelled = state.cancelled.load(Ordering::SeqCst);
+        // Tokens made so far are spent; the next statement gets a fresh state.
+        self.cancel = Arc::new(CancelState::default());
+        match outcome {
+            None => {
                 self.client = None;
-                Err(DriverError::Query(format!("the query timed out after {} s", opts.timeout.as_secs())))
+                Err(DriverError::Cancelled)
+            }
+            Some(Err(_)) if cancelled => {
+                self.client = None;
+                Err(DriverError::Cancelled)
+            }
+            Some(Err(e)) => Err(self.fail(e)),
+            Some(Ok(mut summary)) => {
+                summary.elapsed = start.elapsed();
+                if cancelled {
+                    // A cancel that arrived as the statement ended: the session is being killed.
+                    self.client = None;
+                } else if first_word(sql) == "USE" {
+                    self.refresh_current_db().await;
+                }
+                Ok(summary)
             }
         }
     }
@@ -605,7 +729,7 @@ impl Conn for MsConn {
     async fn cancel_handle(&mut self) -> DriverResult<Box<dyn CancelToken>> {
         // After a cancel the session is gone: reconnect first, so the token holds the id of the live one.
         self.ensure_client().await?;
-        Ok(Box::new(MsCancel { cfg: self.cfg.clone(), ssl: self.ssl, spid: self.spid, cancelled: Arc::clone(&self.cancelled) }))
+        Ok(Box::new(MsCancel { cfg: self.cfg.clone(), ssl: self.ssl, spid: self.spid, login_time: self.login_time.clone(), state: Arc::clone(&self.cancel), fired: AtomicBool::new(false) }))
     }
 
     async fn ping(&mut self) -> DriverResult<()> {
@@ -630,12 +754,8 @@ impl Conn for MsConn {
 
     async fn rename_database(&mut self, from: &str, to: &str) -> DriverResult<()> {
         self.leave_database(from).await?;
-        let (old, new) = (q(from), q(to));
-        // Renaming needs exclusive access: other sessions are rolled back and disconnected first.
-        self.run(&format!("ALTER DATABASE {old} SET SINGLE_USER WITH ROLLBACK IMMEDIATE")).await?;
-        let renamed = self.run(&format!("ALTER DATABASE {old} MODIFY NAME = {new}")).await;
-        let reopened = self.run(&format!("ALTER DATABASE {} SET MULTI_USER", if renamed.is_ok() { &new } else { &old })).await;
-        renamed.and(reopened)
+        // The server refuses while other sessions use the database: that is reported, nobody is disconnected.
+        self.run(&format!("ALTER DATABASE {} MODIFY NAME = {}", q(from), q(to))).await
     }
 
     async fn drop_database(&mut self, name: &str) -> DriverResult<()> {
@@ -667,13 +787,22 @@ mod tests {
     }
 
     #[test]
-    fn plain_dml_is_told_apart_from_row_returning_statements() {
-        for sql in ["UPDATE t SET a = 1", "  -- note\n insert into t values (1)", "/* x */DELETE FROM t", "merge t using s on 1=1 when matched then delete;"] {
-            assert!(is_plain_dml(sql), "{sql}");
+    fn dml_is_told_apart_by_its_first_word() {
+        for sql in ["UPDATE t SET a = 1", "  -- note\n insert into t values (1)", "/* x */DELETE FROM t", "merge t using s on 1=1 when matched then delete;", "INSERT INTO t OUTPUT inserted.id VALUES (1)"] {
+            assert!(starts_with_dml(sql), "{sql}");
         }
-        for sql in ["SELECT 1", "INSERT INTO t OUTPUT inserted.id VALUES (1)", "WITH x AS (SELECT 1) UPDATE t SET a = 1", "EXEC p", "USE db", "CREATE TABLE t (a int)", ""] {
-            assert!(!is_plain_dml(sql), "{sql}");
+        for sql in ["SELECT 1", "WITH x AS (SELECT 1) UPDATE t SET a = 1", "EXEC p", "USE db", "CREATE TABLE t (a int)", ""] {
+            assert!(!starts_with_dml(sql), "{sql}");
         }
+        assert_eq!(first_word("/* c */ use  [db]"), "USE");
+    }
+
+    #[test]
+    fn the_legacy_datetime_is_rounded_to_milliseconds() {
+        let d = chrono::NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
+        assert_eq!(round_to_millis(d.and_hms_nano_opt(3, 4, 5, 996_666_666).unwrap()), d.and_hms_milli_opt(3, 4, 5, 997).unwrap());
+        assert_eq!(round_to_millis(d.and_hms_nano_opt(3, 4, 5, 3_333_333).unwrap()), d.and_hms_milli_opt(3, 4, 5, 3).unwrap());
+        assert_eq!(round_to_millis(d.and_hms_nano_opt(3, 4, 5, 999_700_000).unwrap()), d.and_hms_opt(3, 4, 6).unwrap());
     }
 
     #[test]

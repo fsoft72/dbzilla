@@ -141,3 +141,24 @@ fn sqlserver_literals_and_helpers() {
     assert_eq!(d.cast_text("x"), "CAST(x AS NVARCHAR(MAX))");
     assert_eq!(d.insert_defaults("[t]"), "INSERT INTO [t] DEFAULT VALUES");
 }
+
+#[test]
+fn sqlserver_date_literals_do_not_depend_on_the_login_language() {
+    use chrono::NaiveDate;
+    let d = dialect_for(DriverId::SqlServer);
+    let day = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+    assert_eq!(d.literal(&Value::DateTime(day.and_hms_opt(10, 0, 0).unwrap())), "'2026-11-05T10:00:00'");
+    assert_eq!(d.literal(&Value::DateTime(day.and_hms_milli_opt(10, 0, 0, 500).unwrap())), "'2026-11-05T10:00:00.5'");
+    assert_eq!(d.literal(&Value::DateTime(day.and_hms_nano_opt(10, 0, 0, 123_456_700).unwrap())), "'2026-11-05T10:00:00.1234567'");
+    assert_eq!(d.literal(&Value::DateTime(day.and_hms_nano_opt(10, 0, 0, 123_456_789).unwrap())), "'2026-11-05T10:00:00.1234567'", "SQL Server takes at most seven digits");
+    let tz = chrono::DateTime::parse_from_rfc3339("2026-11-05T10:00:00.25+02:00").unwrap();
+    assert_eq!(d.literal(&Value::DateTimeTz(tz)), "'2026-11-05T10:00:00.25+02:00'");
+}
+
+#[test]
+fn each_dialect_opens_a_transaction_in_its_own_words() {
+    assert_eq!(dialect_for(DriverId::MySql).begin_transaction(), "START TRANSACTION");
+    assert_eq!(dialect_for(DriverId::SqlServer).begin_transaction(), "BEGIN TRANSACTION");
+    assert_eq!(dialect_for(DriverId::Postgres).begin_transaction(), "BEGIN");
+    assert_eq!(dialect_for(DriverId::Sqlite).begin_transaction(), "BEGIN");
+}
