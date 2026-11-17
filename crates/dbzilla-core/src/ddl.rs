@@ -13,6 +13,8 @@ const REBUILD_SUFFIX: &str = "__new";
 pub enum DdlError {
     #[error("not supported: {0}")]
     Unsupported(String),
+    #[error("invalid: {0}")]
+    Invalid(String),
 }
 
 /// A column definition being created or altered.
@@ -46,6 +48,30 @@ pub struct IndexDef {
     pub columns: Vec<String>,
 }
 
+/// Whether a trigger runs once per row or once per statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerLevel {
+    #[default]
+    Row,
+    Statement,
+}
+
+/// A trigger being created. PostgreSQL calls `function`, MySQL runs `body`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerDef {
+    pub name: String,
+    /// `BEFORE` or `AFTER`.
+    pub timing: String,
+    /// `INSERT`, `UPDATE` or `DELETE`.
+    pub event: String,
+    /// Ignored by MySQL, which only has row level triggers.
+    pub level: TriggerLevel,
+    /// PostgreSQL: the trigger function.
+    pub function: Option<TableRef>,
+    /// MySQL: the statement or `BEGIN ... END` block.
+    pub body: String,
+}
+
 /// A queued structural change.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StructuralOp {
@@ -65,6 +91,8 @@ pub enum StructuralOp {
     AddForeignKey { table: TableRef, fk: ForeignKeyDef, current: Option<Box<TableStructure>> },
     DropForeignKey { table: TableRef, name: String },
     CloneTable { source: TableRef, target: TableRef, with_data: bool },
+    CreateTrigger { table: TableRef, trigger: TriggerDef },
+    DropTrigger { table: TableRef, name: String },
     /// Raw SQL (view or function definitions typed in a DDL editor).
     Raw(String),
 }
@@ -231,7 +259,43 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
             DriverId::Postgres => vec![format!("ALTER TABLE {} DROP CONSTRAINT {}", q(table), d.quote_ident(name))],
         },
         StructuralOp::CloneTable { source, target, with_data } => clone_table(d, source, target, *with_data),
+        StructuralOp::CreateTrigger { table, trigger } => vec![create_trigger_sql(d, table, trigger)?],
+        StructuralOp::DropTrigger { table, name } => vec![drop_trigger_sql(d, table, name)?],
         StructuralOp::Raw(sql) => vec![sql.clone()],
+    })
+}
+
+/// Checks a trigger definition, naming the first problem.
+fn validate_trigger(d: &dyn Dialect, t: &TriggerDef) -> Result<(), DdlError> {
+    let invalid = |m: &str| Err(DdlError::Invalid(m.into()));
+    if t.name.trim().is_empty() { return invalid("the trigger needs a name"); }
+    if !["BEFORE", "AFTER"].contains(&t.timing.as_str()) { return invalid("timing must be BEFORE or AFTER"); }
+    if !["INSERT", "UPDATE", "DELETE"].contains(&t.event.as_str()) { return invalid("event must be INSERT, UPDATE or DELETE"); }
+    if d.id() == DriverId::Postgres && t.function.is_none() { return invalid("choose the trigger function"); }
+    if d.id() == DriverId::MySql && t.body.trim().is_empty() { return invalid("the trigger body is empty"); }
+    Ok(())
+}
+
+/// `CREATE TRIGGER` for PostgreSQL (calls a function) and MySQL (inline body).
+fn create_trigger_sql(d: &dyn Dialect, table: &TableRef, t: &TriggerDef) -> Result<String, DdlError> {
+    if d.id() == DriverId::Sqlite { return Err(DdlError::Unsupported("triggers are read only on this database".into())); }
+    validate_trigger(d, t)?;
+    let head = format!("CREATE TRIGGER {} {} {} ON {}", d.quote_ident(&t.name), t.timing, t.event, d.quote_table(table));
+    Ok(match (d.id(), &t.function) {
+        (DriverId::Postgres, Some(f)) => {
+            let level = if t.level == TriggerLevel::Statement { "STATEMENT" } else { "ROW" };
+            format!("{head} FOR EACH {level} EXECUTE FUNCTION {}()", d.quote_table(f))
+        }
+        _ => format!("{head} FOR EACH ROW {}", t.body.trim()),
+    })
+}
+
+/// `DROP TRIGGER`: PostgreSQL names the table, MySQL qualifies the trigger with the table's database.
+fn drop_trigger_sql(d: &dyn Dialect, table: &TableRef, name: &str) -> Result<String, DdlError> {
+    Ok(match d.id() {
+        DriverId::Sqlite => return Err(DdlError::Unsupported("triggers are read only on this database".into())),
+        DriverId::Postgres => format!("DROP TRIGGER {} ON {}", d.quote_ident(name), d.quote_table(table)),
+        DriverId::MySql => format!("DROP TRIGGER {}", d.quote_table(&TableRef { database: table.database.clone(), schema: None, name: name.to_owned() })),
     })
 }
 
