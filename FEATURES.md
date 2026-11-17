@@ -22,8 +22,8 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 
 ## ER diagram
 
-- [ ] Add and delete tables from the diagram, through the pending changes (11.3)
-- [ ] Table settings popover: name, colour, structure editor, index editor
+- [x] Add and delete tables from the diagram, through the pending changes (11.3): Add table, Delete table, Undo, Redo, Apply (`Mod+S`), Discard
+- [x] Table settings window: colour, column editor, index editor (name is in the column editor), Delete table. Foreign keys are made by dragging, not from the column editor
 - [x] `Mod+F` shortcut for the diagram search, and Up and Down to move between matches (Enter and Shift+Enter too)
 - [x] Remember the "Inferred links" switch between openings (per diagram)
 - [-] Route lines around tables instead of behind them (dropped on purpose)

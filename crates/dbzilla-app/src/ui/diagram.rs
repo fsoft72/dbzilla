@@ -1,10 +1,15 @@
 //! ER diagram tab (SPEC 11.3): tables as boxes, one line per foreign key.
 
+use super::diagram_pending::{DiagramPending, Markers};
+use super::structure::{self, StructAction, StructEnv};
 use super::widgets;
 use crate::glyphs::Ico;
 use crate::theme;
+use dbzilla_core::caps::Capabilities;
+use dbzilla_core::ddl::StructuralOp;
 use dbzilla_core::diagram::{Diagram, DiagramEdge, DiagramSort, DocLink, EdgeKind};
-use dbzilla_core::model::TableStructure;
+use dbzilla_core::model::{TableRef, TableStructure};
+use std::collections::BTreeMap;
 use dbzilla_store::diagrams::Positions;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
@@ -46,6 +51,33 @@ pub enum DiagramAction {
     SetInferred(bool),
     /// A message for the user (error flag, text).
     Notice(bool, String),
+    /// Apply the pending changes to the database.
+    Apply,
+    /// The colours chosen for tables changed: keep them (table name to palette index).
+    SetColors(BTreeMap<String, usize>),
+}
+
+/// What the diagram needs to know about the database to edit tables.
+pub struct DiagramEnv<'a> {
+    pub caps: &'a Capabilities,
+    /// Data types of the dialect.
+    pub types: &'a [&'a str],
+}
+
+/// Page of the table settings window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Columns,
+    Indexes,
+}
+
+/// The table settings window.
+struct Settings {
+    /// Key of the draft: the name of an existing table, the current name of a new one.
+    key: String,
+    /// Name the table is drawn with.
+    shown: String,
+    page: SettingsPage,
 }
 
 /// A link being dragged from a column.
@@ -91,6 +123,19 @@ pub struct DiagramTab {
     save_pending: bool,
     /// Why a foreign key of the database cannot be dropped here, when it cannot.
     fk_drop_blocked: Option<String>,
+    /// Changes waiting to be applied.
+    pending: DiagramPending,
+    markers: Markers,
+    settings: Option<Settings>,
+    /// Table the right click menu was opened on, with the column under the pointer.
+    menu_table: Option<(usize, Option<usize>)>,
+    /// Palette index chosen for a table, by name.
+    colors: BTreeMap<String, usize>,
+    /// Where a new table is created (schema) and the type of its first column.
+    template: TableRef,
+    int_type: String,
+    /// Centre the view on this table at the next frame.
+    jump_to_name: Option<String>,
 }
 
 impl DiagramTab {
@@ -121,6 +166,104 @@ impl DiagramTab {
             menu_edge: None,
             save_pending: false,
             fk_drop_blocked: None,
+            pending: DiagramPending::default(),
+            markers: Markers::default(),
+            settings: None,
+            menu_table: None,
+            colors: BTreeMap::new(),
+            template: TableRef::default(),
+            int_type: "integer".into(),
+            jump_to_name: None,
+        }
+    }
+
+    /// Where new tables are created and the type of their first column.
+    pub fn configure(&mut self, template: TableRef, int_type: &str) {
+        self.template = template;
+        self.int_type = int_type.to_owned();
+    }
+
+    /// Colours chosen for tables.
+    pub fn set_colors(&mut self, colors: BTreeMap<String, usize>) {
+        self.colors = colors;
+    }
+
+    /// Number of pending changes.
+    pub fn pending_count(&self) -> usize {
+        self.pending.change_count()
+    }
+
+    /// The pending changes as operations, or the reason they cannot be applied.
+    pub fn pending_ops(&self, caps: &Capabilities, sqlite: bool) -> Result<Vec<StructuralOp>, String> {
+        self.pending.to_ops(&self.structures, caps, sqlite)
+    }
+
+    /// Forgets every pending change and closes the settings window.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.settings = None;
+        self.reapply(None);
+    }
+
+    /// Positions of every table, new ones included (to keep them once the tables exist).
+    pub fn positions_all(&self) -> Positions {
+        self.diagram.tables.iter().zip(&self.positions).map(|(t, p)| (t.name.clone(), *p)).collect()
+    }
+
+    /// Stages a foreign key from the column of a link to the other one.
+    pub fn stage_foreign_key(&mut self, link: &DocLink, name: Option<String>, on_update: &str, on_delete: &str) -> Result<(), String> {
+        self.pending.stage_fk(&self.structures, (&link.from_table, &link.from_column), (&link.to_table, &link.to_column), name, on_update, on_delete)?;
+        self.reapply(None);
+        Ok(())
+    }
+
+    /// Stages the drop of a foreign key of the database.
+    pub fn stage_drop_foreign_key(&mut self, table: &str, constraint: &str) {
+        self.pending.stage_drop_fk(table, constraint);
+        self.reapply(None);
+    }
+
+    /// Type of a column as the diagram draws it (pending changes included).
+    pub fn column_type(&self, table: &str, column: &str) -> Option<String> {
+        self.diagram.tables.iter().find(|t| t.name == table)?.columns.iter().find(|c| c.name == column).map(|c| c.type_name.clone())
+    }
+
+    /// Adds a table called `untitled_table_N`, selects it and opens its settings.
+    pub fn add_table(&mut self) {
+        let name = self.pending.add_table(&self.structures, &self.template, &self.int_type);
+        self.reapply(None);
+        self.open_settings(&name);
+        self.jump_to_name = Some(name);
+    }
+
+    /// Marks a table to be dropped.
+    pub fn drop_table(&mut self, name: &str) {
+        self.settings = None;
+        self.pending.drop_table(name);
+        self.reapply(None);
+    }
+
+    /// Opens the settings window of a table.
+    fn open_settings(&mut self, name: &str) {
+        if self.markers.dropped.contains(name) {
+            return;
+        }
+        self.settings = Some(Settings { key: name.to_owned(), shown: name.to_owned(), page: SettingsPage::Columns });
+    }
+
+    /// Goes back one pending step.
+    pub fn undo(&mut self) {
+        self.settings = None;
+        if self.pending.undo() {
+            self.reapply(None);
+        }
+    }
+
+    /// Goes forward one pending step.
+    pub fn redo(&mut self) {
+        self.settings = None;
+        if self.pending.redo() {
+            self.reapply(None);
         }
     }
 
@@ -212,16 +355,35 @@ impl DiagramTab {
         self.refresh_edges();
     }
 
-    /// Structure of the table called `name`.
-    pub fn structure(&self, name: &str) -> Option<&TableStructure> {
-        self.structures.iter().find(|s| s.table.name == name)
+    /// The diagram of the structures with the pending changes and the links drawn by the user.
+    fn build_diagram(&self) -> Diagram {
+        let mut d = Diagram::build(&self.pending.effective(&self.structures), self.sort);
+        d.add_manual(&self.links);
+        d
+    }
+
+    /// Draws again after a pending change: tables keep their positions by name (`renamed` is old and new name
+    /// of a table being renamed), the new ones are placed where they do not overlap.
+    fn reapply(&mut self, renamed: Option<(&str, &str)>) {
+        let mut by_name = self.positions_all();
+        let selected = self.selected.and_then(|i| self.diagram.tables.get(i)).map(|t| t.name.clone());
+        let selected = match (&selected, renamed) {
+            (Some(s), Some((old, new))) if s == old => Some(new.to_owned()),
+            _ => selected,
+        };
+        if let Some((old, new)) = renamed {
+            if let Some(p) = by_name.remove(old) {
+                by_name.insert(new.to_owned(), p);
+            }
+        }
+        self.relayout(Some(&by_name));
+        self.selected = selected.and_then(|n| self.diagram.tables.iter().position(|t| t.name == n));
+        self.refresh_search();
     }
 
     /// Rebuilds only the lines: the tables keep their order, so the positions stay valid.
     fn refresh_edges(&mut self) {
-        let mut d = Diagram::build(&self.structures, self.sort);
-        d.add_manual(&self.links);
-        self.diagram = d;
+        self.diagram = self.build_diagram();
         self.selected = self.selected.filter(|&i| i < self.positions.len());
     }
 
@@ -233,14 +395,23 @@ impl DiagramTab {
 
     /// Positions by table name, as kept in the store.
     fn positions_by_name(&self) -> Positions {
-        self.diagram.tables.iter().zip(&self.positions).map(|(t, p)| (t.name.clone(), *p)).collect()
+        self.diagram.tables.iter().zip(&self.positions).filter(|(t, _)| !self.markers.created.contains(&t.name)).map(|(t, p)| (t.name.clone(), *p)).collect()
     }
 
     /// Builds the diagram from the loaded tables with the current sort, and lays it out.
     /// A layout that does not come from the saved positions is saved.
     fn rebuild(&mut self, saved: Option<&Positions>) {
-        self.diagram = Diagram::build(&self.structures, self.sort);
-        self.diagram.add_manual(&self.links);
+        self.relayout(saved);
+        self.selected = None;
+        self.dragging = None;
+        self.fit_pending = true;
+        self.refresh_search();
+    }
+
+    /// Builds the diagram and lays it out, using `saved` positions when given (a new layout is saved).
+    fn relayout(&mut self, saved: Option<&Positions>) {
+        self.markers = self.pending.markers();
+        self.diagram = self.build_diagram();
         self.groups = self.diagram.groups();
         self.sizes = self.diagram.tables.iter().map(box_size).collect();
         self.positions = self.diagram.layout(&self.sizes);
@@ -248,10 +419,18 @@ impl DiagramTab {
             Some(saved) => self.diagram.apply_saved(&mut self.positions, &self.sizes, saved),
             None => self.save_pending = true,
         }
-        self.selected = None;
-        self.dragging = None;
-        self.fit_pending = true;
-        self.refresh_search();
+    }
+
+    /// True for a foreign key line that is not in the database yet.
+    fn edge_is_new(&self, e: &DiagramEdge) -> bool {
+        let from = &self.diagram.tables[e.from_table];
+        e.kind == EdgeKind::Real && (self.markers.created.contains(&from.name) || self.markers.new_fks.contains(&(from.name.clone(), from.columns[e.from_column].name.clone())))
+    }
+
+    /// Colour of table `i`: the one chosen by the user, else the one of its group.
+    fn color_of(&self, i: usize) -> Option<Color32> {
+        let chosen = self.colors.get(&self.diagram.tables[i].name).map(|&c| theme::DIAGRAM_GROUPS[c % theme::DIAGRAM_GROUPS.len()]);
+        chosen.or_else(|| group_color(self.groups[i]))
     }
 
     /// Recomputes the search matches after the text or the tables changed.
@@ -336,7 +515,7 @@ fn group_color(group: Option<usize>) -> Option<Color32> {
 }
 
 /// Draws the diagram tab and returns what the user asked for.
-pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
+pub fn show(ui: &mut Ui, tab: &mut DiagramTab, env: &DiagramEnv) -> Vec<DiagramAction> {
     let mut actions = Vec::new();
     let mut canvas_jump: Option<usize> = None;
     egui::TopBottomPanel::top(ui.id().with("diagram_bar")).exact_height(36.0).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(egui::Margin::symmetric(10, 4))).show_inside(ui, |ui| {
@@ -367,8 +546,32 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
             if tab.sort != before {
                 tab.rebuild(None);
             }
-            if widgets::secondary_button(ui, "Rearrange").on_hover_text("Reload the schema and lay the tables out again").clicked() {
+            let clean = tab.pending.is_empty();
+            if ui.add_enabled(clean, egui::Button::new("Rearrange")).on_hover_text("Reload the schema and lay the tables out again").on_disabled_hover_text("Apply or discard the pending changes first").clicked() {
                 actions.push(DiagramAction::Rearrange);
+            }
+            ui.separator();
+            if widgets::secondary_button(ui, "Add table").on_hover_text("Add a table (applied with the other pending changes)").clicked() {
+                tab.add_table();
+            }
+            let selected = tab.selected.and_then(|i| tab.diagram.tables.get(i)).map(|t| t.name.clone());
+            if ui.add_enabled(selected.is_some(), egui::Button::new("Table settings")).on_hover_text("Name, colour, columns and indexes of the selected table").clicked() {
+                if let Some(n) = &selected {
+                    tab.open_settings(n);
+                }
+            }
+            if ui.add_enabled(tab.pending.can_undo(), egui::Button::new("Undo")).clicked() {
+                tab.undo();
+            }
+            if ui.add_enabled(tab.pending.can_redo(), egui::Button::new("Redo")).clicked() {
+                tab.redo();
+            }
+            let count = tab.pending.change_count();
+            if ui.add_enabled(count > 0, egui::Button::new(format!("Apply ({count})"))).on_hover_text("Write the pending changes to the database (Mod+S)").clicked() {
+                actions.push(DiagramAction::Apply);
+            }
+            if ui.add_enabled(count > 0, egui::Button::new("Discard")).on_hover_text("Forget the pending changes").clicked() {
+                tab.discard_pending();
             }
             ui.separator();
             let guessed = tab.inferred_count();
@@ -429,6 +632,9 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
     if tab.fit_pending {
         tab.fit(canvas);
     }
+    if let Some(name) = tab.jump_to_name.take() {
+        canvas_jump = tab.diagram.tables.iter().position(|t| t.name == name).or(canvas_jump);
+    }
     if let Some(i) = canvas_jump {
         tab.jump_to(i, canvas);
     }
@@ -438,7 +644,96 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
         actions.push(DiagramAction::Save(tab.positions_by_name()));
     }
     paint_diagram(&painter.with_clip_rect(canvas), tab, origin, resp.hover_pos());
+    settings_window(ui.ctx(), tab, env, &mut actions);
     actions
+}
+
+/// Colour swatches, the column and index editors and Delete table, in a window over the diagram.
+fn settings_window(ctx: &egui::Context, tab: &mut DiagramTab, env: &DiagramEnv, actions: &mut Vec<DiagramAction>) {
+    let Some(mut st) = tab.settings.take() else { return };
+    if !tab.pending.begin_edit(&tab.structures, &st.key) {
+        tab.pending.end_edit();
+        return;
+    }
+    let before = tab.pending.signature();
+    let mut colors = tab.colors.clone();
+    let mut open = true;
+    let mut delete = false;
+    let mut fk_hint = false;
+    // an existing table cannot get a foreign key from the column editor: the line is dragged in the diagram
+    let mut caps = env.caps.clone();
+    caps.add_fk_after_create = false;
+    let editor_env = StructEnv { caps: &caps, types: env.types, editable: true };
+    egui::Window::new(format!("Table settings: {}", st.shown)).id(egui::Id::new("diagram_table_settings")).open(&mut open).default_size([820.0, 460.0]).resizable(true).show(ctx, |ui| {
+        let Some(draft) = tab.pending.draft_mut(&st.key) else { return };
+        ui.horizontal(|ui| {
+            widgets::field_label(ui, "Colour");
+            let current = colors.get(&st.shown).copied();
+            if ui.selectable_label(current.is_none(), "Auto").clicked() {
+                colors.remove(&st.shown);
+            }
+            for (i, c) in theme::DIAGRAM_GROUPS.iter().enumerate() {
+                let (rect, r) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                ui.painter().rect_filled(rect, theme::RADIUS_CTRL, *c);
+                if current == Some(i) {
+                    ui.painter().rect_stroke(rect.expand(2.0), theme::RADIUS_CTRL, Stroke::new(2.0_f32, theme::TEXT), StrokeKind::Outside);
+                }
+                if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    colors.insert(st.shown.clone(), i);
+                }
+            }
+            ui.separator();
+            ui.selectable_value(&mut st.page, SettingsPage::Columns, "Columns");
+            ui.selectable_value(&mut st.page, SettingsPage::Indexes, "Indexes");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::danger_button(ui, "Delete table").clicked() {
+                    delete = true;
+                }
+            });
+        });
+        ui.separator();
+        match st.page {
+            SettingsPage::Columns => {
+                for a in structure::show_columns(ui, draft, &editor_env) {
+                    if matches!(a, StructAction::EditFk(_)) {
+                        fk_hint = true;
+                    }
+                }
+            }
+            SettingsPage::Indexes => structure::show_indexes(ui, draft, &editor_env),
+        }
+    });
+    if fk_hint {
+        actions.push(DiagramAction::Notice(false, "Drag from the edge of a column to another column to create a foreign key".into()));
+    }
+    let new_shown = tab.pending.draft_mut(&st.key).map(|d| d.new_name.trim().to_owned());
+    if tab.pending.signature() != before {
+        let renamed = new_shown.as_deref().filter(|n| *n != st.shown).map(|n| (st.shown.clone(), n.to_owned()));
+        if let Some((old, new)) = &renamed {
+            if let Some(c) = colors.remove(old) {
+                colors.insert(new.clone(), c);
+            }
+        }
+        tab.reapply(renamed.as_ref().map(|(o, n)| (o.as_str(), n.as_str())));
+        if let Some(n) = new_shown {
+            if tab.markers.created.contains(&n) {
+                st.key = n.clone();
+            }
+            st.shown = n;
+        }
+    }
+    if colors != tab.colors {
+        tab.colors = colors.clone();
+        actions.push(DiagramAction::SetColors(colors));
+    }
+    if delete {
+        tab.pending.end_edit();
+        tab.drop_table(&st.key);
+    } else if open {
+        tab.settings = Some(st);
+    } else {
+        tab.pending.end_edit();
+    }
 }
 
 /// Pan, zoom, table drag, selection and double click.
@@ -487,10 +782,36 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
         }
     }
     if resp.secondary_clicked() {
-        tab.menu_edge = resp.interact_pointer_pos().and_then(|p| edge_near(tab, p, origin));
+        let at = resp.interact_pointer_pos();
+        tab.menu_edge = at.and_then(|p| edge_near(tab, p, origin));
+        tab.menu_table = if tab.menu_edge.is_some() { None } else { at.and_then(|p| hit(p, tab).map(|t| (t, column_at(tab, p, origin).filter(|&(ct, _)| ct == t).map(|(_, c)| c)))) };
+        if let Some((t, _)) = tab.menu_table {
+            tab.selected = Some(t);
+        }
     }
     resp.context_menu(|ui| {
         widgets::flat_menu_style(ui);
+        if let Some((t, column)) = tab.menu_table {
+            let name = tab.diagram.tables[t].name.clone();
+            let dropped = tab.markers.dropped.contains(&name);
+            if ui.add_enabled(!dropped, egui::Button::new("Table settings...")).clicked() {
+                tab.open_settings(&name);
+                ui.close_menu();
+            }
+            if let Some(c) = column {
+                let col = tab.diagram.tables[t].columns[c].name.clone();
+                if ui.button(format!("Copy column name ({col})")).clicked() {
+                    ui.ctx().copy_text(col);
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            if ui.add_enabled(!dropped, egui::Button::new("Delete table")).on_disabled_hover_text("Already marked for deletion: use Undo to keep it").clicked() {
+                tab.drop_table(&name);
+                ui.close_menu();
+            }
+            return;
+        }
         let edge = tab.menu_edge.and_then(|i| tab.diagram.edges.get(i));
         match edge {
             Some(e) if e.kind == EdgeKind::Manual => {
@@ -498,6 +819,14 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
                     if let Some(l) = tab.link_of(e) {
                         actions.push(DiagramAction::DeleteLink(l));
                     }
+                    ui.close_menu();
+                }
+            }
+            Some(e) if e.kind == EdgeKind::Real && tab.edge_is_new(e) => {
+                if ui.button("Remove new foreign key").clicked() {
+                    let (table, column) = (tab.diagram.tables[e.from_table].name.clone(), tab.diagram.tables[e.from_table].columns[e.from_column].name.clone());
+                    tab.pending.unstage_fk(&table, &column);
+                    tab.reapply(None);
                     ui.close_menu();
                 }
             }
@@ -613,20 +942,22 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
     for e in tab.diagram.edges.iter().filter(|e| tab.show_inferred || e.kind != EdgeKind::Inferred) {
         let involved = focus.is_some_and(|f| f == e.from_table || f == e.to_table);
         let base = match e.kind {
-            EdgeKind::Real => group_color(tab.groups[e.from_table]).unwrap_or(theme::LABEL),
+            EdgeKind::Real if tab.edge_is_new(e) => theme::OK,
+            EdgeKind::Real => tab.color_of(e.from_table).unwrap_or(theme::LABEL),
             EdgeKind::Inferred => theme::LABEL,
             EdgeKind::Manual => theme::SECONDARY,
         };
         let color = if involved && e.kind == EdgeKind::Inferred { theme::TEXT } else if involved { base } else if focus.is_some() { base.gamma_multiply(0.25) } else { base.gamma_multiply(0.7) };
         let width = if involved { 2.0_f32 } else { 1.2_f32 };
-        paint_edge(p, tab, origin, e, Stroke::new(width, color));
+        paint_edge(p, tab, origin, e, Stroke::new(width, color), tab.edge_is_new(e));
     }
     for (i, t) in tab.diagram.tables.iter().enumerate() {
         let rect = tab.rect_of(i, origin);
         if !rect.intersects(p.clip_rect()) {
             continue;
         }
-        let color = group_color(tab.groups[i]);
+        let color = tab.color_of(i);
+        let (is_new, is_dropped, is_edited) = (tab.markers.created.contains(&t.name), tab.markers.dropped.contains(&t.name), tab.markers.edited.contains(&t.name));
         let selected = tab.selected == Some(i);
         let matched = tab.found.contains(&i);
         let hovered = hover.is_some_and(|h| rect.contains(h));
@@ -634,7 +965,11 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H * z));
         let header_fill = color.map_or(theme::FIELD_ROW_BG, |c| c.gamma_multiply(0.38));
         p.rect_filled(header, theme::RADIUS_CARD, header_fill);
-        let border = if selected {
+        let border = if is_dropped {
+            Stroke::new(2.0_f32, theme::ERROR)
+        } else if is_new {
+            Stroke::new(2.0_f32, theme::OK)
+        } else if selected {
             Stroke::new(2.0_f32, theme::SECONDARY)
         } else if matched {
             Stroke::new(2.0_f32, theme::TERTIARY)
@@ -647,7 +982,14 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
         if !show_text {
             continue;
         }
-        p.text(header.left_center() + vec2(8.0 * z, 0.0), Align2::LEFT_CENTER, &t.name, FontId::new(13.0 * z, theme::semibold()), theme::TEXT);
+        p.text(header.left_center() + vec2(8.0 * z, 0.0), Align2::LEFT_CENTER, &t.name, FontId::new(13.0 * z, theme::semibold()), if is_dropped { theme::MUTED } else { theme::TEXT });
+        let tag = if is_dropped { Some(("DROP", theme::ERROR)) } else if is_new { Some(("NEW", theme::OK)) } else if is_edited { Some(("EDITED", theme::TERTIARY)) } else { None };
+        if let Some((text, c)) = tag {
+            p.text(header.right_center() - vec2(8.0 * z, 0.0), Align2::RIGHT_CENTER, text, FontId::proportional(10.0 * z), c);
+        }
+        if is_dropped {
+            p.line_segment([header.left_center() + vec2(6.0 * z, 0.0), header.left_center() + vec2(8.0 * z + t.name.chars().count() as f32 * 7.5 * z, 0.0)], Stroke::new(1.5_f32, theme::ERROR));
+        }
         for (r, c) in t.columns.iter().enumerate() {
             let y = rect.min.y + (HEADER_H + ROW_H * r as f32 + ROW_H / 2.0) * z;
             let name_color = if c.is_pk { theme::TERTIARY } else if c.is_fk { theme::SECONDARY } else { theme::TEXT };
@@ -719,11 +1061,11 @@ fn edge_curve(from: Rect, to: Rect, e: &DiagramEdge, z: f32) -> (Pos2, Pos2, Pos
 }
 
 /// Draws the line of one edge between the two column rows: solid for a foreign key, dashed for the others.
-fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge, stroke: Stroke) {
+fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge, stroke: Stroke, pending: bool) {
     let z = tab.zoom;
     let (a, b, c1, c2) = edge_geometry(tab, origin, e);
     let curve = egui::epaint::CubicBezierShape::from_points_stroke([a, c1, c2, b], false, Color32::TRANSPARENT, stroke);
-    if e.kind != EdgeKind::Real {
+    if e.kind != EdgeKind::Real || pending {
         let dash = 6.0 * z.max(0.6);
         p.extend(egui::Shape::dashed_line(&curve.flatten(Some(0.5)), stroke, dash, dash * 0.7));
     } else {
@@ -772,7 +1114,7 @@ impl DiagramTab {
         let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{bg}"/>"#, bounds.min.x, bounds.min.y, bounds.width(), bounds.height());
         for e in self.diagram.edges.iter().filter(|e| self.show_inferred || e.kind != EdgeKind::Inferred) {
             let base = match e.kind {
-                EdgeKind::Real => group_color(self.groups[e.from_table]).unwrap_or(theme::LABEL),
+                EdgeKind::Real => self.color_of(e.from_table).unwrap_or(theme::LABEL),
                 EdgeKind::Inferred => theme::LABEL,
                 EdgeKind::Manual => theme::SECONDARY,
             };
@@ -784,7 +1126,7 @@ impl DiagramTab {
         }
         for (i, t) in self.diagram.tables.iter().enumerate() {
             let r = rects[i];
-            let color = group_color(self.groups[i]);
+            let color = self.color_of(i);
             let (fill, _) = hex(theme::SURFACE);
             let (head, _) = hex(color.map_or(theme::FIELD_ROW_BG, |c| c.gamma_multiply(0.38)));
             let (border, _) = hex(color.map_or(theme::FIELD_ROW_BORDER, |c| c.gamma_multiply(0.7)));

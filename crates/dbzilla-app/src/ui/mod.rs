@@ -10,6 +10,7 @@ pub mod datatab;
 pub mod dbsearch;
 pub mod details;
 pub mod diagram;
+pub mod diagram_pending;
 pub mod metrics;
 pub mod backup;
 pub mod process;
