@@ -29,7 +29,7 @@ A fast, native, cross-platform (Windows/Linux/macOS) desktop client to manage ma
 
 - Direct connection from the user's machine to the database. **Nothing is sent to any vendor server**; credentials stay on the device, passwords in the OS keychain.
 - Browse and edit table data like a spreadsheet, with **pending changes** that are only sent after explicit **Commit**.
-- Powerful SQL editor with autocomplete, multiple carets, formatting, parameters, streaming results.
+- Powerful SQL editor with autocomplete, formatting, parameters, streaming results.
 - Safe-by-default tooling for production databases (safe-mode levels, SQL preview, tags/colors).
 - Import/export, backup/restore, ER diagram, metrics board, user management, process list.
 - Optional AI assistant and an embedded MCP server.
@@ -51,8 +51,7 @@ Reference list **[DOC]**: PostgreSQL, Amazon Redshift, MySQL, MariaDB, SingleSto
 
 - Licensing/trial limits, license server, payment, update server, beta channel, MDM deployment, crash-report upload. (The reference free tier limits to 2 tabs/windows/filters and 1 metrics board — **do not implement**.)
 - iOS/Android.
-- JavaScript plugin system (§17 defines a minimal optional extension point only).
-- Cloud sync of connections (a *folder-based* connection source is in scope, §6.8).
+- JavaScript plugin system, custom scripts, multi-window, light/Auto themes, multi-caret editing, split panes and any team/sharing feature (shared connection sources, shared query folders). Removed from scope for good.
 
 ---
 
@@ -63,8 +62,7 @@ Reference list **[DOC]**: PostgreSQL, Amazon Redshift, MySQL, MariaDB, SingleSto
 | Language / edition | Rust stable, edition 2021+ | `#![forbid(unsafe_code)]` in app crates where possible |
 | UI | `eframe` + `egui` (latest stable) | glow or wgpu backend; enable `persistence` feature |
 | Tables | `egui_extras::TableBuilder` (virtualized rows) | custom selection layer on top |
-| Docking / tabs / split panes | `egui_dock` | tabs, drag to split, workspaces |
-| Multi-window | egui **viewports** (`ctx.show_viewport_deferred`) | one OS window per "window"; fallback: single window |
+| Docking / tabs | `egui_dock` | tabs, workspaces |
 | Charts | `egui_plot` | line, bar, pie (pie painted manually) |
 | Async runtime | `tokio` (multi-thread, 2–4 workers) | UI ↔ runtime via channels |
 | SQLite | `rusqlite` (bundled) wrapped in `spawn_blocking` | |
@@ -99,7 +97,7 @@ crates/
   core/              # domain types, Value, ChangeSet, SQL builders, safe-mode classifier (no UI, no I/O)
   drivers/           # trait + sqlite, postgres, mysql, ... (feature-gated)
   ssh/               # tunnel
-  editor/            # SQL editor widget (highlight, carets, completion popup)
+  editor/            # SQL editor widget (highlight, completion popup)
   ui/                # egui views: welcome, workspace, grid, structure, filters, wizards...
   store/             # settings, connections, history, saved queries, keychain
   mcp/               # MCP server
@@ -152,10 +150,9 @@ pub struct TableRef { pub database: Option<String>, pub schema: Option<String>, 
 
 ```
 App
- └─ Windows[]                       (viewports)
      └─ Workspaces[]                (one per open database; "database stack" on the far left)
          ├─ Session (connection handle, db name, schema cache, safe mode, pending ChangeSets)
-         └─ Dock<Tab>               (tabs + split panes)
+         └─ Dock<Tab>               (tabs)
               Tab = TableData | TableStructure | TableIndex | ViewDdl | FunctionEditor
                   | SqlEditor | SavedQueryEditor | ErDiagram | MetricsBoard | ...
 ```
@@ -172,7 +169,6 @@ Use `directories::ProjectDirs`. Files (all JSON, written atomically via temp+ren
 |---|---|
 | `settings.json` | all preferences (§16) |
 | `connections.json` | local connection source (no secrets) |
-| `connection_sources.json` | extra folders (§6.8) |
 | `tags.json` | tag names + colors |
 | `history/<connection_id>.jsonl` | query history |
 | `queries/` | saved queries (`*.sql`, folders allowed) |
@@ -329,7 +325,7 @@ Options:
 - Edit (from list, or via click on status bar → popover with **Edit / Reconnect / Disconnect**), Duplicate, Delete.
 - **Groups**: create (name + optional icon), nest, drag connection in/out, edit, delete (deleting a group deletes its connections — confirm!).
 - **Keep connection alive**: ping every **30 s** (default on). **Query time-out**: default **300 s**; checked together with keep-alive; on expiry show "The server is taking too long to respond" with **Reconnect** / **Wait**; not applicable to SQLite, DuckDB, BigQuery, libSQL, D1, Snowflake.
-- **Switch connection**: `Mod+Shift+K` opens the connection list from inside a workspace; default opens in a **new workspace in the same window**; context menu "Open in new Window".
+- **Switch connection**: `Mod+Shift+K` opens the connection list from inside a workspace; default opens in a **new workspace in the same window**.
 
 ### 6.5 Import/export connection files **[DOC]**
 
@@ -343,10 +339,6 @@ Options:
 ### 6.7 Reopen last session **[DOC]**
 
 Setting "Reopen closed workspaces at startup": on quit, persist open workspaces (connection id + database + open tab descriptors, no secrets); restore at launch.
-
-### 6.8 Connection sources (team sharing) **[DOC]**
-
-Settings > Connections > **Add** a folder (e.g. a synced Dropbox/iCloud directory). Its connections appear as a separate section on the welcome window; drag a connection into the section to move it there. **Passwords are never stored in that folder** — they stay in each machine's keychain.
 
 ---
 
@@ -407,7 +399,6 @@ Bottom panel logging **every statement sent to the server**, including backgroun
 - `Mod+T` new tab (default: SQL editor; setting "Command+T to open": SQL Query Editor | Empty tab), `Mod+W` close, `Mod+]`/`Mod+[` next/prev tab, `Mod+1…9` jump.
 - Opening another **database** → new workspace in the same window by default (`Mod+K`, double-click; or "Open in new Tab"/"Open in current Tab" to replace). Opening another **connection** → new workspace in same window; "Open in new Window" or `Mod+N`.
 - Workspace switching: `Mod+Shift+]`/`[`, overview `Mod+Shift+\`.
-- Split panes: see §10.7.
 
 ### 7.7 Open Anything (command palette) **[DOC]**
 
@@ -603,11 +594,6 @@ Toolbar **SQL File**, `Mod+E`, or `Mod+T`. When no SQL editor is focused, `Mod+R
 - Key binding: **Sublime (default)** or **Vim** (Vim mode optional/stretch).
 - **Auto-save tabs** on close/reopen: *Do not save* | *Only first SQL tab (default)* | *Save all tabs*; saved on run/format/close.
 
-### 10.4 Multiple carets **[DOC]**
-
-`Mod+Click` add/remove caret; `Ctrl+Shift+↑/↓` caret on adjacent line; `Alt+drag` rectangular selection; `Mod+D` select next occurrence (first press selects word); `Ctrl+Mod+G` select all occurrences; `Esc` back to single caret. Typing/delete/paste apply at all carets.
-**[DESIGN]** egui's built-in `TextEdit` has one cursor, so implement a **custom editor widget** (`crates/editor`) with: rope buffer (`ropey`), `Vec<Selection>`, own layout/painting (galley per visible line), IME + clipboard handling, undo stack. Alternative for early milestones: ship single-caret first (M3) and add multi-caret in M6.
-
 ### 10.5 Autocomplete **[DOC]**
 
 Suggest: databases, tables, views, columns, functions, procedures, SQL keywords, and **keywords bound to saved queries**. `↑/↓` or `Ctrl+N/P` navigate, `Return`/`Tab` accept (setting *Complete Key*: Enter or Tab (both, default) | Enter only | Tab only), `Esc` toggles list.
@@ -617,13 +603,9 @@ Mongo shell syntax: collections + shell methods.
 
 ### 10.6 Formatting **[DOC]**
 
-- **Beautify** (`Mod+I`) formats selection, or the statement under cursor; keywords uppercase (unless "Automatically UPPERCASE keywords" off). Each caret's selection formatted separately.
-- **Uglify/minify** (`Mod+Shift+I`) single caret.
+- **Beautify** (`Mod+I`) formats selection, or the statement under cursor; keywords uppercase (unless "Automatically UPPERCASE keywords" off).
+- **Uglify/minify** (`Mod+Shift+I`).
 - Options: **Indent with** Tab|Spaces, **Indent width** 2/4/6/8, **Indent type** Standard | Tabular Left | Tabular Right (tabular uses 10-space alignment, ignores indent width).
-
-### 10.7 Split panes **[DOC]**
-
-Right-click editor → **Split pane Down** (stacked editors in the same tab) / **Split pane Right** (`Mod+Shift+D`, new pane with its own tabs). `Alt+Mod+]`/`[` select next/prev pane. **Close pane** in context menu. Each pane has its own editor + results and runs independently.
 
 ### 10.8 Result tabs **[DOC]**
 
@@ -653,7 +635,7 @@ Off by default (gear → *Query params options* → *Enable query params*; also 
 
 ### 10.12 Saved queries ("Queries" tab) **[DOC]**
 
-- Stored as plain `.sql` files; supports **folders**, drag-and-drop move, rename, delete; sort by Name / Date Created / Date Modified; **Add a shared Folder** (existing dir, e.g. team-synced).
+- Stored as plain `.sql` files; supports **folders**, drag-and-drop move, rename, delete; sort by Name / Date Created / Date Modified.
 - Create: `+` or `New > File…` (editor window: **Name**, **Keywords**, query), `Mod+S`; from editor: select → **Add to Queries** (statement under cursor if no selection) or run-menu **Add to Queries** (whole content); from History: **Add to Queries**.
 - **Keyword binding**: typing a keyword in the editor offers the saved query in autocomplete; accept inserts it.
 - Context menu: Run, Copy, Edit/Rename…, Import… (run via Import SQL wizard), Open file in Tab, Insert into SQL Editor, Show in file manager, Delete.
@@ -765,7 +747,7 @@ For Redis/MongoDB/Elasticsearch/DynamoDB tabs are **Data | Json | Tree** (grid, 
 
 ## 14. Settings (Preferences) **[DOC]**
 
-Window with tabs: **General**, **Table**, **Editor**, **Fonts & Themes**, **Keymap**, **Security**, **Connections** (sources), **AI Agent**, **MCP**, (About). Open `Mod+,`.
+Window with tabs: **General**, **Table**, **Editor**, **Fonts & Themes**, **Keymap**, **Security**, **AI Agent**, **MCP**, (About). Open `Mod+,`.
 
 ### 14.1 General / Application
 
@@ -782,9 +764,9 @@ Auto-save queries while editing (default on); Automatically UPPERCASE keywords; 
 ### 14.4 Fonts & Themes
 
 - Scope switch **SQL Editor | Data Table | Application** each with fonts (default system monospace), size **9–100 (default 12)**, line height (editor 1.0–5.0), row padding (table 9–100, default 12; left sidebar padding 0–5).
-- **Themes**: sections *System* (Auto, Light, Dark), *Built-in*, *Custom*, one per **Git theme repository**. Auto follows OS appearance using the **default light / default dark** theme ("Make default (for Auto)"). Actions: Duplicate, Delete (custom only), Export (JSON) / Export all, Import (file/folder), **Add theme… > File or folder… / Git…** (URL + branch/tag, update/delete repo, info).
+- **Themes**: sections *System* (Dark), *Built-in*, *Custom*, one per **Git theme repository**. Actions: Duplicate, Delete (custom only), Export (JSON) / Export all, Import (file/folder), **Add theme… > File or folder… / Git…** (URL + branch/tag, update/delete repo, info).
 - Colors editable per part (hex input + color well + Reset): SQL syntax (comments, numbers, strings, keywords, current query bg, selection bg, error), Data Table (deleted/modified/new row bg, cell selection border/bg, grid), Application (window, sidebar, tabs, notifications). **Restore Defaults**.
-- Ship ≥ 1 light and 2 dark themes in JSON format; themes map to `egui::Visuals` + a custom `AppColors` struct.
+- Ship ≥ 2 dark themes in JSON format; themes map to `egui::Visuals` + a custom `AppColors` struct.
 
 ### 14.5 Keymap
 
@@ -850,12 +832,6 @@ Built-in MCP server so external agents can use the app's connections.
 
 ---
 
-## 17. Extensibility **[DOC → DESIGN]**
-
-The reference supports JavaScript plugins (`*.plugin` folders, Tools menu entries, cell/sidebar context menus, own shortcuts, Plugin Manager `Mod+L`) and Git theme repos. **For this app:** implement **themes** (§14.4) fully; define an internal `Extension` trait (menu contributions + command handlers) but ship **no** plugin loader in v1. Built-in alternatives to old plugins must exist: SQL formatter and *Copy Script As*.
-
----
-
 ## 18. Menus, shortcuts, commands
 
 ### 18.1 Menu bar **[DOC]**
@@ -864,13 +840,12 @@ The reference supports JavaScript plugins (`*.plugin` folders, Tools menu entrie
 |---|---|
 | **App** | About, Settings (`Mod+,`), Hide, Quit (`Mod+Q`) |
 | **File** | Open… (`Mod+O`), Open Recent, Save As… (`Mod+Shift+S`), New Workspace (`Mod+N`), New SQL Viewer (`Mod+Shift+O`), Backup…, Restore…, Export > Export Tables… (`Mod+Shift+E`) / Export this Table with Column Selection…, Import > From CSV/JSON/SQL Dump…, Close |
-| **Edit** | Undo/Redo, **Commit** (`Mod+S`), **Discard** (`Mod+Shift+Delete`), **Preview** (`Mod+Shift+P`), Add Row (`Mod+I`), Duplicate Rows (`Mod+D`), Cut/Copy/Copy Selected Cells/Paste/Paste to Selected Cells, Select Word, Select all Words (`Ctrl+Mod+G`), Delete, Select All, Toggle Line/Block Comment, Font size ±, Find submenu (Find, Find and Replace, Next, Previous, Use Selection, Jump to Selection, Find Items in left sidebar `Mod+Shift+F`), Transformations |
+| **Edit** | Undo/Redo, **Commit** (`Mod+S`), **Discard** (`Mod+Shift+Delete`), **Preview** (`Mod+Shift+P`), Add Row (`Mod+I`), Duplicate Rows (`Mod+D`), Cut/Copy/Copy Selected Cells/Paste/Paste to Selected Cells, Delete, Select All, Toggle Line/Block Comment, Font size ±, Find submenu (Find, Find and Replace, Next, Previous, Use Selection, Jump to Selection, Find Items in left sidebar `Mod+Shift+F`), Transformations |
 | **View** | Toggle Left Sidebar (`Mod+0`), Right Sidebar (`Space`), Bottom/console, Query Results Pane (`Ctrl+\``), Full Screen |
-| **Tools** | Process List (`Mod+.`), Show Diagram, Show Metrics Board, User Management, Search in Database…, Run Custom Script (reserved), Manage Plugins (reserved) |
+| **Tools** | Process List (`Mod+.`), Show Diagram, Show Metrics Board, User Management, Search in Database… |
 | **Connection** | New…, Edit…, Open a Database (`Mod+K`), Open a Connection (`Mod+Shift+K`), Run Current/All Query, View Using Encoding, Reload Workspace (`Mod+R`), Reload Current Tab (`Alt+Mod+R`), Reconnect (`Mod+Shift+R`), Disconnect (`Alt+Mod+.`) |
 | **Theme** | built-in/installed themes, More themes, Import theme from Git…, Import from file/folder…, Theme Settings |
-| **Navigate** | Open Anything (`Mod+P`), New/Close Tab, Show Table Data/Structure, Select Next/Prev Pane (`Alt+Mod+]/[`), Go Back/Forward (`Ctrl+Mod+←/→`), Next/Prev Tab, Tab at Index 1–9, Next/Prev Workspace, Split Pane Right (`Mod+Shift+D`) |
-| **Window** | Minimize, Zoom, Bring All to Front |
+| **Navigate** | Open Anything (`Mod+P`), New/Close Tab, Show Table Data/Structure, Go Back/Forward (`Ctrl+Mod+←/→`), Next/Prev Tab, Tab at Index 1–9, Next/Prev Workspace |
 | **Help** | Changelog link, Enable SSH log, Report bug (`Mod+?`) |
 
 ### 18.2 Global shortcut reference **[DOC]**
@@ -883,12 +858,11 @@ The reference supports JavaScript plugins (`*.plugin` folders, Tools menu entrie
 | Workspace | `Mod+P` `Mod+K` `Mod+Shift+K` `Mod+E` `Mod+T` `Mod+W` | open anything, open DB, open connection, new SQL editor, new tab, close tab |
 | Workspace | `Mod+S` `Mod+Shift+P` `Mod+Shift+Delete` `Mod+Z` `Mod+Shift+Z` | commit, preview, discard, undo, redo |
 | Workspace | `Mod+R` `Alt+Mod+R` `Mod+Shift+R` `Alt+Mod+.` `Mod+.` `Mod+Shift+E` | reload workspace, reload tab, reconnect, disconnect, process list, export |
-| Navigation | `Mod+]` `Mod+[` `Mod+1…9` `Alt+Mod+]/[` `Mod+Shift+D` `Mod+Shift+]/[` `Mod+Shift+\` `Ctrl+Mod+←/→` `Ctrl+Mod+[ ]` | tabs, panes, split, workspaces, overview, history back/forward, data/structure |
+| Navigation | `Mod+]` `Mod+[` `Mod+1…9` `Mod+Shift+]/[` `Mod+Shift+\` `Ctrl+Mod+←/→` `Ctrl+Mod+[ ]` | tabs, workspaces, overview, history back/forward, data/structure |
 | Panels | `Mod+0` `Space` `Ctrl+Mod+C` `Ctrl+\`` `Mod+Shift+F` `Ctrl+Mod+F` | left, right, console, results, sidebar search, fullscreen |
 | Sidebar | `Space` `Delete` `Alt+Delete` | open, delete, truncate |
 | Table data | `Mod+I` `Mod+D` `Mod+C` `Mod+Shift+C` `Mod+V` `Mod+Shift+V` `Delete` `Return/Tab` `Space` `Mod+Return` `Alt+Return` `Mod+↑/↓` `Mod+←/→` `Mod+F` `Alt+Mod+F` `Esc` | add, duplicate, copy rows, copy cells, paste, paste cells, delete, edit cell, row detail, Quick Look, quick edit menu, first/last row, prev/next page, filters, column filter, deselect |
 | SQL editor | `Mod+Return` `Mod+Shift+Return` `Mod+.` `Mod+I` `Mod+Shift+I` `Mod+/` `Alt+Mod+/` `Mod+=` `Mod+-` `Mod+F` `Alt+Mod+F` `Mod+G` `Mod+Shift+G` `Mod+Shift+S` `Esc` `Ctrl+N/P` | run current, run all, cancel, beautify, uglify, comments, font, find/replace, next/prev, save SQL, autocomplete toggle, suggestion nav |
-| Multi-caret | `Mod+Click` `Alt+Drag` `Ctrl+Shift+↑/↓` `Mod+D` `Ctrl+Mod+G` `Esc` | add/remove caret, block select, caret above/below, next occurrence, all occurrences, single caret |
 
 **[DESIGN]** On Windows/Linux, avoid collisions with OS/desktop shortcuts: provide per-platform default maps and let the Keymap UI override.
 
@@ -896,7 +870,7 @@ The reference supports JavaScript plugins (`*.plugin` folders, Tools menu entrie
 
 ## 19. UX and visual requirements **[DESIGN]**
 
-- Dense, professional, keyboard-first. Default dark and light themes; follow OS appearance in **Auto**.
+- Dense, professional, keyboard-first. Dark themes only.
 - Tooltips on every toolbar button including shortcut text **[DOC]**.
 - Destructive actions (drop DB, delete group, truncate, delete table) always confirm; DB drop requires typing the name **[DOC]**.
 - Production-tagged or Safe-Mode connections show a persistent colored status bar.
@@ -940,13 +914,13 @@ The reference supports JavaScript plugins (`*.plugin` folders, Tools menu entrie
 
 | M | Scope | Done when |
 |---|---|---|
-| **M0** | Workspace skeleton, eframe app, theme plumbing, settings/persistence, keymap/action system, Open-Anything shell | App launches with welcome window, light/dark theme, settings saved |
+| **M0** | Workspace skeleton, eframe app, theme plumbing, settings/persistence, keymap/action system, Open-Anything shell | App launches with welcome window, dark theme, settings saved |
 | **M1** | SQLite driver; connection form (file); connection list/groups/tags/colors; workspace layout (sidebars, tabs, status bar, console); table Data tab with paging, sorting, selection; Quick Look (text/JSON) | Open `.sqlite`, browse tables, page 300 rows |
 | **M2** | Pending changes pipeline: edit/insert/duplicate/delete rows, undo/redo, Preview/Commit/Discard, row state colors; right sidebar Details | Edit→Preview SQL→Commit works; discard reloads |
-| **M3** | SQL editor v1 (single caret): highlight, run current/all, row limit, streaming results, result tabs, messages, history, saved queries, autocomplete (keywords/tables/columns), format, comments, find | Run multi-statement script, named tabs, history persisted |
+| **M3** | SQL editor v1: highlight, run current/all, row limit, streaming results, result tabs, messages, history, saved queries, autocomplete (keywords/tables/columns), format, comments, find | Run multi-statement script, named tabs, history persisted |
 | **M4** | Structure/Index tabs (columns, constraints, PK/FK, defaults, indexes), create/rename/clone/truncate/drop table, views, copy-script-as, filters (all operators, multi-filter AND/OR, quick filters, column filter), Search in Database | Create table from GUI; filtered grid; DDL snapshots pass |
 | **M5** | PostgreSQL + MySQL/MariaDB drivers, TLS, URL import/export/Copy-as-URL, safe-mode levels, keychain, password modes, bootstrap commands, keep-alive/timeout, database list (new/rename/drop), cancel via side connection | Parity of M1–M4 on PG/MySQL; safe-mode prompts work |
-| **M6** | SSH tunnel; multi-caret editor; split panes; query parameters; Vim key binding (stretch); workspaces/windows/database stack; session restore; connection import/export files; connection sources | Connect through SSH container; multi-window |
+| **M6** | SSH tunnel; query parameters; Vim key binding (stretch); workspaces/database stack; session restore; connection import/export files | Connect through SSH container |
 | **M7** | Import wizards (CSV/JSON/SQL) and Export (CSV/JSON/SQL/XLSX, gzip, filename patterns, column selection, background jobs + notifications); backup/restore via external tools | Round-trip export→import equal data |
 | **M8** | Tier-2 drivers (DuckDB, MSSQL, CockroachDB/Redshift/Greenplum via PG, ClickHouse); process list; user management; encoding menu; foreign-key navigation | Feature matrix of §5.2 enforced via capabilities |
 | **M9** | ER diagram, Metrics Board, charts from results/comments; Redis/Mongo (optional) | Edit FK in diagram → commit |

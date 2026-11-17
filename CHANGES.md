@@ -42,3 +42,4 @@
 - Release 0.1.2.
 - Release workflow: removed the macOS targets (CI kept failing); only Linux and Windows binaries are built.
 - Release 0.1.3.
+- SPEC: removed plugins/custom scripts (§17), light and Auto themes, multi-window, connection sources and other team features (§6.8, shared query folder), multi-caret (§10.4) and split panes (§10.7).
