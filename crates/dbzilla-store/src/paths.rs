@@ -40,6 +40,11 @@ impl AppPaths {
         self.root.join("diagrams.json")
     }
 
+    /// `metrics.json` (metrics boards).
+    pub fn metrics_file(&self) -> PathBuf {
+        self.root.join("metrics.json")
+    }
+
     /// `tags.json`.
     pub fn tags_file(&self) -> PathBuf {
         self.root.join("tags.json")

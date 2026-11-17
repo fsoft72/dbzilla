@@ -547,7 +547,7 @@ pub fn import_dialog(ctx: &egui::Context, d: &mut ImportDialog, driver: DriverId
 /// The bell button with the job list popover.
 pub fn bell(ui: &mut Ui, jobs: &mut JobCenter) {
     let tip = if jobs.running() > 0 { format!("{} job(s) running", jobs.running()) } else { "Notifications".to_owned() };
-    let resp = widgets::ico_button(ui, Ico::Bolt, &tip);
+    let resp = widgets::ico_button(ui, Ico::Alert, &tip);
     if jobs.unread > 0 || jobs.running() > 0 {
         let color = if jobs.running() > 0 { theme::SECONDARY } else { theme::OK };
         ui.painter().circle_filled(resp.rect.right_top() + egui::vec2(-5.0, 5.0), 3.5, color);

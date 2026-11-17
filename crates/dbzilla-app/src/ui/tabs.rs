@@ -12,6 +12,8 @@ pub enum TabTarget {
     Sql(TabId),
     /// The ER diagram (one per workspace).
     Diagram,
+    /// The metrics board (one per workspace).
+    Metrics,
 }
 
 /// The facts about an existing tab that the opening rules need.

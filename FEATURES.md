@@ -5,7 +5,8 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 
 ## Database tools
 
-- [ ] Metrics Board (11.2)
+- [x] Metrics Board (11.2): boards, data table, scoreboard, bar, line and pie charts, input, dropdown, button, `$name` variables, refresh rates, import and export
+- [ ] Metrics Board, still missing: Exporter, Importer and Connection objects, wiring by dragging between connection points (today a checkbox list in the object settings), input submit modes, board list in the left sidebar, Add to Metrics Board from a result chart, `Tools > Show Metrics Board` menu entry
 - [ ] Process list UI with kill (11.4)
 - [ ] User management with a SQL preview before apply (11.5)
 - [ ] Backup and restore for PostgreSQL, MySQL and MariaDB (12.3)

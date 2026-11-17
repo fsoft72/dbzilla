@@ -4,6 +4,7 @@ pub mod atomic;
 pub mod connections;
 pub mod diagrams;
 pub mod history;
+pub mod metrics;
 pub mod paths;
 pub mod queries;
 pub mod secrets;

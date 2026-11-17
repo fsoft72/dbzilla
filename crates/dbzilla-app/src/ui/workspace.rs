@@ -7,6 +7,7 @@ use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
 use super::diagram::{self, DiagramAction, DiagramTab};
+use super::metrics::{self, MetricsAction, MetricsTab};
 use dbzilla_core::diagram::DocLink;
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
@@ -36,6 +37,7 @@ use dbzilla_session::gate::{gate_check, verify_password, GateDecision};
 use dbzilla_session::{Command, Event, PageRequest, RequestId, SessionHandle};
 use dbzilla_store::connections::StoredConnection;
 use dbzilla_store::diagrams::DiagramStore;
+use dbzilla_store::metrics::MetricsStore;
 use dbzilla_store::history::{HistoryEntry, HistoryKind, HistoryStore};
 use dbzilla_store::queries::{QueryEntry, QuerySort, QueryStore};
 use dbzilla_store::settings::Settings;
@@ -183,6 +185,7 @@ const FK_ACTIONS: [&str; 5] = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "
 pub struct Stores {
     pub history: HistoryStore,
     pub diagrams: DiagramStore,
+    pub metrics: MetricsStore,
     pub queries: QueryStore,
 }
 
@@ -202,6 +205,8 @@ enum ReqKind {
     Sql,
     Ddl,
     Search,
+    /// A query of the metrics board object with this id.
+    Metric(u64),
 }
 
 /// What a confirmed gate does.
@@ -255,6 +260,7 @@ pub enum TabKind {
     Table(Box<TableTab>),
     Sql(Box<SqlTab>),
     Diagram(Box<DiagramTab>),
+    Metrics(Box<MetricsTab>),
 }
 
 /// A tab of the dock.
@@ -277,6 +283,7 @@ impl Tab {
             TabKind::Table(t) => t.table.name.clone(),
             TabKind::Sql(s) => format!("SQL {}", s.no),
             TabKind::Diagram(_) => "Diagram".to_owned(),
+            TabKind::Metrics(_) => "Metrics".to_owned(),
         }
     }
 }
@@ -339,6 +346,7 @@ pub struct Workspace {
     pub schema_loaded: bool,
     history: HistoryStore,
     diagrams: DiagramStore,
+    metrics: MetricsStore,
     queries: QueryStore,
     history_cache: Vec<HistoryEntry>,
     history_for: Option<String>,
@@ -422,6 +430,7 @@ impl Workspace {
             schema_loaded: false,
             history: stores.history,
             diagrams: stores.diagrams,
+            metrics: stores.metrics,
             queries: stores.queries,
             history_cache: Vec::new(),
             history_for: None,
@@ -597,14 +606,25 @@ impl Workspace {
             }
             Event::StatementStarted { req, index, sql } => self.on_statement_started(req, index, sql),
             Event::RowBatch { req, index, columns, rows } => match self.req_map.get(&req).copied() {
+                Some((_, ReqKind::Metric(obj))) => {
+                    if let Some(m) = self.metrics_tab_mut() {
+                        m.on_rows(obj, columns, rows);
+                    }
+                }
                 Some((id, ReqKind::Sql)) => self.on_sql_rows(id, index, columns, rows),
                 _ => self.on_rows(req, columns, rows),
             },
             Event::QueryDone { req, index, summary } => match self.req_map.get(&req).copied() {
+                Some((_, ReqKind::Metric(_))) => {}
                 Some((id, ReqKind::Sql)) => self.on_sql_done(id, index, ResStatus::Done { elapsed: summary.elapsed, affected: summary.affected, messages: summary.messages }),
                 _ => self.on_page_done(req, summary.elapsed),
             },
             Event::QueryError { req, index, error, cancelled } => match self.req_map.get(&req).copied() {
+                Some((_, ReqKind::Metric(obj))) => {
+                    if let Some(m) = self.metrics_tab_mut() {
+                        m.on_error(obj, error);
+                    }
+                }
                 Some((id, ReqKind::Sql)) => self.on_sql_done(id, index, if cancelled { ResStatus::Cancelled } else { ResStatus::Error(error) }),
                 _ => self.on_page_error(req, error),
             },
@@ -651,7 +671,7 @@ impl Workspace {
     fn table_tab_mut(&mut self, id: TabId) -> Option<&mut TableTab> {
         self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).and_then(|t| match &mut t.kind {
             TabKind::Table(tt) => Some(tt.as_mut()),
-            TabKind::Sql(_) | TabKind::Diagram(_) => None,
+            TabKind::Sql(_) | TabKind::Diagram(_) | TabKind::Metrics(_) => None,
         })
     }
 
@@ -821,6 +841,7 @@ impl Workspace {
                 TabKind::Table(tt) => TabMeta { id: t.id, target: TabTarget::Table(tt.table.clone()), pinned: t.pinned, dirty: false },
                 TabKind::Sql(sq) => TabMeta { id: t.id, target: TabTarget::Sql(t.id), pinned: true, dirty: !sq.text.is_empty() },
                 TabKind::Diagram(_) => TabMeta { id: t.id, target: TabTarget::Diagram, pinned: true, dirty: false },
+                TabKind::Metrics(_) => TabMeta { id: t.id, target: TabTarget::Metrics, pinned: true, dirty: false },
             })
             .collect()
     }
@@ -834,7 +855,7 @@ impl Workspace {
     fn active_table(&mut self) -> Option<TableRef> {
         self.dock.find_active_focused().and_then(|(_, t)| match &t.kind {
             TabKind::Table(tt) => Some(tt.table.clone()),
-            TabKind::Sql(_) | TabKind::Diagram(_) => None,
+            TabKind::Sql(_) | TabKind::Diagram(_) | TabKind::Metrics(_) => None,
         })
     }
 
@@ -960,6 +981,7 @@ impl Workspace {
                 self.search = Some(SearchState::new(&tables));
             }
             Action::ShowDiagram => self.open_diagram(),
+            Action::ShowMetrics => self.open_metrics(),
             Action::ShowData => self.set_view(TabView::Data),
             Action::ShowStructure => self.set_view(TabView::Structure),
             Action::NewSqlEditor => self.open_sql(String::new()),
@@ -1003,7 +1025,7 @@ impl Workspace {
             let id = t.id;
             match &mut t.kind {
                 TabKind::Table(tt) => Some((id, tt.as_mut())),
-                TabKind::Sql(_) | TabKind::Diagram(_) => None,
+                TabKind::Sql(_) | TabKind::Diagram(_) | TabKind::Metrics(_) => None,
             }
         })
     }
@@ -1014,7 +1036,7 @@ impl Workspace {
             let id = t.id;
             match &mut t.kind {
                 TabKind::Sql(sq) => Some((id, sq.as_mut())),
-                TabKind::Table(_) | TabKind::Diagram(_) => None,
+                TabKind::Table(_) | TabKind::Diagram(_) | TabKind::Metrics(_) => None,
             }
         })
     }
@@ -1023,7 +1045,7 @@ impl Workspace {
     fn sql_tab_mut(&mut self, id: TabId) -> Option<&mut SqlTab> {
         self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).and_then(|t| match &mut t.kind {
             TabKind::Sql(sq) => Some(sq.as_mut()),
-            TabKind::Table(_) | TabKind::Diagram(_) => None,
+            TabKind::Table(_) | TabKind::Diagram(_) | TabKind::Metrics(_) => None,
         })
     }
 
@@ -1118,6 +1140,50 @@ impl Workspace {
             self.dock.set_focused_node_and_surface((loc.0, loc.1));
         }
         self.request_diagram();
+    }
+
+    /// The metrics board tab, if open.
+    fn metrics_tab_mut(&mut self) -> Option<&mut MetricsTab> {
+        self.dock.iter_all_tabs_mut().map(|(_, t)| t).find_map(|t| match &mut t.kind {
+            TabKind::Metrics(m) => Some(m.as_mut()),
+            _ => None,
+        })
+    }
+
+    /// Opens the metrics board, or focuses the one already open.
+    pub fn open_metrics(&mut self) {
+        let existing = self.tab_metas().into_iter().find(|t| t.target == TabTarget::Metrics).map(|t| t.id);
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                self.dock.push_to_focused_leaf(Tab { id, pinned: true, kind: TabKind::Metrics(Box::new(MetricsTab::new(self.metrics.load()))) });
+                id
+            }
+        };
+        if let Some(loc) = self.tab_location(id) {
+            self.dock.set_active_tab(loc);
+            self.dock.set_focused_node_and_surface((loc.0, loc.1));
+        }
+    }
+
+    /// Reacts to a request of the metrics board tab.
+    fn metrics_action(&mut self, id: TabId, a: MetricsAction) {
+        match a {
+            MetricsAction::Close => self.retain_tabs(|t| t.id != id),
+            MetricsAction::Run { object, sql } => {
+                let req = RequestId::next();
+                self.req_map.insert(req, (id, ReqKind::Metric(object)));
+                self.session.send(Command::RunSql { req, statements: vec![sql], opts: dbzilla_drivers::QueryOpts::default(), stop_on_error: true });
+            }
+            MetricsAction::Save(boards) => {
+                if let Err(e) = self.metrics.save(&boards) {
+                    self.notices.push((true, format!("cannot save the metrics boards: {e}")));
+                }
+            }
+            MetricsAction::Notice(error, text) => self.notices.push((error, text)),
+        }
     }
 
     /// Reacts to a request of the diagram tab.
@@ -1305,6 +1371,13 @@ impl Workspace {
 
     /// The whole run finished.
     fn on_run_finished(&mut self, req: RequestId) {
+        if let Some((_, ReqKind::Metric(obj))) = self.req_map.get(&req).copied() {
+            self.req_map.remove(&req);
+            if let Some(m) = self.metrics_tab_mut() {
+                m.on_finished(obj);
+            }
+            return;
+        }
         let Some((id, ReqKind::Sql)) = self.req_map.remove(&req) else { return };
         let Some(tab) = self.sql_tab_mut(id) else { return };
         tab.running = false;
@@ -2213,6 +2286,7 @@ impl Workspace {
         let mut sql_actions: Vec<(TabId, SqlAction)> = Vec::new();
         let mut struct_actions: Vec<(TabId, StructAction)> = Vec::new();
         let mut diagram_actions: Vec<(TabId, DiagramAction)> = Vec::new();
+        let mut metrics_actions: Vec<(TabId, MetricsAction)> = Vec::new();
         self.fmt_width = env.settings.indent_width;
         self.fmt_with = env.settings.indent_with;
         self.fmt_kind = env.settings.indent_type;
@@ -2249,7 +2323,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, diagram_actions: &mut diagram_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key, vim: env.settings.key_binding == dbzilla_store::settings::KeyBinding::Vim, indent_width: env.settings.indent_width, indent_spaces: env.settings.indent_with == dbzilla_store::settings::IndentWith::Spaces };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, diagram_actions: &mut diagram_actions, metrics_actions: &mut metrics_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key, vim: env.settings.key_binding == dbzilla_store::settings::KeyBinding::Vim, indent_width: env.settings.indent_width, indent_spaces: env.settings.indent_with == dbzilla_store::settings::IndentWith::Spaces };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -2268,6 +2342,9 @@ impl Workspace {
         }
         for (id, a) in diagram_actions {
             self.diagram_action(id, a);
+        }
+        for (id, a) in metrics_actions {
+            self.metrics_action(id, a);
         }
         for (id, a) in struct_actions {
             self.struct_action(id, a);
@@ -2824,6 +2901,9 @@ impl Workspace {
                 if widgets::ico_button(ui, Ico::Structure, &tip("Show ER diagram", Action::ShowDiagram)).clicked() {
                     self.open_diagram();
                 }
+                if widgets::ico_button(ui, Ico::Bolt, &tip("Show metrics board", Action::ShowMetrics)).clicked() {
+                    self.open_metrics();
+                }
                 if widgets::ico_button(ui, Ico::Search, &tip("Open anything", Action::OpenAnything)).clicked() {
                     self.palette = Some(PaletteState::default());
                 }
@@ -2906,6 +2986,7 @@ struct Viewer<'a> {
     structures: &'a HashMap<TableRef, TableStructure>,
     sql_actions: &'a mut Vec<(TabId, SqlAction)>,
     diagram_actions: &'a mut Vec<(TabId, DiagramAction)>,
+    metrics_actions: &'a mut Vec<(TabId, MetricsAction)>,
     struct_actions: &'a mut Vec<(TabId, StructAction)>,
     caps: &'a Capabilities,
     keywords: &'a HashSet<String>,
@@ -2935,6 +3016,12 @@ impl TabViewer for Viewer<'_> {
             TabKind::Diagram(d) => {
                 for a in diagram::show(ui, d) {
                     self.diagram_actions.push((id, a));
+                }
+                return;
+            }
+            TabKind::Metrics(m) => {
+                for a in metrics::show(ui, m) {
+                    self.metrics_actions.push((id, a));
                 }
                 return;
             }
@@ -3072,7 +3159,7 @@ mod tests {
         conn.database = path.to_string_lossy().into_owned();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: conn.database.clone(), ssl: SslMode::Disabled, bootstrap: vec![] }));
-        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), queries: QueryStore::new(dir.path().join("queries")) };
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), metrics: MetricsStore::new(dir.path().join("metrics.json")), queries: QueryStore::new(dir.path().join("queries")) };
         let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && !w.objects.is_empty());
         (dir, path, ws)
@@ -3484,6 +3571,32 @@ mod tests {
         wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 2));
     }
 
+    /// The metrics board opens once, runs the query of an object on the session and keeps the boards.
+    #[test]
+    fn metrics_board_runs_queries_and_saves_boards() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.open_metrics();
+        ws.open_metrics();
+        assert_eq!(ws.tab_metas().iter().filter(|t| t.target == TabTarget::Metrics).count(), 1);
+        let id = ws.metrics_tab_mut().unwrap().add_with_sql(dbzilla_core::metrics::ObjectKind::Scoreboard, "SELECT count(*) AS n, 'rows' FROM t");
+        let mut actions = Vec::new();
+        ws.metrics_tab_mut().unwrap().dispatch_for_test(&mut actions);
+        let tab_id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Metrics).unwrap().id;
+        assert_eq!(actions.len(), 1);
+        for a in actions {
+            ws.metrics_action(tab_id, a);
+        }
+        wait(&mut ws, |w| w.metrics_tab_mut().and_then(|m| m.data(id).map(|d| !d.loading)).unwrap_or(false));
+        let d = ws.metrics_tab_mut().unwrap().data(id).unwrap().clone();
+        assert_eq!(d.error, None);
+        assert_eq!(d.rows, vec![vec![Value::I64(2), Value::Text("rows".into())]]);
+        ws.metrics_action(tab_id, MetricsAction::Save(vec![dbzilla_core::metrics::Board::new("b", "Saved")]));
+        assert_eq!(ws.metrics.load()[0].name, "Saved");
+        ws.metrics_action(tab_id, MetricsAction::Close);
+        assert!(ws.metrics_tab_mut().is_none());
+    }
+
     /// The ER diagram loads every table of the schema with its foreign keys and opens only once.
     #[test]
     fn diagram_loads_tables_and_foreign_keys() {
@@ -3709,7 +3822,7 @@ mod tests {
         conn.database = cfg.database.clone();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(cfg));
-        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), queries: QueryStore::new(dir.path().join("queries")) };
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), metrics: MetricsStore::new(dir.path().join("metrics.json")), queries: QueryStore::new(dir.path().join("queries")) };
         let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && w.schema_loaded);
         (dir, ws)
