@@ -345,6 +345,24 @@ impl MsConn {
         (q(&db), db, schema, oid)
     }
 
+    /// Runs one statement and returns the rows it changed (0 when the server does not report a count).
+    async fn run_counted(&mut self, sql: &str) -> DriverResult<u64> {
+        if !is_plain_dml(sql) {
+            return self.run(sql).await.map(|()| 0);
+        }
+        let client = self.ensure_client().await?;
+        let result = client.execute(sql, &[]).await.map(|r| r.total());
+        result.map_err(|e| self.fail(e))
+    }
+
+    /// Leaves the database `name` for `master` when the session is inside it, so it can be renamed or dropped.
+    async fn leave_database(&mut self, name: &str) -> DriverResult<()> {
+        if self.current_db.eq_ignore_ascii_case(name) {
+            self.set_database("master").await?;
+        }
+        Ok(())
+    }
+
     /// Runs a statement and discards its results.
     async fn run(&mut self, sql: &str) -> DriverResult<()> {
         let client = self.ensure_client().await?;
@@ -517,8 +535,30 @@ impl Conn for MsConn {
         }
     }
 
-    async fn execute_batch(&mut self, _stmts: &[String], _atomic: bool) -> DriverResult<Vec<u64>> {
-        unsupported("batch execution")
+    async fn execute_batch(&mut self, stmts: &[String], atomic: bool) -> DriverResult<Vec<u64>> {
+        if atomic {
+            self.run("BEGIN TRANSACTION").await?;
+        }
+        let mut counts = Vec::with_capacity(stmts.len());
+        for (i, stmt) in stmts.iter().enumerate() {
+            match self.run_counted(stmt).await {
+                Ok(n) => counts.push(n),
+                Err(e) => {
+                    if atomic {
+                        let _ = self.run("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
+                    }
+                    let message = match e {
+                        DriverError::Query(m) => m,
+                        other => other.to_string(),
+                    };
+                    return Err(DriverError::Query(format!("statement {} failed: {message}", i + 1)));
+                }
+            }
+        }
+        if atomic {
+            self.run("COMMIT TRANSACTION").await?;
+        }
+        Ok(counts)
     }
 
     async fn estimate_count(&mut self, t: &TableRef) -> DriverResult<Option<u64>> {
@@ -541,16 +581,35 @@ impl Conn for MsConn {
         Ok(())
     }
 
-    async fn create_database(&mut self, _req: &NewDatabase) -> DriverResult<()> {
-        unsupported("creating databases")
+    async fn create_database(&mut self, req: &NewDatabase) -> DriverResult<()> {
+        let collate = match req.collation.as_deref().filter(|c| !c.is_empty()) {
+            // The collation name is part of the statement text, so it must be a plain name.
+            Some(c) if !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') => return Err(DriverError::Query(format!("'{c}' is not a valid collation name"))),
+            Some(c) => format!(" COLLATE {c}"),
+            None => String::new(),
+        };
+        self.run(&format!("CREATE DATABASE {}{collate}", q(&req.name))).await
     }
 
-    async fn rename_database(&mut self, _from: &str, _to: &str) -> DriverResult<()> {
-        unsupported("renaming databases")
+    async fn rename_database(&mut self, from: &str, to: &str) -> DriverResult<()> {
+        self.leave_database(from).await?;
+        let (old, new) = (q(from), q(to));
+        // Renaming needs exclusive access: other sessions are rolled back and disconnected first.
+        self.run(&format!("ALTER DATABASE {old} SET SINGLE_USER WITH ROLLBACK IMMEDIATE")).await?;
+        let renamed = self.run(&format!("ALTER DATABASE {old} MODIFY NAME = {new}")).await;
+        let reopened = self.run(&format!("ALTER DATABASE {} SET MULTI_USER", if renamed.is_ok() { &new } else { &old })).await;
+        renamed.and(reopened)
     }
 
-    async fn drop_database(&mut self, _name: &str) -> DriverResult<()> {
-        unsupported("dropping databases")
+    async fn drop_database(&mut self, name: &str) -> DriverResult<()> {
+        self.leave_database(name).await?;
+        let db = q(name);
+        self.run(&format!("ALTER DATABASE {db} SET SINGLE_USER WITH ROLLBACK IMMEDIATE")).await?;
+        let dropped = self.run(&format!("DROP DATABASE {db}")).await;
+        if dropped.is_err() {
+            let _ = self.run(&format!("ALTER DATABASE {db} SET MULTI_USER")).await;
+        }
+        dropped
     }
 }
 

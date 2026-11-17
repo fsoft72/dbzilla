@@ -8,7 +8,8 @@ use chrono::{NaiveDate, NaiveTime};
 use dbzilla_core::dialect::DriverId;
 use dbzilla_core::model::{ObjectKind, TableRef};
 use dbzilla_core::value::Value;
-use dbzilla_drivers::{driver_for, ConnectConfig, Conn, DriverError, QueryOpts, SslMode};
+use dbzilla_core::dialect::dialect_for;
+use dbzilla_drivers::{driver_for, ConnectConfig, Conn, DriverError, NewDatabase, QueryOpts, SslMode};
 use std::time::{Duration, Instant};
 use support::{collect, opts, rows_of, Container};
 use uuid::Uuid;
@@ -332,4 +333,92 @@ async fn timeout_fails_and_the_connection_recovers() {
     assert!(matches!(&err, DriverError::Query(m) if m.contains("timed out")), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(10));
     conn.ping().await.unwrap();
+}
+
+/// Recreates `dbo.<table>` in the `t7_batch` database and returns a connection working in it. Every test has its
+/// own table, so they can run in parallel.
+async fn batch_fixture(port: u16, table: &str) -> Box<dyn Conn> {
+    raw_exec(port, &["IF DB_ID('t7_batch') IS NULL CREATE DATABASE t7_batch"]).await;
+    raw_exec(
+        port,
+        &[
+            &format!("USE t7_batch; IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}"),
+            &format!("USE t7_batch; CREATE TABLE dbo.{table} (a int NOT NULL, s nvarchar(100) NULL)"),
+        ],
+    )
+    .await;
+    connect(port, "t7_batch").await
+}
+
+async fn count_rows(conn: &mut Box<dyn Conn>, table: &str) -> Value {
+    let (batches, _) = collect(conn, &format!("SELECT COUNT(*) FROM dbo.{table}"), opts()).await;
+    rows_of(&batches).remove(0).remove(0)
+}
+
+#[tokio::test]
+async fn batch_returns_affected_counts() {
+    let Some(c) = container().await else { return };
+    let mut conn = batch_fixture(c.port, "t7_counts").await;
+    let stmts = ["INSERT INTO dbo.t7_counts (a) VALUES (1), (2)", "UPDATE dbo.t7_counts SET a = a + 1", "CREATE INDEX ix7 ON dbo.t7_counts (a)", "DELETE FROM dbo.t7_counts"].map(String::from);
+    assert_eq!(conn.execute_batch(&stmts, false).await.unwrap(), vec![2, 2, 0, 2]);
+}
+
+#[tokio::test]
+async fn atomic_batch_rolls_back_on_error_and_plain_batch_keeps_earlier_statements() {
+    let Some(c) = container().await else { return };
+    let mut conn = batch_fixture(c.port, "t7_atomic").await;
+    let bad = ["INSERT INTO dbo.t7_atomic (a) VALUES (1)", "INSERT INTO dbo.t7_atomic (a) VALUES (NULL)"].map(String::from);
+    let err = conn.execute_batch(&bad, true).await.unwrap_err();
+    assert!(err.to_string().contains("statement 2"), "{err}");
+    assert_eq!(count_rows(&mut conn, "t7_atomic").await, Value::I64(0));
+    assert!(conn.execute_batch(&bad, false).await.is_err());
+    assert_eq!(count_rows(&mut conn, "t7_atomic").await, Value::I64(1));
+    let good = ["INSERT INTO dbo.t7_atomic (a) VALUES (5)".to_owned()];
+    assert_eq!(conn.execute_batch(&good, true).await.unwrap(), vec![1]);
+    assert_eq!(count_rows(&mut conn, "t7_atomic").await, Value::I64(2));
+}
+
+#[tokio::test]
+async fn unicode_roundtrip_through_the_dialect_literal() {
+    let Some(c) = container().await else { return };
+    let mut conn = batch_fixture(c.port, "t7_unicode").await;
+    let text = "ciao àèì 日本 it's [x]";
+    let insert = format!("INSERT INTO dbo.t7_unicode (a, s) VALUES (1, {})", dialect_for(DriverId::SqlServer).literal(&Value::Text(text.into())));
+    conn.execute_batch(&[insert], true).await.unwrap();
+    let (batches, _) = collect(&mut conn, "SELECT s FROM dbo.t7_unicode", opts()).await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::Text(text.into())]]);
+}
+
+#[tokio::test]
+async fn creates_renames_and_drops_databases() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    for name in ["t7_made", "t7_renamed"] {
+        let _ = conn.drop_database(name).await;
+    }
+    conn.create_database(&NewDatabase { name: "t7_made".into(), encoding: None, collation: Some("Latin1_General_100_CI_AS".into()) }).await.unwrap();
+    let has = |dbs: Vec<dbzilla_drivers::DatabaseInfo>, n: &str| dbs.iter().any(|d| d.name == n);
+    assert!(has(conn.list_databases().await.unwrap(), "t7_made"));
+    let (batches, _) = collect(&mut conn, "SELECT CAST(DATABASEPROPERTYEX('t7_made', 'Collation') AS nvarchar(100))", opts()).await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::Text("Latin1_General_100_CI_AS".into())]]);
+    conn.rename_database("t7_made", "t7_renamed").await.unwrap();
+    let dbs = conn.list_databases().await.unwrap();
+    assert!(has(dbs.clone(), "t7_renamed") && !has(dbs, "t7_made"));
+    conn.drop_database("t7_renamed").await.unwrap();
+    assert!(!has(conn.list_databases().await.unwrap(), "t7_renamed"));
+    let mut inside = connect(c.port, "").await;
+    inside.create_database(&NewDatabase { name: "t7_made".into(), encoding: None, collation: None }).await.unwrap();
+    inside.set_database("t7_made").await.unwrap();
+    inside.drop_database("t7_made").await.unwrap();
+    assert!(!has(inside.list_databases().await.unwrap(), "t7_made"));
+}
+
+#[tokio::test]
+async fn a_collation_that_is_not_a_plain_name_is_refused() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let req = NewDatabase { name: "t7_bad".into(), encoding: None, collation: Some("x; DROP DATABASE master".into()) };
+    let err = conn.create_database(&req).await.unwrap_err();
+    assert!(matches!(&err, DriverError::Query(m) if m.contains("not a valid collation")), "{err:?}");
+    assert!(!conn.list_databases().await.unwrap().iter().any(|d| d.name == "t7_bad"));
 }
