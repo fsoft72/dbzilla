@@ -4,11 +4,14 @@
 
 mod support;
 
+use chrono::{NaiveDate, NaiveTime};
 use dbzilla_core::dialect::DriverId;
 use dbzilla_core::model::{ObjectKind, TableRef};
-use dbzilla_drivers::{driver_for, ConnectConfig, Conn, DriverError, SslMode};
-use std::time::Duration;
-use support::Container;
+use dbzilla_core::value::Value;
+use dbzilla_drivers::{driver_for, ConnectConfig, Conn, DriverError, QueryOpts, SslMode};
+use std::time::{Duration, Instant};
+use support::{collect, opts, rows_of, Container};
+use uuid::Uuid;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
@@ -240,4 +243,93 @@ async fn estimate_count_uses_partition_rows() {
     assert_eq!(conn.estimate_count(&parent).await.unwrap(), Some(5));
     let missing = TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "nope".into() };
     assert_eq!(conn.estimate_count(&missing).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn maps_types() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let sql = "SELECT CAST(NULL AS int), CAST(1 AS bit), CAST(12.3456789012 AS decimal(38,10)), CAST('2020-01-02T03:04:05.123' AS datetime2), \
+               CAST('2020-01-02T03:04:05.1234567+02:00' AS datetimeoffset), CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier), 0xDEADBEEF, \
+               N'ciao àèì 日本', CAST(1.5 AS float), CAST('<a/>' AS xml), CAST(12.5 AS money), CAST('2020-01-02' AS date), CAST('03:04:05' AS time), \
+               CAST(7 AS bigint), CAST(7 AS tinyint), CAST(1.5 AS real), CAST(7 AS smallint)";
+    let (batches, summary) = collect(&mut conn, sql, opts()).await;
+    let row = rows_of(&batches).remove(0);
+    let day = NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
+    let expected = [
+        Value::Null,
+        Value::Bool(true),
+        Value::Decimal("12.3456789012".into()),
+        Value::DateTime(day.and_hms_milli_opt(3, 4, 5, 123).unwrap()),
+        Value::DateTimeTz(chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05.1234567+02:00").unwrap()),
+        Value::Uuid(Uuid::parse_str("6F9619FF-8B86-D011-B42D-00C04FC964FF").unwrap()),
+        Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        Value::Text("ciao àèì 日本".into()),
+        Value::F64(1.5),
+        Value::Text("<a/>".into()),
+        Value::Decimal("12.5000".into()),
+        Value::Date(day),
+        Value::Time(NaiveTime::from_hms_opt(3, 4, 5).unwrap()),
+        Value::I64(7),
+        Value::I64(7),
+        Value::F64(1.5),
+        Value::I64(7),
+    ];
+    assert_eq!(row, expected);
+    assert!(batches[0].columns.as_ref().is_some_and(|c| c.len() == expected.len()));
+    assert_eq!(summary.affected, None);
+}
+
+#[tokio::test]
+async fn streams_in_batches_with_limit() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let sql = "SELECT TOP 1000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b";
+    let (batches, _) = collect(&mut conn, sql, QueryOpts { limit: Some(450), ..opts() }).await;
+    assert!(batches[0].columns.as_ref().is_some_and(|c| c[0].name == "n"));
+    assert!(batches[0].rows.is_empty());
+    assert!(batches.iter().all(|b| b.rows.len() <= 200));
+    assert_eq!(rows_of(&batches).len(), 450);
+    let (all, _) = collect(&mut conn, sql, opts()).await;
+    assert_eq!(rows_of(&all).len(), 1000);
+}
+
+#[tokio::test]
+async fn non_row_statement_reports_affected_rows() {
+    let Some(c) = container().await else { return };
+    raw_exec(c.port, &["IF DB_ID('t6_dml') IS NULL CREATE DATABASE t6_dml"]).await;
+    raw_exec(c.port, &["USE t6_dml; IF OBJECT_ID('dbo.t') IS NOT NULL DROP TABLE dbo.t", "USE t6_dml; CREATE TABLE dbo.t (id int IDENTITY PRIMARY KEY, v int)"]).await;
+    let mut conn = connect(c.port, "t6_dml").await;
+    let (_, inserted) = collect(&mut conn, "INSERT INTO dbo.t (v) VALUES (1), (2), (3)", opts()).await;
+    assert_eq!(inserted.affected, Some(3));
+    let (batches, updated) = collect(&mut conn, "UPDATE dbo.t SET v = v + 1", opts()).await;
+    assert_eq!((updated.affected, rows_of(&batches).len()), (Some(3), 0));
+    let (_, deleted) = collect(&mut conn, "DELETE FROM dbo.t WHERE v > 2", opts()).await;
+    assert_eq!(deleted.affected, Some(2));
+    let (batches, _) = collect(&mut conn, "INSERT INTO dbo.t (v) OUTPUT inserted.v VALUES (9)", opts()).await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::I64(9)]]);
+}
+
+#[tokio::test]
+async fn a_failing_query_is_a_query_error_and_the_connection_survives() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let err = conn.query_stream("SELECT * FROM no_such_table_here", opts(), tx).await.expect_err("must fail");
+    assert!(matches!(&err, DriverError::Query(m) if m.contains("Invalid object name")), "{err:?}");
+    while rx.recv().await.is_some() {}
+    let (batches, _) = collect(&mut conn, "SELECT 1", opts()).await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::I64(1)]]);
+}
+
+#[tokio::test]
+async fn timeout_fails_and_the_connection_recovers() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let started = Instant::now();
+    let err = conn.query_stream("WAITFOR DELAY '00:00:20'", QueryOpts { timeout: Duration::from_secs(1), ..opts() }, tx).await.expect_err("must time out");
+    assert!(matches!(&err, DriverError::Query(m) if m.contains("timed out")), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    conn.ping().await.unwrap();
 }

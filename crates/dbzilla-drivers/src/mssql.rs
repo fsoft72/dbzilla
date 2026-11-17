@@ -6,8 +6,10 @@ use dbzilla_core::caps::Capabilities;
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::ddl::create_from_structure;
 use dbzilla_core::model::{ColumnMeta, ForeignKeyRef, IndexInfo, ObjectInfo, ObjectKind, TableRef, TableStructure, TriggerInfo};
-use std::time::Duration;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Row};
+use dbzilla_core::value::Value;
+use futures_util::TryStreamExt;
+use std::time::{Duration, Instant};
+use tiberius::{AuthMethod, Client, ColumnData, ColumnType, Config, EncryptionLevel, FromSql, QueryItem, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -133,6 +135,89 @@ fn wraps_whole(text: &str) -> bool {
         }
     }
     depth == 0
+}
+
+/// True for an `INSERT`, `UPDATE`, `DELETE` or `MERGE` that returns no rows (no `OUTPUT`). Those run through
+/// `execute`, the only call that reports the number of rows they changed.
+fn is_plain_dml(sql: &str) -> bool {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail).trim_start();
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail).trim_start();
+        } else {
+            break;
+        }
+    }
+    let mut words = rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').filter(|w| !w.is_empty());
+    let first = words.next().unwrap_or_default().to_ascii_uppercase();
+    matches!(first.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE") && !words.any(|w| w.eq_ignore_ascii_case("OUTPUT"))
+}
+
+/// Converts one cell of a row to a [`Value`].
+fn to_value(row: &Row, i: usize) -> Value {
+    let Ok(data) = row.get_column_data(i) else { return Value::Null };
+    match data {
+        ColumnData::U8(v) => v.map_or(Value::Null, |n| Value::I64(i64::from(n))),
+        ColumnData::I16(v) => v.map_or(Value::Null, |n| Value::I64(i64::from(n))),
+        ColumnData::I32(v) => v.map_or(Value::Null, |n| Value::I64(i64::from(n))),
+        ColumnData::I64(v) => v.map_or(Value::Null, Value::I64),
+        // Going through the shortest text keeps 1.1f32 as 1.1 instead of 1.100000023841858.
+        ColumnData::F32(v) => v.map_or(Value::Null, |f| Value::F64(f.to_string().parse().unwrap_or(f64::from(f)))),
+        // tiberius reads money and smallmoney as f64; they always carry four decimals.
+        ColumnData::F64(v) if matches!(row.columns()[i].column_type(), ColumnType::Money | ColumnType::Money4) => v.map_or(Value::Null, |f| Value::Decimal(format!("{f:.4}"))),
+        ColumnData::F64(v) => v.map_or(Value::Null, Value::F64),
+        ColumnData::Bit(v) => v.map_or(Value::Null, Value::Bool),
+        ColumnData::String(v) => v.as_ref().map_or(Value::Null, |s| Value::Text(s.to_string())),
+        ColumnData::Guid(v) => v.map_or(Value::Null, Value::Uuid),
+        ColumnData::Binary(v) => v.as_ref().map_or(Value::Null, |b| Value::Bytes(b.to_vec())),
+        ColumnData::Numeric(v) => v.map_or(Value::Null, |n| Value::Decimal(n.to_string())),
+        ColumnData::Xml(v) => v.as_ref().map_or(Value::Null, |x| Value::Text(x.to_string())),
+        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
+            chrono::NaiveDateTime::from_sql(data).ok().flatten().map_or(Value::Null, Value::DateTime)
+        }
+        ColumnData::Date(_) => chrono::NaiveDate::from_sql(data).ok().flatten().map_or(Value::Null, Value::Date),
+        ColumnData::Time(_) => chrono::NaiveTime::from_sql(data).ok().flatten().map_or(Value::Null, Value::Time),
+        ColumnData::DateTimeOffset(_) => chrono::DateTime::<chrono::FixedOffset>::from_sql(data).ok().flatten().map_or(Value::Null, Value::DateTimeTz),
+    }
+}
+
+/// Runs one statement and streams its first result set; later result sets are read and dropped.
+async fn run_statement(client: &mut MsClient, sql: &str, opts: &QueryOpts, tx: &RowSink) -> Result<QuerySummary, tiberius::error::Error> {
+    let mut summary = QuerySummary::default();
+    if is_plain_dml(sql) {
+        summary.affected = Some(client.execute(sql, &[]).await?.total());
+        return Ok(summary);
+    }
+    let mut stream = client.simple_query(sql).await?;
+    let batch_size = opts.batch_size.max(1);
+    let (mut batch, mut total, mut width) = (Vec::with_capacity(batch_size), 0u64, 0usize);
+    // `skip`: ignore the rows that follow (limit reached or nobody listens); `closed`: the receiver is gone.
+    let (mut skip, mut closed) = (false, false);
+    while let Some(item) = stream.try_next().await? {
+        match item {
+            QueryItem::Metadata(meta) if meta.result_index() == 0 => {
+                let columns: Vec<ColumnMeta> = meta.columns().iter().enumerate().map(|(i, c)| ColumnMeta { name: c.name().to_owned(), type_name: format!("{:?}", c.column_type()).to_lowercase(), nullable: true, ordinal: i, ..Default::default() }).collect();
+                width = columns.len();
+                closed = tx.send(RowBatch { columns: Some(columns), rows: vec![] }).await.is_err();
+                skip = closed;
+            }
+            QueryItem::Row(row) if row.result_index() == 0 && !skip => {
+                batch.push((0..width).map(|i| to_value(&row, i)).collect());
+                total += 1;
+                if batch.len() >= batch_size && tx.send(RowBatch { columns: None, rows: std::mem::take(&mut batch) }).await.is_err() {
+                    closed = true;
+                }
+                skip = closed || opts.limit.is_some_and(|l| total >= l);
+            }
+            _ => {}
+        }
+    }
+    if !batch.is_empty() && !closed {
+        let _ = tx.send(RowBatch { columns: None, rows: batch }).await;
+    }
+    Ok(summary)
 }
 
 /// Builds the tiberius settings. Encryption follows the TLS mode: PREFERRED and REQUIRED encrypt without
@@ -411,8 +496,25 @@ impl Conn for MsConn {
         Ok(st)
     }
 
-    async fn query_stream(&mut self, _sql: &str, _opts: QueryOpts, _tx: RowSink) -> DriverResult<QuerySummary> {
-        unsupported("running queries")
+    async fn query_stream(&mut self, sql: &str, opts: QueryOpts, tx: RowSink) -> DriverResult<QuerySummary> {
+        let start = Instant::now();
+        self.ensure_client().await?;
+        let outcome = {
+            let client = self.client.as_mut().expect("client was just ensured");
+            tokio::time::timeout(opts.timeout, run_statement(client, sql, &opts, &tx)).await
+        };
+        match outcome {
+            Ok(Ok(mut summary)) => {
+                summary.elapsed = start.elapsed();
+                Ok(summary)
+            }
+            Ok(Err(e)) => Err(self.fail(e)),
+            Err(_) => {
+                // The half-read stream leaves the socket unusable: drop it, the next call reconnects.
+                self.client = None;
+                Err(DriverError::Query(format!("the query timed out after {} s", opts.timeout.as_secs())))
+            }
+        }
     }
 
     async fn execute_batch(&mut self, _stmts: &[String], _atomic: bool) -> DriverResult<Vec<u64>> {
@@ -466,6 +568,16 @@ mod tests {
         assert_eq!(type_text("datetime2", 8, 27, 7), "datetime2(7)");
         assert_eq!(type_text("int", 4, 10, 0), "int");
         assert_eq!(type_text("bit", 1, 1, 0), "bit");
+    }
+
+    #[test]
+    fn plain_dml_is_told_apart_from_row_returning_statements() {
+        for sql in ["UPDATE t SET a = 1", "  -- note\n insert into t values (1)", "/* x */DELETE FROM t", "merge t using s on 1=1 when matched then delete;"] {
+            assert!(is_plain_dml(sql), "{sql}");
+        }
+        for sql in ["SELECT 1", "INSERT INTO t OUTPUT inserted.id VALUES (1)", "WITH x AS (SELECT 1) UPDATE t SET a = 1", "EXEC p", "USE db", "CREATE TABLE t (a int)", ""] {
+            assert!(!is_plain_dml(sql), "{sql}");
+        }
     }
 
     #[test]
