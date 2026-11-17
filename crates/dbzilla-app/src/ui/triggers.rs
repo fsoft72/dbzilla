@@ -14,7 +14,7 @@ const TIMINGS: [&str; 2] = ["BEFORE", "AFTER"];
 /// Events the form offers.
 const EVENTS: [&str; 3] = ["INSERT", "UPDATE", "DELETE"];
 /// Why a trigger cannot go through the form.
-const NOT_EDITABLE: &str = "This trigger uses options the editor cannot keep (several events, UPDATE OF, WHEN or arguments). Edit it in a SQL tab.";
+const NOT_EDITABLE: &str = "This trigger uses options the editor cannot keep (several events, UPDATE OF, WHEN, arguments, transition tables, INSTEAD OF, TRUNCATE, a constraint trigger or a disabled trigger). Edit it in a SQL tab.";
 
 /// A trigger being created or changed.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,19 +32,32 @@ pub struct TriggerDraft {
     pub body: String,
     /// False when the original has options the form cannot represent.
     pub editable: bool,
+    /// The name this draft was last sent to the server as, so the draft can follow it once the list is read again.
+    pub submitted: Option<String>,
 }
 
 impl TriggerDraft {
     /// An empty draft for a new trigger.
     pub fn blank(driver: DriverId) -> Self {
-        Self { original: None, driver, name: String::new(), timing: TIMINGS[0].into(), event: EVENTS[0].into(), level: TriggerLevel::Row, function: None, body: String::new(), editable: true }
+        Self { original: None, driver, name: String::new(), timing: TIMINGS[0].into(), event: EVENTS[0].into(), level: TriggerLevel::Row, function: None, body: String::new(), editable: true, submitted: None }
     }
 
     /// A draft that starts from an existing trigger.
     pub fn from_info(info: &TriggerInfo, driver: DriverId) -> Self {
         let level = if info.level == "STATEMENT" { TriggerLevel::Statement } else { TriggerLevel::Row };
         let body = if driver == DriverId::MySql { info.statement.clone() } else { String::new() };
-        Self { original: Some(info.clone()), driver, name: info.name.clone(), timing: info.timing.clone(), event: info.event.clone(), level, function: info.function.clone(), body, editable: info.editable }
+        Self { original: Some(info.clone()), driver, name: info.name.clone(), timing: info.timing.clone(), event: info.event.clone(), level, function: info.function.clone(), body, editable: info.editable, submitted: None }
+    }
+
+    /// Follows the list after it was read again. Once the original is gone, the draft becomes the trigger it was
+    /// saved as (a rename, or a first save), or a new one when the server lost it (a failed MySQL edit), keeping
+    /// the text typed. While the original is still listed nothing changes: the reload has not arrived yet.
+    pub fn sync(&mut self, triggers: &[TriggerInfo]) {
+        if self.original.as_ref().is_some_and(|o| triggers.iter().any(|t| t.name == o.name)) {
+            return;
+        }
+        let name = self.name.trim();
+        self.original = self.submitted.as_deref().filter(|n| *n == name).and_then(|n| triggers.iter().find(|t| t.name == n).cloned());
     }
 
     /// The statements that save the draft: a create, preceded by a drop of the original when there is one.
@@ -58,7 +71,7 @@ impl TriggerDraft {
         generate_ddl(&create, dialect_for(self.driver).as_ref()).map_err(|e| e.to_string())?;
         let mut ops = Vec::new();
         if let Some(o) = &self.original {
-            ops.push(StructuralOp::DropTrigger { table: table.clone(), name: o.name.clone() });
+            ops.push(StructuralOp::DropTrigger { table: table.clone(), name: o.name.clone(), if_exists: true });
         }
         ops.push(create);
         Ok(ops)
@@ -67,7 +80,7 @@ impl TriggerDraft {
 
 /// The statements that delete a trigger.
 pub fn delete_ops(table: &TableRef, name: &str) -> Vec<StructuralOp> {
-    vec![StructuralOp::DropTrigger { table: table.clone(), name: name.to_owned() }]
+    vec![StructuralOp::DropTrigger { table: table.clone(), name: name.to_owned(), if_exists: false }]
 }
 
 /// State of the trigger window.
@@ -123,6 +136,9 @@ impl TriggerEditor {
     pub fn show(&mut self, ctx: &egui::Context, env: &TriggerEnv) -> Vec<TriggerAction> {
         let mut actions = Vec::new();
         let read_only = env.driver == DriverId::Sqlite;
+        if let Some(d) = self.draft.as_mut() {
+            d.sync(env.triggers);
+        }
         widgets::modal(ctx, "Triggers", |ui| {
             ui.set_min_width(640.0);
             ui.horizontal_top(|ui| {
@@ -214,11 +230,13 @@ impl TriggerEditor {
             return;
         }
         ui.add_space(6.0);
+        let mut deleted = false;
         ui.horizontal(|ui| {
             if d.editable && widgets::primary_button(ui, "Save").clicked() {
                 match d.to_ops(&self.table) {
                     Ok(ops) => {
                         self.error = None;
+                        d.submitted = Some(d.name.trim().to_owned());
                         actions.push(TriggerAction::Submit { ops, message: format!("Trigger {} saved", d.name.trim()) });
                     }
                     Err(e) => self.error = Some(e),
@@ -229,6 +247,8 @@ impl TriggerEditor {
                 muted(ui, &format!("Delete trigger {name}?"));
                 if widgets::danger_button(ui, "Delete").clicked() {
                     self.confirm_delete = false;
+                    self.selected = None;
+                    deleted = true;
                     actions.push(TriggerAction::Submit { ops: delete_ops(&self.table, &name), message: format!("Trigger {name} deleted") });
                 }
                 if widgets::secondary_button(ui, "Keep").clicked() {
@@ -238,6 +258,9 @@ impl TriggerEditor {
                 self.confirm_delete = true;
             }
         });
+        if deleted {
+            self.draft = None;
+        }
     }
 }
 
@@ -279,13 +302,13 @@ mod tests {
         let mut d = TriggerDraft::from_info(&mysql_info("a"), DriverId::MySql);
         d.name = "b".into();
         let ops = d.to_ops(&TableRef::simple("orders")).unwrap();
-        assert!(matches!(ops.as_slice(), [StructuralOp::DropTrigger { name, .. }, StructuralOp::CreateTrigger { trigger, .. }] if name == "a" && trigger.name == "b"));
+        assert!(matches!(ops.as_slice(), [StructuralOp::DropTrigger { name, if_exists: true, .. }, StructuralOp::CreateTrigger { trigger, .. }] if name == "a" && trigger.name == "b"));
     }
 
     #[test]
     fn delete_makes_one_drop_op() {
         let ops = delete_ops(&TableRef::simple("orders"), "a");
-        assert!(matches!(ops.as_slice(), [StructuralOp::DropTrigger { name, .. }] if name == "a"));
+        assert!(matches!(ops.as_slice(), [StructuralOp::DropTrigger { name, if_exists: false, .. }] if name == "a"));
     }
 
     #[test]
@@ -311,5 +334,49 @@ mod tests {
         let d = TriggerDraft::from_info(&info, DriverId::Postgres);
         assert_eq!(d.level, TriggerLevel::Statement);
         assert_eq!(d.function, info.function);
+    }
+
+    /// After a save the list is read again: the draft follows the trigger it became.
+    #[test]
+    fn sync_follows_a_rename_and_a_first_save() {
+        let mut renamed = TriggerDraft::from_info(&mysql_info("a"), DriverId::MySql);
+        renamed.name = "b".into();
+        renamed.submitted = Some("b".into());
+        renamed.sync(&[mysql_info("b")]);
+        assert_eq!(renamed.original.as_ref().map(|o| o.name.as_str()), Some("b"), "a later save drops b, not a");
+        let mut fresh = filled(DriverId::MySql);
+        fresh.submitted = Some("t1".into());
+        fresh.sync(&[mysql_info("t1")]);
+        assert_eq!(fresh.original.as_ref().map(|o| o.name.as_str()), Some("t1"), "saving a new trigger twice replaces it instead of failing");
+    }
+
+    /// A failed MySQL edit leaves no trigger: the draft becomes a new one, so fixing the body and saving works.
+    #[test]
+    fn sync_turns_a_lost_trigger_into_a_new_one() {
+        let mut d = TriggerDraft::from_info(&mysql_info("a"), DriverId::MySql);
+        d.body = "SET NEW.a = 2".into();
+        d.submitted = Some("a".into());
+        d.sync(&[]);
+        assert!(d.original.is_none());
+        assert_eq!(d.body, "SET NEW.a = 2", "the text typed is kept");
+        let ops = d.to_ops(&TableRef::simple("orders")).unwrap();
+        assert!(matches!(ops.as_slice(), [StructuralOp::CreateTrigger { .. }]));
+    }
+
+    /// A new draft whose name matches an existing trigger, without having been saved, is not that trigger.
+    #[test]
+    fn sync_never_adopts_a_trigger_that_was_not_saved_as_this_name() {
+        let mut d = filled(DriverId::MySql);
+        d.sync(&[mysql_info("t1")]);
+        assert!(d.original.is_none());
+    }
+
+    /// While the list still has the original, the draft is left alone (the reload has not arrived yet).
+    #[test]
+    fn sync_keeps_a_draft_whose_original_is_still_listed() {
+        let mut d = TriggerDraft::from_info(&mysql_info("a"), DriverId::MySql);
+        d.name = "b".into();
+        d.sync(&[mysql_info("a")]);
+        assert_eq!(d.original.as_ref().map(|o| o.name.as_str()), Some("a"));
     }
 }

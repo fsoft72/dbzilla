@@ -92,7 +92,8 @@ pub enum StructuralOp {
     DropForeignKey { table: TableRef, name: String },
     CloneTable { source: TableRef, target: TableRef, with_data: bool },
     CreateTrigger { table: TableRef, trigger: TriggerDef },
-    DropTrigger { table: TableRef, name: String },
+    /// `if_exists` makes a repeated drop harmless, for an edit whose earlier attempt already dropped the trigger.
+    DropTrigger { table: TableRef, name: String, if_exists: bool },
     /// Raw SQL (view or function definitions typed in a DDL editor).
     Raw(String),
 }
@@ -260,7 +261,7 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
         },
         StructuralOp::CloneTable { source, target, with_data } => clone_table(d, source, target, *with_data),
         StructuralOp::CreateTrigger { table, trigger } => vec![create_trigger_sql(d, table, trigger)?],
-        StructuralOp::DropTrigger { table, name } => vec![drop_trigger_sql(d, table, name)?],
+        StructuralOp::DropTrigger { table, name, if_exists } => vec![drop_trigger_sql(d, table, name, *if_exists)?],
         StructuralOp::Raw(sql) => vec![sql.clone()],
     })
 }
@@ -273,7 +274,15 @@ fn validate_trigger(d: &dyn Dialect, t: &TriggerDef) -> Result<(), DdlError> {
     if !["INSERT", "UPDATE", "DELETE"].contains(&t.event.as_str()) { return invalid("event must be INSERT, UPDATE or DELETE"); }
     if d.id() == DriverId::Postgres && t.function.is_none() { return invalid("choose the trigger function"); }
     if d.id() == DriverId::MySql && t.body.trim().is_empty() { return invalid("the trigger body is empty"); }
+    if d.id() == DriverId::MySql && has_loose_statements(&t.body) { return invalid("a body with several statements must be wrapped in BEGIN ... END"); }
     Ok(())
+}
+
+/// True when a MySQL trigger body holds more than one statement without a `BEGIN ... END` block.
+/// The server would run the extra ones at once, outside the trigger.
+fn has_loose_statements(body: &str) -> bool {
+    let statements = crate::splitter::split_statements(body, DriverId::MySql);
+    statements.len() > 1 && !body.trim_start().to_ascii_uppercase().starts_with("BEGIN")
 }
 
 /// `CREATE TRIGGER` for PostgreSQL (calls a function) and MySQL (inline body).
@@ -291,11 +300,12 @@ fn create_trigger_sql(d: &dyn Dialect, table: &TableRef, t: &TriggerDef) -> Resu
 }
 
 /// `DROP TRIGGER`: PostgreSQL names the table, MySQL qualifies the trigger with the table's database.
-fn drop_trigger_sql(d: &dyn Dialect, table: &TableRef, name: &str) -> Result<String, DdlError> {
+fn drop_trigger_sql(d: &dyn Dialect, table: &TableRef, name: &str, if_exists: bool) -> Result<String, DdlError> {
+    let exists = if if_exists { "IF EXISTS " } else { "" };
     Ok(match d.id() {
         DriverId::Sqlite => return Err(DdlError::Unsupported("triggers are read only on this database".into())),
-        DriverId::Postgres => format!("DROP TRIGGER {} ON {}", d.quote_ident(name), d.quote_table(table)),
-        DriverId::MySql => format!("DROP TRIGGER {}", d.quote_table(&TableRef { database: table.database.clone(), schema: None, name: name.to_owned() })),
+        DriverId::Postgres => format!("DROP TRIGGER {exists}{} ON {}", d.quote_ident(name), d.quote_table(table)),
+        DriverId::MySql => format!("DROP TRIGGER {exists}{}", d.quote_table(&TableRef { database: table.database.clone(), schema: None, name: name.to_owned() })),
     })
 }
 

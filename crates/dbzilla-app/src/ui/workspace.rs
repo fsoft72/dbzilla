@@ -3098,7 +3098,7 @@ impl Workspace {
     fn open_triggers(&mut self, id: TabId) {
         let Some(table) = self.table_tab_mut(id).map(|t| t.table.clone()) else { return };
         if self.conn.driver == DriverId::Postgres {
-            self.session.send(Command::LoadTriggerFunctions { schema: table.schema.clone() });
+            self.session.send(Command::LoadTriggerFunctions { schema: None });
         }
         self.triggers = Some(TriggerEditor::new(id, table));
     }

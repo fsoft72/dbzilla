@@ -278,11 +278,11 @@ fn trigger_names_are_quoted() {
 
 #[test]
 fn drop_trigger_per_dialect() {
-    let pg = StructuralOp::DropTrigger { table: pg_table("shop", "orders"), name: "trg_orders".into() };
+    let pg = StructuralOp::DropTrigger { table: pg_table("shop", "orders"), name: "trg_orders".into(), if_exists: false };
     assert_eq!(ddl(DriverId::Postgres, pg).unwrap(), vec![r#"DROP TRIGGER "trg_orders" ON "shop"."orders""#]);
-    let plain = StructuralOp::DropTrigger { table: t("orders"), name: "trg_orders".into() };
+    let plain = StructuralOp::DropTrigger { table: t("orders"), name: "trg_orders".into(), if_exists: false };
     assert_eq!(ddl(DriverId::MySql, plain).unwrap(), vec!["DROP TRIGGER `trg_orders`"]);
-    let qualified = StructuralOp::DropTrigger { table: TableRef { database: Some("shop".into()), schema: None, name: "orders".into() }, name: "trg_orders".into() };
+    let qualified = StructuralOp::DropTrigger { table: TableRef { database: Some("shop".into()), schema: None, name: "orders".into() }, name: "trg_orders".into(), if_exists: false };
     assert_eq!(ddl(DriverId::MySql, qualified).unwrap(), vec!["DROP TRIGGER `shop`.`trg_orders`"]);
 }
 
@@ -290,7 +290,7 @@ fn drop_trigger_per_dialect() {
 fn trigger_ops_are_refused_on_sqlite() {
     let create = StructuralOp::CreateTrigger { table: t("o"), trigger: mysql_trigger("t1", "SELECT 1") };
     assert!(matches!(ddl(DriverId::Sqlite, create), Err(DdlError::Unsupported(_))));
-    let drop = StructuralOp::DropTrigger { table: t("o"), name: "t1".into() };
+    let drop = StructuralOp::DropTrigger { table: t("o"), name: "t1".into(), if_exists: false };
     assert!(matches!(ddl(DriverId::Sqlite, drop), Err(DdlError::Unsupported(_))));
 }
 
@@ -306,4 +306,21 @@ fn create_trigger_validates() {
     let mut bad_event = mysql_trigger("t1", "SELECT 1");
     bad_event.event = "TRUNCATE".into();
     assert!(invalid(DriverId::MySql, bad_event), "event");
+}
+
+#[test]
+fn drop_trigger_if_exists_per_dialect() {
+    let pg = StructuralOp::DropTrigger { table: pg_table("shop", "orders"), name: "trg".into(), if_exists: true };
+    assert_eq!(ddl(DriverId::Postgres, pg).unwrap(), vec![r#"DROP TRIGGER IF EXISTS "trg" ON "shop"."orders""#]);
+    let my = StructuralOp::DropTrigger { table: TableRef { database: Some("shop".into()), schema: None, name: "orders".into() }, name: "trg".into(), if_exists: true };
+    assert_eq!(ddl(DriverId::MySql, my).unwrap(), vec!["DROP TRIGGER IF EXISTS `shop`.`trg`"]);
+}
+
+/// MySQL runs a second statement of a multi-statement body on its own, so a body with several statements needs BEGIN ... END.
+#[test]
+fn create_trigger_mysql_refuses_extra_statements_outside_begin_end() {
+    let create = |body: &str| ddl(DriverId::MySql, StructuralOp::CreateTrigger { table: t("orders"), trigger: mysql_trigger("t1", body) });
+    assert!(matches!(create("UPDATE stats SET n = n + 1; DELETE FROM audit"), Err(DdlError::Invalid(m)) if m.contains("BEGIN")));
+    assert!(create("SET NEW.a = 1;").is_ok(), "a trailing semicolon is one statement");
+    assert!(create("BEGIN UPDATE stats SET n = n + 1; DELETE FROM audit; END").is_ok());
 }
