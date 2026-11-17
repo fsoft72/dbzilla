@@ -2969,7 +2969,7 @@ impl Workspace {
                 if widgets::ico_button(ui, Ico::Bolt, &tip("Show metrics board", Action::ShowMetrics)).clicked() {
                     self.open_metrics();
                 }
-                if widgets::ico_button(ui, Ico::Console, &tip("Process list", Action::ProcessList)).clicked() {
+                if dbzilla_core::processes::supported(self.conn.driver) && widgets::ico_button(ui, Ico::Console, &tip("Process list", Action::ProcessList)).clicked() {
                     self.open_process_list();
                 }
                 if widgets::ico_button(ui, Ico::Search, &tip("Open anything", Action::OpenAnything)).clicked() {
