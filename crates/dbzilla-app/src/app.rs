@@ -234,7 +234,7 @@ impl App {
         session.send(Command::Connect(config_for(&conn, password.clone())));
         let job_env = crate::ui::jobs::JobEnv { rt: self.rt.handle().clone(), cfg: config_for(&conn, password.clone()), names: dbzilla_io::naming::NameContext::now(&conn.name, &conn.database, "") };
         let repaint_for_jobs = ctx.clone();
-        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries, self.settings.page_size, password, Stores { history: HistoryStore::new(self.paths.history_dir(), self.settings.history_enabled), diagrams: dbzilla_store::diagrams::DiagramStore::new(self.paths.diagrams_file()), metrics: dbzilla_store::metrics::MetricsStore::new(self.paths.metrics_file()), queries: QueryStore::new(self.paths.queries_dir()) }));
+        self.workspaces.push(Workspace::new(conn, session, self.settings.console_max_entries, self.settings.page_size, password, Stores { history: HistoryStore::new(self.paths.history_dir(), self.settings.history_enabled), diagrams: dbzilla_store::diagrams::DiagramStore::new(self.paths.diagrams_file()), metrics: dbzilla_store::metrics::MetricsStore::new(self.paths.metrics_file()), queries: QueryStore::new(self.paths.queries_dir()), backup: dbzilla_store::backup::BackupStore::new(self.paths.backup_file()) }));
         if let Some(ws) = self.workspaces.last_mut() {
             ws.set_job_env(job_env, Arc::new(move || repaint_for_jobs.request_repaint()));
         }

@@ -8,6 +8,7 @@ use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
 use super::diagram::{self, DiagramAction, DiagramTab};
 use super::metrics::{self, MetricsAction, MetricsTab};
+use super::backup::{self, BackupAction, BackupSheet};
 use super::process::{self, ProcessAction, ProcessList};
 use dbzilla_core::diagram::DocLink;
 use super::pending::default_key_columns;
@@ -188,6 +189,7 @@ pub struct Stores {
     pub diagrams: DiagramStore,
     pub metrics: MetricsStore,
     pub queries: QueryStore,
+    pub backup: dbzilla_store::backup::BackupStore,
 }
 
 /// Dialog saving a statement as a query file.
@@ -219,6 +221,8 @@ enum GateAction {
     Run { labels: Vec<Option<String>>, originals: Vec<String> },
     /// Statements that stop queries, run by the process list.
     Kill,
+    /// A restore held by the backup sheet.
+    Restore,
 }
 
 /// A statement list waiting for the safe-mode answer.
@@ -350,6 +354,7 @@ pub struct Workspace {
     history: HistoryStore,
     diagrams: DiagramStore,
     metrics: MetricsStore,
+    backup_store: dbzilla_store::backup::BackupStore,
     queries: QueryStore,
     history_cache: Vec<HistoryEntry>,
     history_for: Option<String>,
@@ -383,6 +388,8 @@ pub struct Workspace {
     clipboard_out: Option<String>,
     /// The process list sheet, when open.
     process: Option<ProcessList>,
+    /// The backup and restore sheet, when open.
+    backup: Option<BackupSheet>,
     new_table_no: usize,
     log_original: bool,
     sql_counter: usize,
@@ -436,6 +443,7 @@ impl Workspace {
             history: stores.history,
             diagrams: stores.diagrams,
             metrics: stores.metrics,
+            backup_store: stores.backup,
             queries: stores.queries,
             history_cache: Vec::new(),
             history_for: None,
@@ -467,6 +475,7 @@ impl Workspace {
             pending_copy: None,
             clipboard_out: None,
             process: None,
+            backup: None,
             new_table_no: 0,
             log_original: false,
             sql_counter: 0,
@@ -493,6 +502,9 @@ impl Workspace {
         }
         if let Some(p) = self.process.as_mut() {
             p.poll();
+        }
+        if let Some(outcome) = self.backup.as_mut().and_then(BackupSheet::poll) {
+            self.notices.push(outcome);
         }
         for (title, state) in self.jobs.poll() {
             match state {
@@ -992,6 +1004,8 @@ impl Workspace {
             Action::ShowDiagram => self.open_diagram(),
             Action::ShowMetrics => self.open_metrics(),
             Action::ProcessList => self.open_process_list(),
+            Action::Backup => self.open_backup(false),
+            Action::Restore => self.open_backup(true),
             Action::ShowData => self.set_view(TabView::Data),
             Action::ShowStructure => self.set_view(TabView::Structure),
             Action::NewSqlEditor => self.open_sql(String::new()),
@@ -1166,6 +1180,42 @@ impl Workspace {
             return;
         };
         self.process = Some(ProcessList::open(env, repaint));
+    }
+
+    /// Opens the backup and restore sheet on the wanted tab, or says why it cannot.
+    pub fn open_backup(&mut self, restore: bool) {
+        if let Some(b) = self.backup.as_mut() {
+            b.show_tab(restore);
+            return;
+        }
+        let (Some(env), Some(repaint)) = (self.job_env.as_ref(), self.repaint.clone()) else {
+            self.notices.push((true, "Backup needs a connection".into()));
+            return;
+        };
+        let databases = self.databases.iter().map(|d| d.name.clone()).collect();
+        self.backup = Some(BackupSheet::open(env, repaint, self.backup_store.clone(), &self.conn.id, databases, &self.current_db, restore));
+    }
+
+    /// Draws the backup sheet and acts on its requests. A restore writes data, so it asks the safe mode first.
+    fn backup_sheet(&mut self, ctx: &egui::Context) {
+        let Some(sheet) = self.backup.as_mut() else { return };
+        match backup::show(ctx, sheet) {
+            Some(BackupAction::Dismiss) => self.backup = None,
+            Some(BackupAction::Restore(lines)) => {
+                let level = self.conn.safe_level;
+                let kind = dbzilla_core::safemode::StatementKind::Write;
+                let modal = |needs_password: bool| GateModal { action: GateAction::Restore, statements: lines.clone(), needs_password, input: String::new(), reveal: false, tab: 0, error: None };
+                if level.requires_password(kind) {
+                    let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                    self.gate = Some(modal(known));
+                } else if level.requires_confirm(kind) {
+                    self.gate = Some(modal(false));
+                } else if let Some(b) = self.backup.as_mut() {
+                    b.confirm_restore();
+                }
+            }
+            None => {}
+        }
     }
 
     /// Draws the process list sheet and acts on its requests.
@@ -2502,6 +2552,7 @@ impl Workspace {
         self.database_dialogs(ctx);
         self.job_dialogs(ctx);
         self.process_sheet(ctx);
+        self.backup_sheet(ctx);
         if let Some(d) = self.save_dialog.as_mut() {
             let mut decision = None;
             widgets::modal(ctx, "Add to Queries", |ui| {
@@ -2652,6 +2703,11 @@ impl Workspace {
                                 GateAction::Import(title, req) => self.spawn_import_now(title, req),
                                 GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
                                 GateAction::Kill => self.kill_now(g.statements),
+                                GateAction::Restore => {
+                                    if let Some(b) = self.backup.as_mut() {
+                                        b.confirm_restore();
+                                    }
+                                }
                             }
                         }
                     } else if let Some(g) = self.gate.as_mut() {
@@ -2956,6 +3012,9 @@ impl Workspace {
                 if widgets::ico_button(ui, Ico::Import, "Import data").clicked() {
                     self.open_import(None);
                 }
+                if widgets::ico_button(ui, Ico::Folder, &tip("Backup and restore", Action::Backup)).clicked() {
+                    self.open_backup(false);
+                }
                 jobs::bell(ui, &mut self.jobs);
                 if widgets::ico_button(ui, Ico::Database, &tip("Open a database", Action::OpenDatabase)).clicked() {
                     self.db_picker = Some(DbPicker { query: String::new(), selected: None });
@@ -3227,7 +3286,7 @@ mod tests {
         conn.database = path.to_string_lossy().into_owned();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: conn.database.clone(), ssl: SslMode::Disabled, bootstrap: vec![] }));
-        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), metrics: MetricsStore::new(dir.path().join("metrics.json")), queries: QueryStore::new(dir.path().join("queries")) };
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), metrics: MetricsStore::new(dir.path().join("metrics.json")), queries: QueryStore::new(dir.path().join("queries")), backup: dbzilla_store::backup::BackupStore::new(dir.path().join("backup.json")) };
         let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && !w.objects.is_empty());
         (dir, path, ws)
@@ -3890,7 +3949,7 @@ mod tests {
         conn.database = cfg.database.clone();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(cfg));
-        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), metrics: MetricsStore::new(dir.path().join("metrics.json")), queries: QueryStore::new(dir.path().join("queries")) };
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), metrics: MetricsStore::new(dir.path().join("metrics.json")), queries: QueryStore::new(dir.path().join("queries")), backup: dbzilla_store::backup::BackupStore::new(dir.path().join("backup.json")) };
         let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && w.schema_loaded);
         (dir, ws)
