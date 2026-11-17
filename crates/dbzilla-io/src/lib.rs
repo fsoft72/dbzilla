@@ -1,5 +1,6 @@
 //! Import and export of table data (SPEC 12): streaming writers and batch importers.
 
+pub mod backup;
 pub mod convert;
 pub mod export;
 pub mod import;

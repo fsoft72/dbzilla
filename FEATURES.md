@@ -10,7 +10,8 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 - [x] Process list UI with kill (11.4): PostgreSQL and MySQL/MariaDB
 - [ ] Process list, still missing: SQL Server, left list of databases for MySQL, Quick Look and export of the page, `Mod+.` shortcut (taken by Cancel Running Queries), `Tools` menu entry
 - [ ] User management with a SQL preview before apply (11.5)
-- [ ] Backup and restore for PostgreSQL, MySQL and MariaDB (12.3)
+- [x] Backup and restore for PostgreSQL, MySQL and MariaDB (12.3), plus a tar.bz2 backup for SQLite
+- [ ] Backup and restore, still missing: tool version picker, connection picker inside the sheet, job entry in the notifications bell, `File` menu entries, Open Anything entries
 - [ ] View Using Encoding to re-decode text columns (11.6)
 
 ## Tables and structure

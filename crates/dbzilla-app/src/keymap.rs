@@ -41,11 +41,13 @@ pub enum Action {
     ShowDiagram,
     ShowMetrics,
     ProcessList,
+    Backup,
+    Restore,
 }
 
 impl Action {
     /// Every action, for the command palette and the keymap editor.
-    pub const ALL: [Action; 35] = [
+    pub const ALL: [Action; 37] = [
         Action::OpenAnything,
         Action::OpenDatabase,
         Action::OpenConnection,
@@ -81,6 +83,8 @@ impl Action {
         Action::ShowDiagram,
         Action::ShowMetrics,
         Action::ProcessList,
+        Action::Backup,
+        Action::Restore,
     ];
 
     /// Name shown in menus, tooltips and the palette.
@@ -121,6 +125,8 @@ impl Action {
             Action::ShowDiagram => "Show Diagram",
             Action::ShowMetrics => "Show Metrics Board",
             Action::ProcessList => "Process List",
+            Action::Backup => "Backup Database",
+            Action::Restore => "Restore Database",
         }
     }
 }

@@ -1,6 +1,7 @@
 //! DBZilla store: settings, connections, history, saved queries and secrets.
 
 pub mod atomic;
+pub mod backup;
 pub mod connections;
 pub mod diagrams;
 pub mod history;

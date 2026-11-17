@@ -45,6 +45,11 @@ impl AppPaths {
         self.root.join("metrics.json")
     }
 
+    /// `backup.json` (backup and restore choices per connection).
+    pub fn backup_file(&self) -> PathBuf {
+        self.root.join("backup.json")
+    }
+
     /// `tags.json`.
     pub fn tags_file(&self) -> PathBuf {
         self.root.join("tags.json")
