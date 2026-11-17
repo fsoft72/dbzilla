@@ -15,3 +15,4 @@ pub mod url;
 pub mod paging;
 pub mod rowlimit;
 pub mod params;
+pub mod diagram;

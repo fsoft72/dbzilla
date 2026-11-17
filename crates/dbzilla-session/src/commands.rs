@@ -50,6 +50,8 @@ pub enum Command {
     LoadDatabases,
     LoadSchema { db: String, schema: Option<String> },
     LoadStructure(TableRef),
+    /// Structure of every table of a schema, for the ER diagram.
+    LoadDiagram { db: String, schema: Option<String> },
     EstimateCount { req: RequestId, table: TableRef },
     UseDatabase(String),
     FetchPage(Box<PageRequest>),
@@ -71,6 +73,8 @@ pub enum Event {
     Databases(Vec<DatabaseInfo>),
     Schema { db: String, schema: Option<String>, schemas: Vec<String>, objects: Vec<ObjectInfo> },
     Structure(Box<TableStructure>),
+    /// Every table of a schema; `skipped` lists the tables that could not be read.
+    Diagram { schema: Option<String>, tables: Vec<TableStructure>, skipped: Vec<String> },
     DatabaseChanged(String),
     StatementStarted { req: RequestId, index: usize, sql: String },
     RowBatch { req: RequestId, index: usize, columns: Option<Vec<ColumnMeta>>, rows: Vec<Row> },

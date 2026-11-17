@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::dialect::{Dialect, DriverId};
-use dbzilla_core::model::{ColumnMeta, ObjectInfo, Row, TableRef, TableStructure};
+use dbzilla_core::model::{ColumnMeta, ObjectInfo, ObjectKind, Row, TableRef, TableStructure};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -137,6 +137,19 @@ pub trait Conn: Send {
     async fn list_schemas(&mut self, db: &str) -> DriverResult<Vec<String>>;
     async fn list_objects(&mut self, db: &str, schema: Option<&str>) -> DriverResult<Vec<ObjectInfo>>;
     async fn table_structure(&mut self, t: &TableRef) -> DriverResult<TableStructure>;
+    /// Structure of every table of a schema (views excluded), for the ER diagram.
+    /// A table that cannot be read is skipped and reported in the second element.
+    async fn schema_structures(&mut self, db: &str, schema: Option<&str>) -> DriverResult<(Vec<TableStructure>, Vec<String>)> {
+        let objects = self.list_objects(db, schema).await?;
+        let (mut tables, mut skipped) = (Vec::new(), Vec::new());
+        for o in objects.into_iter().filter(|o| o.kind == ObjectKind::Table) {
+            match self.table_structure(&o.table).await {
+                Ok(st) => tables.push(st),
+                Err(e) => skipped.push(format!("{}: {e}", o.table.name)),
+            }
+        }
+        Ok((tables, skipped))
+    }
     /// Runs one statement, streaming rows through `tx` (awaiting for back-pressure).
     async fn query_stream(&mut self, sql: &str, opts: QueryOpts, tx: RowSink) -> DriverResult<QuerySummary>;
     /// Runs statements in order; with `atomic` inside one transaction. Returns affected rows per statement.

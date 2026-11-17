@@ -230,6 +230,10 @@ impl Actor {
                 Ok(st) => self.out.emit(Event::Structure(Box::new(st))).await,
                 Err(e) => self.out.emit(Event::Error { error: format!("cannot read the structure of {}: {e}", t.name) }).await,
             },
+            Command::LoadDiagram { db, schema } => match conn.schema_structures(&db, schema.as_deref()).await {
+                Ok((tables, skipped)) => self.out.emit(Event::Diagram { schema, tables, skipped }).await,
+                Err(e) => self.out.emit(Event::Error { error: format!("cannot read the schema for the diagram: {e}") }).await,
+            },
             Command::EstimateCount { req, table } => {
                 let count = conn.estimate_count(&table).await.unwrap_or(None);
                 self.out.emit(Event::Estimate { req, count }).await;

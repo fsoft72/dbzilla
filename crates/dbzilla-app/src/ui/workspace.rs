@@ -6,6 +6,7 @@ use super::jobs::{self, ExportDialog, ImportDialog, JobCenter, JobEnv, JobState}
 use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
+use super::diagram::{self, DiagramAction, DiagramTab};
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
 use super::sidebar::{self, ExtraAction, SidebarAction, SidebarState, SidebarTab};
@@ -231,6 +232,7 @@ struct KeyDialog {
 pub enum TabKind {
     Table(Box<TableTab>),
     Sql(Box<SqlTab>),
+    Diagram(Box<DiagramTab>),
 }
 
 /// A tab of the dock.
@@ -252,6 +254,7 @@ impl Tab {
         match &self.kind {
             TabKind::Table(t) => t.table.name.clone(),
             TabKind::Sql(s) => format!("SQL {}", s.no),
+            TabKind::Diagram(_) => "Diagram".to_owned(),
         }
     }
 }
@@ -555,6 +558,11 @@ impl Workspace {
                 self.objects = objects;
             }
             Event::Structure(st) => self.apply_structure(*st),
+            Event::Diagram { tables, skipped, .. } => {
+                if let Some(d) = self.diagram_tab_mut() {
+                    d.set_tables(tables, skipped);
+                }
+            }
             Event::StatementStarted { req, index, sql } => self.on_statement_started(req, index, sql),
             Event::RowBatch { req, index, columns, rows } => match self.req_map.get(&req).copied() {
                 Some((id, ReqKind::Sql)) => self.on_sql_rows(id, index, columns, rows),
@@ -611,7 +619,7 @@ impl Workspace {
     fn table_tab_mut(&mut self, id: TabId) -> Option<&mut TableTab> {
         self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).and_then(|t| match &mut t.kind {
             TabKind::Table(tt) => Some(tt.as_mut()),
-            TabKind::Sql(_) => None,
+            TabKind::Sql(_) | TabKind::Diagram(_) => None,
         })
     }
 
@@ -780,6 +788,7 @@ impl Workspace {
             .map(|(_, t)| match &t.kind {
                 TabKind::Table(tt) => TabMeta { id: t.id, target: TabTarget::Table(tt.table.clone()), pinned: t.pinned, dirty: false },
                 TabKind::Sql(sq) => TabMeta { id: t.id, target: TabTarget::Sql(t.id), pinned: true, dirty: !sq.text.is_empty() },
+                TabKind::Diagram(_) => TabMeta { id: t.id, target: TabTarget::Diagram, pinned: true, dirty: false },
             })
             .collect()
     }
@@ -793,7 +802,7 @@ impl Workspace {
     fn active_table(&mut self) -> Option<TableRef> {
         self.dock.find_active_focused().and_then(|(_, t)| match &t.kind {
             TabKind::Table(tt) => Some(tt.table.clone()),
-            TabKind::Sql(_) => None,
+            TabKind::Sql(_) | TabKind::Diagram(_) => None,
         })
     }
 
@@ -918,6 +927,7 @@ impl Workspace {
                 let tables: Vec<TableRef> = self.objects.iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::View)).map(|o| o.table.clone()).collect();
                 self.search = Some(SearchState::new(&tables));
             }
+            Action::ShowDiagram => self.open_diagram(),
             Action::ShowData => self.set_view(TabView::Data),
             Action::ShowStructure => self.set_view(TabView::Structure),
             Action::NewSqlEditor => self.open_sql(String::new()),
@@ -961,7 +971,7 @@ impl Workspace {
             let id = t.id;
             match &mut t.kind {
                 TabKind::Table(tt) => Some((id, tt.as_mut())),
-                TabKind::Sql(_) => None,
+                TabKind::Sql(_) | TabKind::Diagram(_) => None,
             }
         })
     }
@@ -972,7 +982,7 @@ impl Workspace {
             let id = t.id;
             match &mut t.kind {
                 TabKind::Sql(sq) => Some((id, sq.as_mut())),
-                TabKind::Table(_) => None,
+                TabKind::Table(_) | TabKind::Diagram(_) => None,
             }
         })
     }
@@ -981,8 +991,61 @@ impl Workspace {
     fn sql_tab_mut(&mut self, id: TabId) -> Option<&mut SqlTab> {
         self.dock.iter_all_tabs_mut().map(|(_, t)| t).find(|t| t.id == id).and_then(|t| match &mut t.kind {
             TabKind::Sql(sq) => Some(sq.as_mut()),
-            TabKind::Table(_) => None,
+            TabKind::Table(_) | TabKind::Diagram(_) => None,
         })
+    }
+
+    /// The ER diagram tab, if open.
+    fn diagram_tab_mut(&mut self) -> Option<&mut DiagramTab> {
+        self.dock.iter_all_tabs_mut().map(|(_, t)| t).find_map(|t| match &mut t.kind {
+            TabKind::Diagram(d) => Some(d.as_mut()),
+            _ => None,
+        })
+    }
+
+    /// Asks the session for every table of the current schema.
+    fn request_diagram(&mut self) {
+        let schema = if self.caps.schemas { Some(self.current_schema.clone().unwrap_or_else(|| "public".into())) } else { None };
+        self.session.send(Command::LoadDiagram { db: self.current_db.clone(), schema });
+    }
+
+    /// Opens the ER diagram of the current schema, or focuses the one already open.
+    pub fn open_diagram(&mut self) {
+        let existing = self.tab_metas().into_iter().find(|t| t.target == TabTarget::Diagram).map(|t| t.id);
+        if let Some(id) = existing {
+            if let Some(loc) = self.tab_location(id) {
+                self.dock.set_active_tab(loc);
+                self.dock.set_focused_node_and_surface((loc.0, loc.1));
+            }
+            return;
+        }
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.dock.push_to_focused_leaf(Tab { id, pinned: true, kind: TabKind::Diagram(Box::new(DiagramTab::new())) });
+        if let Some(loc) = self.tab_location(id) {
+            self.dock.set_active_tab(loc);
+            self.dock.set_focused_node_and_surface((loc.0, loc.1));
+        }
+        self.request_diagram();
+    }
+
+    /// Reacts to a request of the diagram tab.
+    fn diagram_action(&mut self, id: TabId, a: DiagramAction) {
+        match a {
+            DiagramAction::Close => self.retain_tabs(|t| t.id != id),
+            DiagramAction::Rearrange => {
+                if let Some(d) = self.diagram_tab_mut() {
+                    d.start_loading();
+                }
+                self.request_diagram();
+            }
+            DiagramAction::OpenTable(name) => {
+                let table = self.objects.iter().find(|o| o.table.name == name).map(|o| o.table.clone());
+                if let Some(t) = table {
+                    self.open_table(t, OpenMode::Pin);
+                }
+            }
+        }
     }
 
     /// Opens a new SQL editor tab.
@@ -2044,6 +2107,7 @@ impl Workspace {
         let mut data_actions: Vec<(TabId, DataAction)> = Vec::new();
         let mut sql_actions: Vec<(TabId, SqlAction)> = Vec::new();
         let mut struct_actions: Vec<(TabId, StructAction)> = Vec::new();
+        let mut diagram_actions: Vec<(TabId, DiagramAction)> = Vec::new();
         self.fmt_width = env.settings.indent_width;
         self.fmt_with = env.settings.indent_with;
         self.fmt_kind = env.settings.indent_type;
@@ -2080,7 +2144,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key, vim: env.settings.key_binding == dbzilla_store::settings::KeyBinding::Vim, indent_width: env.settings.indent_width, indent_spaces: env.settings.indent_with == dbzilla_store::settings::IndentWith::Spaces };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, diagram_actions: &mut diagram_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key, vim: env.settings.key_binding == dbzilla_store::settings::KeyBinding::Vim, indent_width: env.settings.indent_width, indent_spaces: env.settings.indent_with == dbzilla_store::settings::IndentWith::Spaces };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -2096,6 +2160,9 @@ impl Workspace {
         }
         for (_, a) in sql_actions {
             self.sql_action(a);
+        }
+        for (id, a) in diagram_actions {
+            self.diagram_action(id, a);
         }
         for (id, a) in struct_actions {
             self.struct_action(id, a);
@@ -2676,6 +2743,7 @@ struct Viewer<'a> {
     row_height: f32,
     structures: &'a HashMap<TableRef, TableStructure>,
     sql_actions: &'a mut Vec<(TabId, SqlAction)>,
+    diagram_actions: &'a mut Vec<(TabId, DiagramAction)>,
     struct_actions: &'a mut Vec<(TabId, StructAction)>,
     caps: &'a Capabilities,
     keywords: &'a HashSet<String>,
@@ -2702,6 +2770,12 @@ impl TabViewer for Viewer<'_> {
         let id = tab.id;
         let t = match &mut tab.kind {
             TabKind::Table(t) => t,
+            TabKind::Diagram(d) => {
+                for a in diagram::show(ui, d) {
+                    self.diagram_actions.push((id, a));
+                }
+                return;
+            }
             TabKind::Sql(sq) => {
                 let tables: Vec<(&str, bool)> = self
                     .objects
@@ -3246,6 +3320,26 @@ mod tests {
         assert_eq!(name_of_row(&mut ws, 0), Value::Text("beta".into()), "OR keeps rows matching any filter");
         ws.apply_filters(id, vec![], false);
         wait(&mut ws, |w| w.active_tab_mut().is_some_and(|(_, t)| !t.data.loading && t.data.rows.len() == 2));
+    }
+
+    /// The ER diagram loads every table of the schema with its foreign keys and opens only once.
+    #[test]
+    fn diagram_loads_tables_and_foreign_keys() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER REFERENCES p(id)); CREATE VIEW v AS SELECT * FROM t;").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "c"));
+        ws.handle_action(Action::ShowDiagram);
+        ws.handle_action(Action::ShowDiagram);
+        assert_eq!(ws.tab_metas().iter().filter(|t| t.target == TabTarget::Diagram).count(), 1);
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let d = ws.diagram_tab_mut().unwrap();
+        assert_eq!(d.table_count(), 3, "t, p and c; the view is left out");
+        assert_eq!(d.edge_count(), 1);
+        assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+        ws.diagram_action(ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id, DiagramAction::Close);
+        assert!(ws.diagram_tab_mut().is_none());
     }
 
     /// Search in Database scans every table and lists the ones with matches.

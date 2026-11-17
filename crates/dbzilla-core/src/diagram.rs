@@ -1,0 +1,372 @@
+//! ER diagram model (SPEC 11.3): tables, foreign key edges, colour groups and an automatic layout.
+//! Pure data and geometry, no UI and no I/O.
+
+use crate::model::TableStructure;
+
+/// Gap between two tables in the automatic layout.
+const GAP_X: f32 = 80.0;
+const GAP_Y: f32 = 40.0;
+
+/// A column of a table box.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagramColumn {
+    pub name: String,
+    pub type_name: String,
+    pub is_pk: bool,
+    pub is_fk: bool,
+}
+
+/// A table box.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagramTable {
+    pub name: String,
+    pub columns: Vec<DiagramColumn>,
+}
+
+/// A foreign key line from a column to the column it references.
+/// `to_column` is `None` when the target column is unknown, so the line ends on the table header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagramEdge {
+    pub from_table: usize,
+    pub from_column: usize,
+    pub to_table: usize,
+    pub to_column: Option<usize>,
+}
+
+/// Order of the tables in the diagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiagramSort {
+    #[default]
+    Name,
+    ColumnCount,
+}
+
+/// Tables and foreign keys of one schema.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Diagram {
+    pub tables: Vec<DiagramTable>,
+    pub edges: Vec<DiagramEdge>,
+}
+
+impl Diagram {
+    /// Builds the diagram of the given tables. Foreign keys to tables that are not in the list are ignored.
+    pub fn build(structures: &[TableStructure], sort: DiagramSort) -> Diagram {
+        let mut ordered: Vec<&TableStructure> = structures.iter().collect();
+        match sort {
+            DiagramSort::Name => ordered.sort_by_key(|s| s.table.name.to_lowercase()),
+            DiagramSort::ColumnCount => ordered.sort_by(|a, b| b.columns.len().cmp(&a.columns.len()).then_with(|| a.table.name.to_lowercase().cmp(&b.table.name.to_lowercase()))),
+        }
+        let tables = ordered
+            .iter()
+            .map(|s| DiagramTable {
+                name: s.table.name.clone(),
+                columns: s.columns.iter().map(|c| DiagramColumn { name: c.name.clone(), type_name: c.type_name.clone(), is_pk: c.is_pk, is_fk: c.fk.is_some() }).collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut edges = Vec::new();
+        for (from_table, s) in ordered.iter().enumerate() {
+            for (from_column, col) in s.columns.iter().enumerate() {
+                let Some(fk) = &col.fk else { continue };
+                let Some(to_table) = ordered.iter().position(|t| t.table.name == fk.table.name) else { continue };
+                let target = ordered[to_table];
+                let wanted = fk.columns.first().cloned().or_else(|| target.primary_key.first().cloned());
+                let to_column = wanted.and_then(|w| target.columns.iter().position(|c| c.name == w));
+                edges.push(DiagramEdge { from_table, from_column, to_table, to_column });
+            }
+        }
+        Diagram { tables, edges }
+    }
+
+    /// Colour group of each table: tables linked by foreign keys share a group, the others get `None`.
+    /// Groups are numbered from 0 in order of first appearance.
+    pub fn groups(&self) -> Vec<Option<usize>> {
+        let mut parent: Vec<usize> = (0..self.tables.len()).collect();
+        let mut linked = vec![false; self.tables.len()];
+        for e in self.edges.iter().filter(|e| e.from_table != e.to_table) {
+            linked[e.from_table] = true;
+            linked[e.to_table] = true;
+            let (a, b) = (find(&mut parent, e.from_table), find(&mut parent, e.to_table));
+            if a != b {
+                parent[a] = b;
+            }
+        }
+        let mut ids: Vec<(usize, usize)> = Vec::new();
+        (0..self.tables.len())
+            .map(|i| {
+                if !linked[i] {
+                    return None;
+                }
+                let root = find(&mut parent, i);
+                if let Some((_, id)) = ids.iter().find(|(r, _)| *r == root) {
+                    return Some(*id);
+                }
+                ids.push((root, ids.len()));
+                Some(ids.len() - 1)
+            })
+            .collect()
+    }
+
+    /// Indexes of the tables whose name or a column name contains `needle` (case insensitive).
+    pub fn search(&self, needle: &str) -> Vec<usize> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        (0..self.tables.len()).filter(|&i| self.tables[i].name.to_lowercase().contains(&needle) || self.tables[i].columns.iter().any(|c| c.name.to_lowercase().contains(&needle))).collect()
+    }
+
+    /// Top-left position of every table given the size of each box. Referenced tables go to the left of the
+    /// tables that reference them; linked tables are laid out together and the groups are packed in rows.
+    pub fn layout(&self, sizes: &[(f32, f32)]) -> Vec<(f32, f32)> {
+        let n = self.tables.len();
+        if n == 0 || sizes.len() != n {
+            return Vec::new();
+        }
+        let mut parent: Vec<usize> = (0..n).collect();
+        for e in self.edges.iter().filter(|e| e.from_table != e.to_table) {
+            let (a, b) = (find(&mut parent, e.from_table), find(&mut parent, e.to_table));
+            if a != b {
+                parent[a] = b;
+            }
+        }
+        let mut components: Vec<Vec<usize>> = Vec::new();
+        let mut roots: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            match roots.iter().position(|r| *r == root) {
+                Some(k) => components[k].push(i),
+                None => {
+                    roots.push(root);
+                    components.push(vec![i]);
+                }
+            }
+        }
+        // Biggest blocks first, so the rows are filled with the small ones at the end.
+        components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+        let blocks: Vec<Block> = components.iter().map(|c| self.layout_component(c, sizes)).collect();
+        let total_area: f32 = blocks.iter().map(|b| (b.width + GAP_X) * (b.height + GAP_Y)).sum();
+        let widest = blocks.iter().map(|b| b.width).fold(0.0, f32::max);
+        let row_width = widest.max(total_area.sqrt() * 1.6);
+        let mut out = vec![(0.0, 0.0); n];
+        let (mut x, mut y, mut row_height) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for block in &blocks {
+            if x > 0.0 && x + block.width > row_width {
+                x = 0.0;
+                y += row_height + GAP_Y;
+                row_height = 0.0;
+            }
+            for (t, (dx, dy)) in &block.positions {
+                out[*t] = (x + dx, y + dy);
+            }
+            x += block.width + GAP_X;
+            row_height = row_height.max(block.height);
+        }
+        out
+    }
+
+    /// Layered layout of the tables of one linked group.
+    fn layout_component(&self, members: &[usize], sizes: &[(f32, f32)]) -> Block {
+        let mut rank = vec![0_usize; self.tables.len()];
+        // A table sits right of the tables it references. The relaxation is capped, so a cycle cannot loop.
+        for _ in 0..members.len() {
+            let mut changed = false;
+            for e in self.edges.iter().filter(|e| e.from_table != e.to_table && members.contains(&e.from_table)) {
+                if rank[e.from_table] < rank[e.to_table] + 1 && rank[e.to_table] + 1 < members.len() {
+                    rank[e.from_table] = rank[e.to_table] + 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let depth = members.iter().map(|&t| rank[t]).max().unwrap_or(0);
+        let mut layers: Vec<Vec<usize>> = vec![Vec::new(); depth + 1];
+        for &t in members {
+            layers[rank[t]].push(t);
+        }
+        // Order each layer by the average slot of the neighbours in the previous one (one pass).
+        let mut slot = vec![0.0_f32; self.tables.len()];
+        for (li, layer) in layers.iter_mut().enumerate() {
+            if li > 0 {
+                let key = |t: usize| -> f32 {
+                    let neighbours: Vec<f32> = self.edges.iter().filter(|e| e.from_table == t && rank[e.to_table] < li).map(|e| slot[e.to_table]).collect();
+                    if neighbours.is_empty() { f32::MAX } else { neighbours.iter().sum::<f32>() / neighbours.len() as f32 }
+                };
+                layer.sort_by(|a, b| key(*a).partial_cmp(&key(*b)).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            for (k, &t) in layer.iter().enumerate() {
+                slot[t] = k as f32;
+            }
+        }
+        let mut positions = Vec::with_capacity(members.len());
+        let (mut x, mut height) = (0.0_f32, 0.0_f32);
+        for layer in &layers {
+            let layer_width = layer.iter().map(|&t| sizes[t].0).fold(0.0, f32::max);
+            let mut y = 0.0_f32;
+            for &t in layer {
+                positions.push((t, (x, y)));
+                y += sizes[t].1 + GAP_Y;
+            }
+            height = height.max(y - GAP_Y);
+            x += layer_width + GAP_X;
+        }
+        Block { positions, width: (x - GAP_X).max(0.0), height: height.max(0.0) }
+    }
+}
+
+/// A laid out group of tables, positions relative to the block origin.
+struct Block {
+    positions: Vec<(usize, (f32, f32))>,
+    width: f32,
+    height: f32,
+}
+
+/// Union-find root with path halving.
+fn find(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnMeta, ForeignKeyRef, TableRef};
+
+    fn col(name: &str, pk: bool, fk: Option<(&str, &str)>) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            type_name: "int".into(),
+            is_pk: pk,
+            fk: fk.map(|(t, c)| ForeignKeyRef { table: TableRef::simple(t), columns: if c.is_empty() { vec![] } else { vec![c.into()] }, on_update: "NO ACTION".into(), on_delete: "NO ACTION".into(), name: None }),
+            ..Default::default()
+        }
+    }
+
+    fn table(name: &str, columns: Vec<ColumnMeta>) -> TableStructure {
+        let primary_key = columns.iter().filter(|c| c.is_pk).map(|c| c.name.clone()).collect();
+        TableStructure { table: TableRef::simple(name), columns, primary_key, ..Default::default() }
+    }
+
+    fn shop() -> Vec<TableStructure> {
+        vec![
+            table("orders", vec![col("id", true, None), col("customer_id", false, Some(("customers", "id")))]),
+            table("customers", vec![col("id", true, None), col("name", false, None)]),
+            table("items", vec![col("id", true, None), col("order_id", false, Some(("orders", "id")))]),
+            table("audit", vec![col("id", true, None)]),
+        ]
+    }
+
+    #[test]
+    fn build_sorts_by_name_and_resolves_edges() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        let names: Vec<_> = d.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["audit", "customers", "items", "orders"]);
+        assert_eq!(d.edges.len(), 2);
+        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0) }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0) }));
+    }
+
+    #[test]
+    fn build_sorts_by_column_count() {
+        let mut s = shop();
+        s.push(table("wide", vec![col("a", true, None), col("b", false, None), col("c", false, None)]));
+        let d = Diagram::build(&s, DiagramSort::ColumnCount);
+        assert_eq!(d.tables[0].name, "wide");
+    }
+
+    #[test]
+    fn fk_without_target_column_uses_the_primary_key() {
+        let s = vec![table("a", vec![col("x", false, Some(("b", "")))]), table("b", vec![col("id", true, None)])];
+        let d = Diagram::build(&s, DiagramSort::Name);
+        assert_eq!(d.edges[0].to_column, Some(0));
+    }
+
+    #[test]
+    fn fk_to_unknown_table_is_ignored() {
+        let s = vec![table("a", vec![col("x", false, Some(("elsewhere", "id")))])];
+        let d = Diagram::build(&s, DiagramSort::Name);
+        assert!(d.edges.is_empty());
+        assert!(d.tables[0].columns[0].is_fk);
+    }
+
+    #[test]
+    fn linked_tables_share_a_group_and_the_others_have_none() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        let g = d.groups();
+        assert_eq!(g[0], None);
+        assert_eq!(g[1], g[2]);
+        assert_eq!(g[2], g[3]);
+        assert_eq!(g[1], Some(0));
+    }
+
+    #[test]
+    fn a_self_reference_does_not_make_a_group() {
+        let s = vec![table("tree", vec![col("id", true, None), col("parent", false, Some(("tree", "id")))])];
+        let d = Diagram::build(&s, DiagramSort::Name);
+        assert_eq!(d.groups(), vec![None]);
+    }
+
+    #[test]
+    fn two_separate_clusters_get_two_groups() {
+        let s = vec![
+            table("a", vec![col("id", true, None)]),
+            table("b", vec![col("a_id", false, Some(("a", "id")))]),
+            table("c", vec![col("id", true, None)]),
+            table("d", vec![col("c_id", false, Some(("c", "id")))]),
+        ];
+        let g = Diagram::build(&s, DiagramSort::Name).groups();
+        assert_eq!(g, vec![Some(0), Some(0), Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn search_matches_table_and_column_names() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        assert_eq!(d.search("CUST"), vec![1, 3]);
+        assert!(d.search("  ").is_empty());
+    }
+
+    #[test]
+    fn layout_puts_referenced_tables_on_the_left() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        let sizes = vec![(100.0, 50.0); 4];
+        let p = d.layout(&sizes);
+        // customers < orders < items
+        assert!(p[1].0 < p[3].0 && p[3].0 < p[2].0, "{p:?}");
+    }
+
+    #[test]
+    fn layout_never_overlaps() {
+        let mut s = shop();
+        for i in 0..12 {
+            s.push(table(&format!("lonely{i}"), vec![col("id", true, None), col("v", false, None)]));
+        }
+        let d = Diagram::build(&s, DiagramSort::Name);
+        let sizes: Vec<(f32, f32)> = (0..d.tables.len()).map(|i| (120.0 + (i % 3) as f32 * 20.0, 60.0 + (i % 4) as f32 * 15.0)).collect();
+        let p = d.layout(&sizes);
+        assert_eq!(p.len(), sizes.len());
+        for i in 0..p.len() {
+            for j in (i + 1)..p.len() {
+                let apart = p[i].0 + sizes[i].0 <= p[j].0 || p[j].0 + sizes[j].0 <= p[i].0 || p[i].1 + sizes[i].1 <= p[j].1 || p[j].1 + sizes[j].1 <= p[i].1;
+                assert!(apart, "tables {i} and {j} overlap: {:?} {:?}", p[i], p[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_survives_a_reference_cycle() {
+        let s = vec![table("a", vec![col("b_id", false, Some(("b", "id"))), col("id", true, None)]), table("b", vec![col("a_id", false, Some(("a", "id"))), col("id", true, None)])];
+        let d = Diagram::build(&s, DiagramSort::Name);
+        let p = d.layout(&[(100.0, 50.0), (100.0, 50.0)]);
+        assert_eq!(p.len(), 2);
+        assert_ne!(p[0], p[1]);
+    }
+
+    #[test]
+    fn layout_of_nothing_is_empty() {
+        assert!(Diagram::default().layout(&[]).is_empty());
+    }
+}

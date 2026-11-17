@@ -10,6 +10,8 @@ pub type TabId = u64;
 pub enum TabTarget {
     Table(TableRef),
     Sql(TabId),
+    /// The ER diagram (one per workspace).
+    Diagram,
 }
 
 /// The facts about an existing tab that the opening rules need.

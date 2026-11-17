@@ -27,6 +27,10 @@ pub const PRIMARY_ACTIVE: Color32 = Color32::from_rgb(0x34, 0x59, 0xC0);
 /// Idle button border, slightly lighter than `FIELD_ROW_BORDER`.
 pub const BUTTON_BORDER: Color32 = Color32::from_rgb(0x32, 0x3A, 0x4D);
 
+/// Colours of the table groups in the ER diagram: tables linked by foreign keys share one.
+/// They reuse the semantic colours of the theme, so the diagram adds no new hue.
+pub const DIAGRAM_GROUPS: [Color32; 5] = [PRIMARY, OK, TERTIARY, SECONDARY, ERROR];
+
 pub const RADIUS_CTRL: u8 = 3;
 pub const RADIUS_CARD: u8 = 4;
 pub const RADIUS_WINDOW: u8 = 6;
