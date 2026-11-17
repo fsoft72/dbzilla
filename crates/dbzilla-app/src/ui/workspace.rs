@@ -8,6 +8,7 @@ use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
 use super::diagram::{self, DiagramAction, DiagramTab};
 use super::metrics::{self, MetricsAction, MetricsTab};
+use super::process::{self, ProcessAction, ProcessList};
 use dbzilla_core::diagram::DocLink;
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
@@ -216,6 +217,8 @@ enum GateAction {
     DbOp(dbzilla_session::DbOp),
     Import(String, jobs::ImportRequest),
     Run { labels: Vec<Option<String>>, originals: Vec<String> },
+    /// Statements that stop queries, run by the process list.
+    Kill,
 }
 
 /// A statement list waiting for the safe-mode answer.
@@ -378,6 +381,8 @@ pub struct Workspace {
     triggers_for: Option<TabId>,
     pending_copy: Option<(TableRef, ScriptKind)>,
     clipboard_out: Option<String>,
+    /// The process list sheet, when open.
+    process: Option<ProcessList>,
     new_table_no: usize,
     log_original: bool,
     sql_counter: usize,
@@ -461,6 +466,7 @@ impl Workspace {
             triggers_for: None,
             pending_copy: None,
             clipboard_out: None,
+            process: None,
             new_table_no: 0,
             log_original: false,
             sql_counter: 0,
@@ -484,6 +490,9 @@ impl Workspace {
     pub fn poll(&mut self) {
         while let Some(ev) = self.session.try_recv() {
             self.apply(ev);
+        }
+        if let Some(p) = self.process.as_mut() {
+            p.poll();
         }
         for (title, state) in self.jobs.poll() {
             match state {
@@ -982,6 +991,7 @@ impl Workspace {
             }
             Action::ShowDiagram => self.open_diagram(),
             Action::ShowMetrics => self.open_metrics(),
+            Action::ProcessList => self.open_process_list(),
             Action::ShowData => self.set_view(TabView::Data),
             Action::ShowStructure => self.set_view(TabView::Structure),
             Action::NewSqlEditor => self.open_sql(String::new()),
@@ -1140,6 +1150,59 @@ impl Workspace {
             self.dock.set_focused_node_and_surface((loc.0, loc.1));
         }
         self.request_diagram();
+    }
+
+    /// Opens the process list on its own connection, or says why it cannot.
+    pub fn open_process_list(&mut self) {
+        if !dbzilla_core::processes::supported(self.conn.driver) {
+            self.notices.push((false, "The process list is not available for this database".into()));
+            return;
+        }
+        if self.process.is_some() {
+            return;
+        }
+        let (Some(env), Some(repaint)) = (self.job_env.as_ref(), self.repaint.clone()) else {
+            self.notices.push((true, "The process list needs a connection".into()));
+            return;
+        };
+        self.process = Some(ProcessList::open(env, repaint));
+    }
+
+    /// Draws the process list sheet and acts on its requests.
+    fn process_sheet(&mut self, ctx: &egui::Context) {
+        let Some(list) = self.process.as_mut() else { return };
+        match process::show(ctx, list) {
+            Some(ProcessAction::Dismiss) => self.process = None,
+            Some(ProcessAction::Kill(ids)) => self.submit_kill(ids),
+            None => {}
+        }
+    }
+
+    /// Stops the queries of these sessions, after the safe mode agrees. A kill counts as a write.
+    fn submit_kill(&mut self, ids: Vec<String>) {
+        let driver = self.conn.driver;
+        let statements: Vec<String> = ids.iter().filter_map(|id| dbzilla_core::processes::kill_sql(driver, id)).collect();
+        if statements.is_empty() {
+            return;
+        }
+        let level = self.conn.safe_level;
+        let kind = dbzilla_core::safemode::StatementKind::Write;
+        let modal = |needs_password: bool, statements| GateModal { action: GateAction::Kill, statements, needs_password, input: String::new(), reveal: false, tab: 0, error: None };
+        if level.requires_password(kind) {
+            let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+            self.gate = Some(modal(known, statements));
+        } else if level.requires_confirm(kind) {
+            self.gate = Some(modal(false, statements));
+        } else {
+            self.kill_now(statements);
+        }
+    }
+
+    /// Sends the kill statements on the process list connection.
+    fn kill_now(&mut self, statements: Vec<String>) {
+        if let Some(p) = self.process.as_mut() {
+            p.kill(statements);
+        }
     }
 
     /// The metrics board tab, if open.
@@ -2438,6 +2501,7 @@ impl Workspace {
         self.table_dialogs(ctx);
         self.database_dialogs(ctx);
         self.job_dialogs(ctx);
+        self.process_sheet(ctx);
         if let Some(d) = self.save_dialog.as_mut() {
             let mut decision = None;
             widgets::modal(ctx, "Add to Queries", |ui| {
@@ -2587,6 +2651,7 @@ impl Workspace {
                                 GateAction::DbOp(op) => self.session.send(Command::DbOp(op)),
                                 GateAction::Import(title, req) => self.spawn_import_now(title, req),
                                 GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
+                                GateAction::Kill => self.kill_now(g.statements),
                             }
                         }
                     } else if let Some(g) = self.gate.as_mut() {
@@ -2903,6 +2968,9 @@ impl Workspace {
                 }
                 if widgets::ico_button(ui, Ico::Bolt, &tip("Show metrics board", Action::ShowMetrics)).clicked() {
                     self.open_metrics();
+                }
+                if widgets::ico_button(ui, Ico::Console, &tip("Process list", Action::ProcessList)).clicked() {
+                    self.open_process_list();
                 }
                 if widgets::ico_button(ui, Ico::Search, &tip("Open anything", Action::OpenAnything)).clicked() {
                     self.palette = Some(PaletteState::default());
