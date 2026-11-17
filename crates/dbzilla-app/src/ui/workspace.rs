@@ -715,7 +715,7 @@ impl Workspace {
         if self.conn.driver != DriverId::Sqlite && self.current_db.is_empty() {
             return;
         }
-        let schema = if self.caps.schemas { Some(self.current_schema.clone().unwrap_or_else(|| "public".into())) } else { None };
+        let schema = self.caps.schema_or_default(self.current_schema.as_deref());
         self.session.send(Command::LoadSchema { db: self.current_db.clone(), schema });
     }
 
@@ -1147,7 +1147,8 @@ impl Workspace {
 
     /// Key under which the positions of the current diagram are saved.
     fn diagram_key(&self) -> String {
-        let schema = if self.caps.schemas { Some(self.current_schema.as_deref().unwrap_or("public")) } else { None };
+        let schema = self.caps.schema_or_default(self.current_schema.as_deref());
+        let schema = schema.as_deref();
         let c = &self.conn;
         let server = format!("{:?}://{}@{}:{}/{}", c.driver, c.user, c.host, c.port.map(|p| p.to_string()).unwrap_or_default(), c.database);
         DiagramStore::key(&server, &self.current_db, schema)
@@ -1230,7 +1231,7 @@ impl Workspace {
 
     /// Asks the session for every table of the current schema.
     fn request_diagram(&mut self) {
-        let schema = if self.caps.schemas { Some(self.current_schema.clone().unwrap_or_else(|| "public".into())) } else { None };
+        let schema = self.caps.schema_or_default(self.current_schema.as_deref());
         self.session.send(Command::LoadDiagram { db: self.current_db.clone(), schema });
     }
 

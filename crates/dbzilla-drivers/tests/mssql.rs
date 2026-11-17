@@ -498,3 +498,61 @@ async fn a_transaction_opened_in_one_call_spans_the_next_calls() {
     conn.execute_batch(&step("COMMIT"), false).await.unwrap();
     assert_eq!(count_rows(&mut conn, "t8_tx").await, Value::I64(1));
 }
+
+static APP_QUERIES: OnceCell<()> = OnceCell::const_new();
+
+/// A database with a keyed table and a heap (no key), 25 rows each, as the data tab would meet them.
+async fn app_queries_fixture(port: u16) {
+    APP_QUERIES
+        .get_or_init(|| async move {
+            raw_exec(port, &["IF DB_ID('t10_app') IS NULL CREATE DATABASE t10_app"]).await;
+            raw_exec(
+                port,
+                &[
+                    "USE t10_app; CREATE TABLE dbo.keyed (id int PRIMARY KEY, name nvarchar(20))",
+                    "USE t10_app; CREATE TABLE dbo.heap (id int, name nvarchar(20))",
+                    "USE t10_app; INSERT INTO dbo.keyed SELECT TOP 25 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N'n' FROM sys.all_objects",
+                    "USE t10_app; INSERT INTO dbo.heap SELECT TOP 25 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N'n' FROM sys.all_objects",
+                ],
+            )
+            .await;
+        })
+        .await;
+}
+
+fn app_table(name: &str) -> TableRef {
+    TableRef { database: Some("t10_app".into()), schema: Some("dbo".into()), name: name.into() }
+}
+
+#[tokio::test]
+async fn the_data_tab_queries_run_on_sql_server() {
+    use dbzilla_core::paging::{build_count, build_select, SortKey};
+    let Some(c) = container().await else { return };
+    app_queries_fixture(c.port).await;
+    let mut conn = connect(c.port, "").await;
+    let d = dialect_for(DriverId::SqlServer);
+    let sorted = [SortKey { column: "id".into(), desc: true }];
+    let (page, _) = collect(&mut conn, &build_select(d.as_ref(), &app_table("keyed"), &[], &[], false, &sorted, 10, 10), opts()).await;
+    let ids: Vec<Value> = rows_of(&page).into_iter().map(|r| r[0].clone()).collect();
+    assert_eq!(ids, (6..=15).rev().map(Value::I64).collect::<Vec<_>>());
+    let (last, _) = collect(&mut conn, &build_select(d.as_ref(), &app_table("heap"), &[], &[], false, &[], 10, 20), opts()).await;
+    assert_eq!(rows_of(&last).len(), 5, "a table without key and without sort still pages");
+    let (count, _) = collect(&mut conn, &build_count(d.as_ref(), &app_table("keyed"), &[], &[], false), opts()).await;
+    assert_eq!(rows_of(&count), vec![vec![Value::I64(25)]]);
+}
+
+#[tokio::test]
+async fn the_editor_row_limit_and_top_script_run_on_sql_server() {
+    use dbzilla_core::rowlimit::apply_row_limit_for;
+    let Some(c) = container().await else { return };
+    app_queries_fixture(c.port).await;
+    let mut conn = connect(c.port, "t10_app").await;
+    let d = dialect_for(DriverId::SqlServer);
+    for sql in ["SELECT id FROM dbo.keyed ORDER BY id DESC;", "SELECT id FROM dbo.heap", "WITH x AS (SELECT id FROM dbo.keyed) SELECT id FROM x"] {
+        let limited = apply_row_limit_for(d.as_ref(), sql, Some(5));
+        let (batches, _) = collect(&mut conn, &limited, opts()).await;
+        assert_eq!(rows_of(&batches).len(), 5, "{limited}");
+    }
+    let (top, _) = collect(&mut conn, &d.select_top(&d.quote_table(&app_table("keyed")), 3), opts()).await;
+    assert_eq!(rows_of(&top).len(), 3);
+}

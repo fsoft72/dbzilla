@@ -6,6 +6,8 @@ use crate::dialect::DriverId;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Capabilities {
     pub schemas: bool,
+    /// Schema a connection starts in when it has schemas: `public` on PostgreSQL, `dbo` on SQL Server.
+    pub default_schema: &'static str,
     pub databases_list: bool,
     pub create_db: bool,
     pub rename_db: bool,
@@ -35,10 +37,16 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// The schema to work in: `current` when set, else the driver's default; `None` when the driver has no schemas.
+    pub fn schema_or_default(&self, current: Option<&str>) -> Option<String> {
+        self.schemas.then(|| current.unwrap_or(self.default_schema).to_owned())
+    }
+
     /// Reference capability values for a driver (SPEC 5.2 and appendix A).
     pub fn for_driver(id: DriverId) -> Self {
         let base = Self {
             schemas: false,
+            default_schema: "public",
             databases_list: true,
             create_db: true,
             rename_db: true,
@@ -89,6 +97,7 @@ impl Capabilities {
             },
             DriverId::SqlServer => Self {
                 schemas: true,
+                default_schema: "dbo",
                 functions: true,
                 procedures: true,
                 sequences: true,
@@ -123,6 +132,10 @@ mod tests {
         assert!(Capabilities::for_driver(DriverId::Postgres).schemas);
         assert!(Capabilities::for_driver(DriverId::Postgres).ilike);
         assert!(!Capabilities::for_driver(DriverId::Sqlite).process_list);
+        assert_eq!(Capabilities::for_driver(DriverId::Postgres).schema_or_default(None).as_deref(), Some("public"));
+        assert_eq!(Capabilities::for_driver(DriverId::SqlServer).schema_or_default(None).as_deref(), Some("dbo"));
+        assert_eq!(Capabilities::for_driver(DriverId::SqlServer).schema_or_default(Some("app")).as_deref(), Some("app"));
+        assert_eq!(Capabilities::for_driver(DriverId::MySql).schema_or_default(None), None, "no schemas, no schema");
         let ms = Capabilities::for_driver(DriverId::SqlServer);
         assert!(ms.schemas && ms.functions && ms.procedures && ms.process_list && ms.triggers);
         assert!(!ms.materialized_views && !ms.ilike && !ms.upsert_on_duplicate && !ms.replace_into);

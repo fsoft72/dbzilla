@@ -8,7 +8,7 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 - [x] Metrics Board (11.2): boards, data table, scoreboard, bar, line and pie charts, input, dropdown, button, `$name` variables, refresh rates, import and export
 - [ ] Metrics Board, still missing: Exporter, Importer and Connection objects, wiring by dragging between connection points (today a checkbox list in the object settings), input submit modes, board list in the left sidebar, Add to Metrics Board from a result chart, `Tools > Show Metrics Board` menu entry
 - [x] Process list UI with kill (11.4): PostgreSQL and MySQL/MariaDB
-- [ ] Process list, still missing: SQL Server, left list of databases for MySQL, Quick Look and export of the page, `Mod+.` shortcut (taken by Cancel Running Queries), `Tools` menu entry
+- [ ] Process list, still missing: left list of databases for MySQL, Quick Look and export of the page, `Mod+.` shortcut (taken by Cancel Running Queries), `Tools` menu entry
 - [x] User management with a SQL preview before apply (11.5): PostgreSQL and MySQL/MariaDB
 - [ ] User management, still missing: column level privileges for PostgreSQL, table level grants for MySQL, `GRANT OPTION`, renaming a user, `Tools` menu entry
 - [x] Backup and restore for PostgreSQL, MySQL and MariaDB (12.3), plus a tar.bz2 backup for SQLite
@@ -38,7 +38,9 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 
 ## Other databases
 
-- [ ] Tier 2 drivers (SPEC 1.1)
+- [x] SQL Server driver (SPEC 1.1, Tier 2): browse, structure, data with paging, editor, pending changes, cancel with `KILL`, process list with kill. Needs `DBZILLA_TEST_MSSQL=1` for its tests
+- [ ] SQL Server, still missing: editing columns, primary keys and triggers, backup and restore, user management, encoding menu, Windows authentication and Entra ID login, named instances, MCP read-only queries
+- [ ] Tier 2 drivers, still missing: DuckDB, CockroachDB/Redshift/Greenplum, ClickHouse
 - [ ] Tier 3 document-style databases (13)
 
 ## Distribution and quality

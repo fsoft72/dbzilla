@@ -1,7 +1,7 @@
 # DBZilla
 
-A fast native database client written in Rust with egui. It talks to SQLite, PostgreSQL and
-MySQL/MariaDB and ships an embedded MCP server.
+A fast native database client written in Rust with egui. It talks to SQLite, PostgreSQL,
+MySQL/MariaDB and SQL Server and ships an embedded MCP server.
 
 ## Features
 
@@ -23,7 +23,8 @@ cargo build --release
 ```
 
 The OS keychain needs libdbus at build time on Linux. Examples of URLs:
-`postgresql://user@host/db`, `mysql://root@127.0.0.1/shop`, `sqlite:///path/file.sqlite`.
+`postgresql://user@host/db`, `mysql://root@127.0.0.1/shop`, `sqlserver://sa@127.0.0.1/master`,
+`sqlite:///path/file.sqlite`.
 
 ## Tests
 
@@ -32,14 +33,14 @@ cargo test --workspace
 ```
 
 PostgreSQL and MySQL tests start throwaway Docker containers and are skipped when Docker is not
-available. Always run `cargo clippy --all-targets -- -D warnings` before committing.
+available. The SQL Server tests (a big and slow image, x86 only) also need `DBZILLA_TEST_MSSQL=1`. Always run `cargo clippy --all-targets -- -D warnings` before committing.
 
 ## Layout
 
 | Crate | Purpose |
 |---|---|
 | `dbzilla-core` | Values, dialects, filters, pending changes, DDL, safe mode (no I/O) |
-| `dbzilla-drivers` | SQLite, PostgreSQL and MySQL drivers behind one trait |
+| `dbzilla-drivers` | SQLite, PostgreSQL, MySQL and SQL Server drivers behind one trait |
 | `dbzilla-store` | Settings, connections, history, saved queries, secrets |
 | `dbzilla-session` | Per-connection actor with commands and events |
 | `dbzilla-io` | Streaming export and transactional import |
