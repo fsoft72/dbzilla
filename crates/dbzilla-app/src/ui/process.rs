@@ -220,7 +220,7 @@ async fn work(conn: &mut Option<Box<dyn Conn>>, cfg: &ConnectConfig, cmd: Cmd) -
 }
 
 /// Runs a statement and collects its rows.
-async fn run(conn: &mut dyn Conn, sql: &str) -> Result<(Vec<ColumnMeta>, Vec<Row>), String> {
+pub(super) async fn run(conn: &mut dyn Conn, sql: &str) -> Result<(Vec<ColumnMeta>, Vec<Row>), String> {
     let (tx, mut rx) = mpsc::channel::<dbzilla_drivers::RowBatch>(8);
     let collect = async {
         let (mut columns, mut rows) = (Vec::new(), Vec::new());

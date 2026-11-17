@@ -10,6 +10,7 @@ use super::diagram::{self, DiagramAction, DiagramTab};
 use super::metrics::{self, MetricsAction, MetricsTab};
 use super::backup::{self, BackupAction, BackupSheet};
 use super::process::{self, ProcessAction, ProcessList};
+use super::users::{self, UserManager, UsersAction};
 use dbzilla_core::diagram::DocLink;
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
@@ -223,6 +224,8 @@ enum GateAction {
     Kill,
     /// A restore held by the backup sheet.
     Restore,
+    /// User changes held by the user management sheet.
+    UserApply,
 }
 
 /// A statement list waiting for the safe-mode answer.
@@ -390,6 +393,8 @@ pub struct Workspace {
     process: Option<ProcessList>,
     /// The backup and restore sheet, when open.
     backup: Option<BackupSheet>,
+    /// The user management sheet, when open.
+    user_manager: Option<UserManager>,
     new_table_no: usize,
     log_original: bool,
     sql_counter: usize,
@@ -476,6 +481,7 @@ impl Workspace {
             clipboard_out: None,
             process: None,
             backup: None,
+            user_manager: None,
             new_table_no: 0,
             log_original: false,
             sql_counter: 0,
@@ -505,6 +511,9 @@ impl Workspace {
         }
         if let Some(outcome) = self.backup.as_mut().and_then(BackupSheet::poll) {
             self.notices.push(outcome);
+        }
+        if let Some(done) = self.user_manager.as_mut().and_then(UserManager::poll) {
+            self.record_user_changes(done);
         }
         for (title, state) in self.jobs.poll() {
             match state {
@@ -1004,6 +1013,7 @@ impl Workspace {
             Action::ShowDiagram => self.open_diagram(),
             Action::ShowMetrics => self.open_metrics(),
             Action::ProcessList => self.open_process_list(),
+            Action::Users => self.open_user_manager(),
             Action::Backup => self.open_backup(false),
             Action::Restore => self.open_backup(true),
             Action::ShowData => self.set_view(TabView::Data),
@@ -1180,6 +1190,59 @@ impl Workspace {
             return;
         };
         self.process = Some(ProcessList::open(env, repaint));
+    }
+
+    /// Opens the user management sheet on its own connection, or says why it cannot.
+    pub fn open_user_manager(&mut self) {
+        if !dbzilla_core::users::supported(self.conn.driver) {
+            self.notices.push((false, "User management is not available for this database".into()));
+            return;
+        }
+        if self.user_manager.is_some() {
+            return;
+        }
+        let (Some(env), Some(repaint)) = (self.job_env.as_ref(), self.repaint.clone()) else {
+            self.notices.push((true, "User management needs a connection".into()));
+            return;
+        };
+        self.user_manager = Some(UserManager::open(env, repaint));
+    }
+
+    /// Draws the user management sheet. Applying changes writes data, so it asks the safe mode first.
+    fn user_sheet(&mut self, ctx: &egui::Context) {
+        let Some(sheet) = self.user_manager.as_mut() else { return };
+        match users::show(ctx, sheet) {
+            Some(UsersAction::Dismiss) => self.user_manager = None,
+            Some(UsersAction::Apply(lines)) => {
+                let level = self.conn.safe_level;
+                let kind = dbzilla_core::safemode::StatementKind::Write;
+                let modal = |needs_password: bool| GateModal { action: GateAction::UserApply, statements: lines.clone(), needs_password, input: String::new(), reveal: false, tab: 0, error: None };
+                if level.requires_password(kind) {
+                    let known = self.password.as_deref().is_some_and(|p| !p.is_empty());
+                    self.gate = Some(modal(known));
+                } else if level.requires_confirm(kind) {
+                    self.gate = Some(modal(false));
+                } else if let Some(s) = self.user_manager.as_mut() {
+                    s.confirm_apply();
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Writes the applied user statements, passwords masked, to the history and tells how it went.
+    fn record_user_changes(&mut self, done: users::Applied) {
+        let ok = done.error.is_none();
+        for sql in &done.statements {
+            let entry = HistoryEntry { ts: now_ms(), sql: sql.clone(), kind: HistoryKind::UserManagement, duration_ms: None, ok, database: Some(self.current_db.clone()), original_csv: None };
+            if let Err(e) = self.history.append(&self.conn.id, &entry) {
+                self.notices.push((true, format!("Cannot write the history: {e}")));
+            }
+        }
+        self.notices.push(match done.error {
+            Some(e) => (true, format!("Users: {e}")),
+            None => (false, "User changes applied".into()),
+        });
     }
 
     /// Opens the backup and restore sheet on the wanted tab, or says why it cannot.
@@ -2553,6 +2616,7 @@ impl Workspace {
         self.job_dialogs(ctx);
         self.process_sheet(ctx);
         self.backup_sheet(ctx);
+        self.user_sheet(ctx);
         if let Some(d) = self.save_dialog.as_mut() {
             let mut decision = None;
             widgets::modal(ctx, "Add to Queries", |ui| {
@@ -2703,6 +2767,11 @@ impl Workspace {
                                 GateAction::Import(title, req) => self.spawn_import_now(title, req),
                                 GateAction::Run { labels, originals } => self.send_run(g.tab, g.statements, labels, originals),
                                 GateAction::Kill => self.kill_now(g.statements),
+                                GateAction::UserApply => {
+                                    if let Some(s) = self.user_manager.as_mut() {
+                                        s.confirm_apply();
+                                    }
+                                }
                                 GateAction::Restore => {
                                     if let Some(b) = self.backup.as_mut() {
                                         b.confirm_restore();
@@ -3014,6 +3083,9 @@ impl Workspace {
                 }
                 if widgets::ico_button(ui, Ico::Folder, &tip("Backup and restore", Action::Backup)).clicked() {
                     self.open_backup(false);
+                }
+                if dbzilla_core::users::supported(self.conn.driver) && widgets::ico_button(ui, Ico::Key, &tip("Users", Action::Users)).clicked() {
+                    self.open_user_manager();
                 }
                 jobs::bell(ui, &mut self.jobs);
                 if widgets::ico_button(ui, Ico::Database, &tip("Open a database", Action::OpenDatabase)).clicked() {

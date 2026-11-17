@@ -43,11 +43,12 @@ pub enum Action {
     ProcessList,
     Backup,
     Restore,
+    Users,
 }
 
 impl Action {
     /// Every action, for the command palette and the keymap editor.
-    pub const ALL: [Action; 37] = [
+    pub const ALL: [Action; 38] = [
         Action::OpenAnything,
         Action::OpenDatabase,
         Action::OpenConnection,
@@ -85,6 +86,7 @@ impl Action {
         Action::ProcessList,
         Action::Backup,
         Action::Restore,
+        Action::Users,
     ];
 
     /// Name shown in menus, tooltips and the palette.
@@ -127,6 +129,7 @@ impl Action {
             Action::ProcessList => "Process List",
             Action::Backup => "Backup Database",
             Action::Restore => "Restore Database",
+            Action::Users => "User Management",
         }
     }
 }
