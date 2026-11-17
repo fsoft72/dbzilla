@@ -2684,6 +2684,9 @@ impl Workspace {
                 if widgets::ico_button(ui, Ico::File, &tip("New SQL editor", Action::NewSqlEditor)).clicked() {
                     self.open_sql(String::new());
                 }
+                if widgets::ico_button(ui, Ico::Structure, &tip("Show ER diagram", Action::ShowDiagram)).clicked() {
+                    self.open_diagram();
+                }
                 if widgets::ico_button(ui, Ico::Search, &tip("Open anything", Action::OpenAnything)).clicked() {
                     self.palette = Some(PaletteState::default());
                 }
