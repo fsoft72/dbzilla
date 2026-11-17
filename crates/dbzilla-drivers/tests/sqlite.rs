@@ -294,3 +294,56 @@ async fn column_rebuild_keeps_constraints_indexes_and_triggers() {
     let ddl: String = db.query_row("SELECT sql FROM sqlite_master WHERE name = 'a'", [], |r| r.get(0)).unwrap();
     assert!(ddl.contains("VARCHAR(40)") && ddl.contains("AUTOINCREMENT"), "{ddl}");
 }
+
+/// A foreign key is added to an existing SQLite table by a rebuild that keeps data, indexes and triggers,
+/// and a table with orphan rows is left untouched when the new constraint cannot hold.
+#[tokio::test]
+async fn adding_a_foreign_key_rebuilds_the_table() {
+    use dbzilla_core::ddl::{generate_ddl, ForeignKeyDef, StructuralOp};
+    use dbzilla_core::dialect::{dialect_for, DriverId};
+    use dbzilla_core::model::TableRef;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fk.sqlite3");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE notes (id INTEGER PRIMARY KEY, id_user INTEGER, body TEXT);
+             CREATE INDEX ix_body ON notes (body);
+             CREATE TABLE log (msg TEXT);
+             CREATE TRIGGER trg AFTER INSERT ON notes BEGIN INSERT INTO log VALUES ('n'); END;
+             INSERT INTO users VALUES (1, 'ann');
+             INSERT INTO notes (id_user, body) VALUES (1, 'ok');",
+        )
+        .unwrap();
+    let cfg = dbzilla_drivers::ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: path.to_string_lossy().into_owned(), ssl: dbzilla_drivers::SslMode::Disabled, bootstrap: vec![] };
+    let mut c = dbzilla_drivers::driver_for(DriverId::Sqlite).unwrap().connect(&cfg).await.unwrap();
+    let add = |st: dbzilla_core::model::TableStructure| StructuralOp::AddForeignKey {
+        table: TableRef::simple("notes"),
+        fk: ForeignKeyDef { name: None, columns: vec!["id_user".into()], ref_table: TableRef::simple("users"), ref_columns: vec!["id".into()], on_update: "NO ACTION".into(), on_delete: "CASCADE".into() },
+        current: Some(Box::new(st)),
+    };
+    let dialect = dialect_for(DriverId::Sqlite);
+
+    // an orphan row makes the copy fail and the batch rolls back
+    rusqlite::Connection::open(&path).unwrap().execute_batch("INSERT INTO notes (id_user, body) VALUES (99, 'orphan');").unwrap();
+    let st = c.table_structure(&TableRef::simple("notes")).await.unwrap();
+    let stmts = generate_ddl(&add(st), dialect.as_ref()).unwrap();
+    assert!(c.execute_batch(&stmts, true).await.is_err(), "orphan rows break the constraint");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0)).unwrap(), 2, "the data is untouched");
+    assert_eq!(db.query_row("SELECT count(*) FROM pragma_foreign_key_list('notes')", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    drop(db);
+
+    rusqlite::Connection::open(&path).unwrap().execute_batch("DELETE FROM notes WHERE id_user = 99;").unwrap();
+    let st = c.table_structure(&TableRef::simple("notes")).await.unwrap();
+    let stmts = generate_ddl(&add(st), dialect.as_ref()).unwrap();
+    c.execute_batch(&stmts, true).await.unwrap();
+    let st = c.table_structure(&TableRef::simple("notes")).await.unwrap();
+    let fk = st.columns.iter().find(|c| c.name == "id_user").and_then(|c| c.fk.clone()).expect("the column has a foreign key now");
+    assert_eq!((fk.table.name.as_str(), fk.on_delete.as_str()), ("users", "CASCADE"));
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "the data is kept");
+    let objects: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE tbl_name = 'notes' ORDER BY name").unwrap().query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
+    assert!(objects.contains(&"ix_body".to_owned()) && objects.contains(&"trg".to_owned()), "{objects:?}");
+}

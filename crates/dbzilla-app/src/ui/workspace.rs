@@ -7,6 +7,7 @@ use super::datatab::{self, DataAction, DataEnv, DataState, Total};
 use super::dbsearch::{self, SearchAction, SearchState};
 use super::details::{self, DetailsAction, DetailsState};
 use super::diagram::{self, DiagramAction, DiagramTab};
+use dbzilla_core::diagram::DocLink;
 use super::pending::default_key_columns;
 use super::palette::{self, PaletteChoice, PaletteItem, PaletteState};
 use super::sidebar::{self, ExtraAction, SidebarAction, SidebarState, SidebarTab};
@@ -24,7 +25,7 @@ use crate::theme;
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::changes::generate_sql;
 use dbzilla_core::copyfmt::{copy_script, format_rows, CopyContext, CopyFormat, CsvOptions, ScriptKind};
-use dbzilla_core::ddl::{generate_ddl, StructuralOp};
+use dbzilla_core::ddl::{ForeignKeyDef, generate_ddl, StructuralOp};
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::rowlimit::apply_row_limit;
@@ -154,6 +155,25 @@ struct FkDialog {
     ref_columns: String,
     on_update: String,
     on_delete: String,
+}
+
+/// What a link drawn in the diagram becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkKind {
+    /// A real foreign key, created with DDL.
+    Database,
+    /// A dashed line kept in the application only.
+    DiagramOnly,
+}
+
+/// Dialog asking what to do with a link dragged between two columns of the diagram.
+struct LinkDialog {
+    link: DocLink,
+    kind: LinkKind,
+    constraint: String,
+    on_update: String,
+    on_delete: String,
+    error: Option<String>,
 }
 
 /// Foreign key actions offered in menus.
@@ -344,6 +364,9 @@ pub struct Workspace {
     outputs: Vec<WsOutput>,
     op_dialog: Option<OpDialog>,
     fk_dialog: Option<FkDialog>,
+    link_dialog: Option<LinkDialog>,
+    /// The kind chosen the last time, offered again next time.
+    link_kind: LinkKind,
     triggers_for: Option<TabId>,
     pending_copy: Option<(TableRef, ScriptKind)>,
     clipboard_out: Option<String>,
@@ -424,6 +447,8 @@ impl Workspace {
             outputs: Vec::new(),
             op_dialog: None,
             fk_dialog: None,
+            link_dialog: None,
+            link_kind: LinkKind::DiagramOnly,
             triggers_for: None,
             pending_copy: None,
             clipboard_out: None,
@@ -563,8 +588,9 @@ impl Workspace {
             }
             Event::Structure(st) => self.apply_structure(*st),
             Event::Diagram { tables, skipped, .. } => {
-                let saved = self.diagrams.load(&self.diagram_key());
-                let fresh = self.diagram_tab_mut().and_then(|d| d.set_tables(tables, skipped, &saved));
+                let key = self.diagram_key();
+                let (saved, links) = (self.diagrams.load(&key), self.diagrams.load_links(&key));
+                let fresh = self.diagram_tab_mut().and_then(|d| d.set_tables(tables, skipped, &saved, links));
                 if let Some(positions) = fresh {
                     self.save_diagram_positions(positions);
                 }
@@ -1024,6 +1050,50 @@ impl Workspace {
         }
     }
 
+    /// Keeps the links drawn in the current diagram; a failure becomes a notice.
+    fn save_diagram_links(&mut self) {
+        let Some(links) = self.diagram_tab_mut().map(|d| d.links().to_vec()) else { return };
+        if let Err(e) = self.diagrams.save_links(&self.diagram_key(), links) {
+            self.notices.push((true, format!("cannot save the diagram links: {e}")));
+        }
+    }
+
+    /// Applies the link dialog: a real foreign key goes through the safe-mode gate, a drawn link is kept.
+    /// On a problem the dialog stays open with the reason.
+    fn apply_link_dialog(&mut self, dialog: LinkDialog) {
+        self.link_kind = dialog.kind;
+        let reopen = |ws: &mut Self, mut d: LinkDialog, why: String| {
+            d.error = Some(why);
+            ws.link_dialog = Some(d);
+        };
+        match dialog.kind {
+            LinkKind::DiagramOnly => {
+                let added = self.diagram_tab_mut().is_some_and(|d| d.add_link(dialog.link.clone()));
+                if added {
+                    self.save_diagram_links();
+                } else {
+                    self.notices.push((false, "That link is already in the diagram".into()));
+                }
+            }
+            LinkKind::Database => {
+                let l = &dialog.link;
+                let (Some(from), Some(to)) = (self.diagram_tab_mut().and_then(|d| d.structure(&l.from_table).cloned()), self.diagram_tab_mut().and_then(|d| d.structure(&l.to_table).cloned())) else {
+                    return reopen(self, dialog, "The table is no longer in the diagram".into());
+                };
+                let name = dialog.constraint.trim();
+                let op = StructuralOp::AddForeignKey {
+                    table: from.table.clone(),
+                    fk: ForeignKeyDef { name: (!name.is_empty()).then(|| name.to_owned()), columns: vec![l.from_column.clone()], ref_table: to.table.clone(), ref_columns: vec![l.to_column.clone()], on_update: dialog.on_update.clone(), on_delete: dialog.on_delete.clone() },
+                    current: Some(Box::new(from)),
+                };
+                if let Err(e) = generate_ddl(&op, dialect_for(self.conn.driver).as_ref()) {
+                    return reopen(self, dialog, e.to_string());
+                }
+                self.submit_ddl(vec![op], DdlAfter { closed: None, message: format!("Foreign key from {}.{} to {}.{} created", l.from_table, l.from_column, l.to_table, l.to_column) });
+            }
+        }
+    }
+
     /// Asks the session for every table of the current schema.
     fn request_diagram(&mut self) {
         let schema = if self.caps.schemas { Some(self.current_schema.clone().unwrap_or_else(|| "public".into())) } else { None };
@@ -1061,6 +1131,15 @@ impl Workspace {
                 self.request_diagram();
             }
             DiagramAction::Save(positions) => self.save_diagram_positions(positions),
+            DiagramAction::RequestLink(link) => {
+                self.link_dialog = Some(LinkDialog { link, kind: self.link_kind, constraint: String::new(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into(), error: None });
+            }
+            DiagramAction::DeleteLink(link) => {
+                if let Some(d) = self.diagram_tab_mut() {
+                    d.remove_link(&link);
+                }
+                self.save_diagram_links();
+            }
             DiagramAction::OpenTable(name) => {
                 let table = self.objects.iter().find(|o| o.table.name == name).map(|o| o.table.clone());
                 if let Some(t) = table {
@@ -1548,6 +1627,10 @@ impl Workspace {
                 }
                 self.notices.push((false, if after.message.is_empty() { "Done".into() } else { after.message }));
                 self.load_schema();
+                if let Some(d) = self.diagram_tab_mut() {
+                    d.start_loading();
+                    self.request_diagram();
+                }
             }
             _ => {}
         }
@@ -2612,6 +2695,60 @@ impl Workspace {
                 None => {}
             }
         }
+        if let Some(d) = self.link_dialog.as_mut() {
+            let mut decision = None;
+            let sqlite = self.conn.driver == DriverId::Sqlite;
+            widgets::modal(ctx, "Link columns", |ui| {
+                ui.label(RichText::new(format!("{}.{}  ->  {}.{}", d.link.from_table, d.link.from_column, d.link.to_table, d.link.to_column)).color(theme::TEXT));
+                ui.add_space(8.0);
+                ui.radio_value(&mut d.kind, LinkKind::DiagramOnly, "Only in the diagram");
+                widgets::muted(ui, "A dashed line kept in DBZilla. The database is not changed.");
+                ui.add_space(4.0);
+                ui.radio_value(&mut d.kind, LinkKind::Database, "Foreign key in the database");
+                if d.kind == LinkKind::Database {
+                    ui.add_space(4.0);
+                    widgets::field_label(ui, "Constraint name (optional)");
+                    widgets::input(ui, &mut d.constraint, "chosen by the database");
+                    widgets::field_label(ui, "On update");
+                    egui::ComboBox::from_id_salt("link_upd").selected_text(d.on_update.clone()).show_ui(ui, |ui| {
+                        for a in FK_ACTIONS {
+                            ui.selectable_value(&mut d.on_update, a.to_owned(), a);
+                        }
+                    });
+                    widgets::field_label(ui, "On delete");
+                    egui::ComboBox::from_id_salt("link_del").selected_text(d.on_delete.clone()).show_ui(ui, |ui| {
+                        for a in FK_ACTIONS {
+                            ui.selectable_value(&mut d.on_delete, a.to_owned(), a);
+                        }
+                    });
+                    if sqlite {
+                        widgets::muted(ui, "SQLite rebuilds the table to add it. Rows that break the key stop the change.");
+                    }
+                }
+                if let Some(e) = &d.error {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(e).color(theme::ERROR));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Create").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match decision {
+                Some(true) => {
+                    if let Some(d) = self.link_dialog.take() {
+                        self.apply_link_dialog(d);
+                    }
+                }
+                Some(false) => self.link_dialog = None,
+                None => {}
+            }
+        }
         if let Some(id) = self.triggers_for {
             let triggers = self.table_tab_mut(id).and_then(|t| t.structure.as_ref().map(|s| s.triggers.clone())).unwrap_or_default();
             let mut close = false;
@@ -3381,6 +3518,85 @@ mod tests {
         let d = ws.diagram_tab_mut().unwrap();
         assert_eq!(d.edge_count(false), 0);
         assert_eq!(d.edge_count(true), 1);
+    }
+
+    /// A link drawn between two columns can stay in the diagram only: it is saved, comes back and can be deleted.
+    #[test]
+    fn diagram_only_links_are_kept_and_deleted() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        let link = DocLink { from_table: "logs".into(), from_column: "owner".into(), to_table: "users".into(), to_column: "id".into() };
+        ws.diagram_action(id, DiagramAction::RequestLink(link.clone()));
+        assert_eq!(ws.link_dialog.as_ref().unwrap().kind, LinkKind::DiagramOnly, "the harmless choice is the default");
+        let dialog = ws.link_dialog.take().unwrap();
+        ws.apply_link_dialog(dialog);
+        assert_eq!(ws.diagram_tab_mut().unwrap().links(), std::slice::from_ref(&link));
+        assert_eq!(ws.diagrams.load_links(&ws.diagram_key()), vec![link.clone()]);
+        // closed and opened again, the link comes back
+        ws.diagram_action(id, DiagramAction::Close);
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert_eq!(ws.diagram_tab_mut().unwrap().links(), std::slice::from_ref(&link));
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        ws.diagram_action(id, DiagramAction::DeleteLink(link));
+        assert!(ws.diagram_tab_mut().unwrap().links().is_empty());
+        assert!(ws.diagrams.load_links(&ws.diagram_key()).is_empty());
+        // the database was never touched
+        assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    /// A link can become a real foreign key: the table is rebuilt on SQLite and the diagram shows the key.
+    #[test]
+    fn diagram_link_becomes_a_foreign_key() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER); INSERT INTO users VALUES (1); INSERT INTO logs (owner) VALUES (1);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        let link = DocLink { from_table: "logs".into(), from_column: "owner".into(), to_table: "users".into(), to_column: "id".into() };
+        ws.diagram_action(id, DiagramAction::RequestLink(link));
+        let mut dialog = ws.link_dialog.take().unwrap();
+        dialog.kind = LinkKind::Database;
+        dialog.on_delete = "CASCADE".into();
+        ws.apply_link_dialog(dialog);
+        assert!(ws.link_dialog.is_none(), "{:?}", ws.link_dialog.as_ref().map(|d| d.error.clone()));
+        assert_eq!(ws.link_kind, LinkKind::Database, "the choice is remembered");
+        if let Some(g) = ws.gate.take() {
+            ws.send_ddl(g.statements, DdlAfter::default());
+        }
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.edge_count(false) == 1));
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM logs", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "the data is kept");
+        assert_eq!(db.query_row("SELECT on_delete FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, String>(0)).unwrap(), "CASCADE");
+    }
+
+    /// Adding a foreign key to a table that others refer to is refused with a reason, and the dialog stays open.
+    #[test]
+    fn diagram_link_refused_by_the_database_keeps_the_dialog() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, x INTEGER); CREATE TABLE c (b_id INTEGER REFERENCES b(id));").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "c"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        ws.diagram_action(id, DiagramAction::RequestLink(DocLink { from_table: "b".into(), from_column: "a_id".into(), to_table: "a".into(), to_column: "id".into() }));
+        let mut dialog = ws.link_dialog.take().unwrap();
+        dialog.kind = LinkKind::Database;
+        ws.apply_link_dialog(dialog);
+        let again = ws.link_dialog.as_ref().expect("the dialog stays open");
+        assert!(again.error.as_deref().is_some_and(|e| e.contains("refer to it")), "{:?}", again.error);
+        assert!(ws.gate.is_none());
     }
 
     /// Moved tables come back where they were; Rearrange forgets them.

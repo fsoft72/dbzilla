@@ -185,14 +185,14 @@ fn foreign_keys_postgres_mysql_and_sqlite_refusal() {
         on_delete: "SET NULL".into(),
     };
     assert_eq!(
-        ddl(DriverId::Postgres, StructuralOp::AddForeignKey { table: t("a"), fk: fk() }).unwrap(),
+        ddl(DriverId::Postgres, StructuralOp::AddForeignKey { table: t("a"), fk: fk(), current: None }).unwrap(),
         vec!["ALTER TABLE \"a\" ADD CONSTRAINT \"fk1\" FOREIGN KEY (\"b\") REFERENCES \"r\" (\"id\") ON UPDATE CASCADE ON DELETE SET NULL"]
     );
     assert_eq!(
         ddl(DriverId::MySql, StructuralOp::DropForeignKey { table: t("a"), name: "fk1".into() }).unwrap(),
         vec!["ALTER TABLE `a` DROP FOREIGN KEY `fk1`"]
     );
-    assert!(matches!(ddl(DriverId::Sqlite, StructuralOp::AddForeignKey { table: t("a"), fk: fk() }), Err(DdlError::Unsupported(_))));
+    assert!(matches!(ddl(DriverId::Sqlite, StructuralOp::AddForeignKey { table: t("a"), fk: fk(), current: None }), Err(DdlError::Unsupported(_))));
 }
 
 #[test]
@@ -218,4 +218,16 @@ fn mysql_attrs_include_comment_and_collation() {
     let extra = BTreeMap::from([("collation".to_owned(), "utf8mb4_bin".to_owned()), ("comment".to_owned(), "it's a \\ test".to_owned())]);
     assert_eq!(dbzilla_core::ddl::mysql_column_attrs(&extra, "varchar(40)").as_deref(), Some("COLLATE utf8mb4_bin COMMENT 'it''s a \\\\ test'"));
     assert_eq!(dbzilla_core::ddl::mysql_column_attrs(&extra, "int").as_deref(), Some("COMMENT 'it''s a \\\\ test'"), "no collation on a number");
+}
+
+#[test]
+fn sqlite_foreign_key_rebuild_needs_the_structure_and_refuses_referenced_tables() {
+    let fk = || ForeignKeyDef { name: None, columns: vec!["c".into()], ref_table: t("r"), ref_columns: vec!["id".into()], on_update: "NO ACTION".into(), on_delete: "NO ACTION".into() };
+    let mut st = current_structure();
+    st.ddl = "CREATE TABLE a (id INTEGER PRIMARY KEY, c INTEGER)".into();
+    let stmts = ddl(DriverId::Sqlite, StructuralOp::AddForeignKey { table: t("a"), fk: fk(), current: Some(Box::new(st.clone())) }).unwrap();
+    assert!(stmts[0].contains("FOREIGN KEY (\"c\") REFERENCES \"r\" (\"id\") ON UPDATE NO ACTION ON DELETE NO ACTION"), "{stmts:?}");
+    assert!(stmts[1].starts_with("INSERT INTO") && stmts[2].starts_with("DROP TABLE") && stmts[3].contains("RENAME TO"), "{stmts:?}");
+    st.referenced_by = vec!["child".into()];
+    assert!(matches!(ddl(DriverId::Sqlite, StructuralOp::AddForeignKey { table: t("a"), fk: fk(), current: Some(Box::new(st)) }), Err(DdlError::Unsupported(_))));
 }

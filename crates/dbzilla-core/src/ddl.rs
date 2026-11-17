@@ -61,7 +61,8 @@ pub enum StructuralOp {
     SetPrimaryKey { table: TableRef, old: Vec<String>, new: Vec<String>, current: Option<Box<TableStructure>> },
     AddIndex { table: TableRef, index: IndexDef },
     DropIndex { table: TableRef, name: String },
-    AddForeignKey { table: TableRef, fk: ForeignKeyDef },
+    /// `current` is required for SQLite, which rebuilds the table to gain a foreign key.
+    AddForeignKey { table: TableRef, fk: ForeignKeyDef, current: Option<Box<TableStructure>> },
     DropForeignKey { table: TableRef, name: String },
     CloneTable { source: TableRef, target: TableRef, with_data: bool },
     /// Raw SQL (view or function definitions typed in a DDL editor).
@@ -215,12 +216,15 @@ pub fn generate_ddl(op: &StructuralOp, d: &dyn Dialect) -> Result<Vec<String>, D
             }
             DriverId::Sqlite => vec![format!("DROP INDEX {}", d.quote_ident(name))],
         },
-        StructuralOp::AddForeignKey { table, fk } => {
-            if !caps.add_fk_after_create {
-                return Err(DdlError::Unsupported("this database cannot add a foreign key to an existing table".into()));
+        StructuralOp::AddForeignKey { table, fk, current } => match (d.id(), current) {
+            (DriverId::Sqlite, Some(st)) => sqlite_add_fk(d, table, fk, st)?,
+            _ => {
+                if !caps.add_fk_after_create {
+                    return Err(DdlError::Unsupported("this database cannot add a foreign key to an existing table".into()));
+                }
+                vec![format!("ALTER TABLE {} ADD {}", q(table), fk_sql(d, fk))]
             }
-            vec![format!("ALTER TABLE {} ADD {}", q(table), fk_sql(d, fk))]
-        }
+        },
         StructuralOp::DropForeignKey { table, name } => match d.id() {
             DriverId::Sqlite => return Err(DdlError::Unsupported("this database cannot drop a foreign key from an existing table".into())),
             DriverId::MySql => vec![format!("ALTER TABLE {} DROP FOREIGN KEY {}", q(table), d.quote_ident(name))],
@@ -306,6 +310,31 @@ fn sqlite_set_pk(d: &dyn Dialect, table: &TableRef, new: &[String], st: &TableSt
     let mut tmp = table.clone();
     tmp.name = format!("{}{REBUILD_SUFFIX}", table.name);
     let create = crate::sqlite_rewrite::add_primary_key(&st.ddl, &d.quote_table(&tmp), new, &|n| d.quote_ident(n)).map_err(refuse)?;
+    let names: Vec<String> = st.columns.iter().map(|c| c.name.clone()).collect();
+    let mut v = vec![
+        create,
+        format!("INSERT INTO {} ({}) SELECT {} FROM {}", d.quote_table(&tmp), ident_list(d, &names), ident_list(d, &names), d.quote_table(table)),
+        format!("DROP TABLE {}", d.quote_table(table)),
+        format!("ALTER TABLE {} RENAME TO {}", d.quote_table(&tmp), d.quote_ident(&table.name)),
+    ];
+    v.extend(st.index_sql.iter().cloned());
+    v.extend(st.triggers.iter().map(|t| t.statement.clone()));
+    Ok(v)
+}
+
+/// SQLite gains a foreign key by rebuilding the table with the constraint in its text. Rows that break the
+/// new constraint make the copy fail, and the batch is atomic, so nothing changes.
+fn sqlite_add_fk(d: &dyn Dialect, table: &TableRef, fk: &ForeignKeyDef, st: &TableStructure) -> Result<Vec<String>, DdlError> {
+    let refuse = |why: String| DdlError::Unsupported(format!("this SQLite table cannot be rebuilt safely: {why}"));
+    if !st.referenced_by.is_empty() {
+        return Err(refuse(format!("{} refer to it by foreign key and dropping it could delete their rows", st.referenced_by.join(", "))));
+    }
+    if st.ddl.trim().is_empty() {
+        return Err(refuse("the original table text is unknown".into()));
+    }
+    let mut tmp = table.clone();
+    tmp.name = format!("{}{REBUILD_SUFFIX}", table.name);
+    let create = crate::sqlite_rewrite::add_table_constraint(&st.ddl, &d.quote_table(&tmp), &fk_sql(d, fk)).map_err(refuse)?;
     let names: Vec<String> = st.columns.iter().map(|c| c.name.clone()).collect();
     let mut v = vec![
         create,

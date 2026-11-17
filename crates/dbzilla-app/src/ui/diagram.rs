@@ -3,7 +3,7 @@
 use super::widgets;
 use crate::glyphs::Ico;
 use crate::theme;
-use dbzilla_core::diagram::{Diagram, DiagramSort};
+use dbzilla_core::diagram::{Diagram, DiagramEdge, DiagramSort, DocLink, EdgeKind};
 use dbzilla_core::model::TableStructure;
 use dbzilla_store::diagrams::Positions;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
@@ -20,6 +20,10 @@ const MAX_ZOOM: f32 = 2.5;
 /// Below this zoom the box text is not drawn.
 const TEXT_ZOOM: f32 = 0.45;
 const MARGIN: f32 = 40.0;
+/// Distance from the left or right edge of a box, in screen points, where a column can start a link.
+const PORT_PX: f32 = 10.0;
+/// Distance from a line, in screen points, that counts as pointing at it.
+const EDGE_HIT_PX: f32 = 7.0;
 
 /// Requests of the diagram toward the workspace.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +36,18 @@ pub enum DiagramAction {
     Close,
     /// The positions changed: keep them for the next time.
     Save(Positions),
+    /// The user dragged from one column to another: ask what kind of link to make.
+    RequestLink(DocLink),
+    /// The user deleted a link they had drawn.
+    DeleteLink(DocLink),
+}
+
+/// A link being dragged from a column.
+struct Linking {
+    table: usize,
+    column: usize,
+    /// The drag started on the right edge of the box.
+    right: bool,
 }
 
 /// State of a diagram tab.
@@ -57,6 +73,11 @@ pub struct DiagramTab {
     found_at: usize,
     /// The next reload ignores the saved positions (Rearrange).
     forget_saved: bool,
+    /// Links drawn by the user, kept in the application only.
+    links: Vec<DocLink>,
+    linking: Option<Linking>,
+    /// Line the context menu was opened on.
+    menu_edge: Option<usize>,
     /// The positions changed and must be handed to the store.
     save_pending: bool,
 }
@@ -83,14 +104,18 @@ impl DiagramTab {
             found: Vec::new(),
             found_at: 0,
             forget_saved: false,
+            links: Vec::new(),
+            linking: None,
+            menu_edge: None,
             save_pending: false,
         }
     }
 
     /// Takes the tables read from the database and lays them out, using the saved positions
     /// unless a Rearrange asked for a fresh layout. Returns the positions to save when the layout is new.
-    pub fn set_tables(&mut self, tables: Vec<TableStructure>, skipped: Vec<String>, saved: &Positions) -> Option<Positions> {
+    pub fn set_tables(&mut self, tables: Vec<TableStructure>, skipped: Vec<String>, saved: &Positions, links: Vec<DocLink>) -> Option<Positions> {
         self.structures = tables;
+        self.links = links;
         self.skipped = skipped;
         self.loading = false;
         let use_saved = !self.forget_saved && !saved.is_empty();
@@ -99,10 +124,55 @@ impl DiagramTab {
         std::mem::take(&mut self.save_pending).then(|| self.positions_by_name())
     }
 
+    /// Marks the tab as reloading; the saved positions are kept.
+    pub fn start_loading(&mut self) {
+        self.loading = true;
+    }
+
     /// Marks the tab as reloading with a fresh layout (Rearrange).
     pub fn start_rearrange(&mut self) {
         self.loading = true;
         self.forget_saved = true;
+    }
+
+    /// Links drawn by the user.
+    pub fn links(&self) -> &[DocLink] {
+        &self.links
+    }
+
+    /// Adds a link drawn by the user; false when it is already there.
+    pub fn add_link(&mut self, link: DocLink) -> bool {
+        if self.links.contains(&link) {
+            return false;
+        }
+        self.links.push(link);
+        self.refresh_edges();
+        true
+    }
+
+    /// Removes a link drawn by the user.
+    pub fn remove_link(&mut self, link: &DocLink) {
+        self.links.retain(|l| l != link);
+        self.refresh_edges();
+    }
+
+    /// Structure of the table called `name`.
+    pub fn structure(&self, name: &str) -> Option<&TableStructure> {
+        self.structures.iter().find(|s| s.table.name == name)
+    }
+
+    /// Rebuilds only the lines: the tables keep their order, so the positions stay valid.
+    fn refresh_edges(&mut self) {
+        let mut d = Diagram::build(&self.structures, self.sort);
+        d.add_manual(&self.links);
+        self.diagram = d;
+        self.selected = self.selected.filter(|&i| i < self.positions.len());
+    }
+
+    /// The link a line stands for, by names.
+    fn link_of(&self, e: &DiagramEdge) -> Option<DocLink> {
+        let (from, to) = (&self.diagram.tables[e.from_table], &self.diagram.tables[e.to_table]);
+        Some(DocLink { from_table: from.name.clone(), from_column: from.columns[e.from_column].name.clone(), to_table: to.name.clone(), to_column: to.columns.get(e.to_column?)?.name.clone() })
     }
 
     /// Positions by table name, as kept in the store.
@@ -114,6 +184,7 @@ impl DiagramTab {
     /// A layout that does not come from the saved positions is saved.
     fn rebuild(&mut self, saved: Option<&Positions>) {
         self.diagram = Diagram::build(&self.structures, self.sort);
+        self.diagram.add_manual(&self.links);
         self.groups = self.diagram.groups();
         self.sizes = self.diagram.tables.iter().map(box_size).collect();
         self.positions = self.diagram.layout(&self.sizes);
@@ -142,12 +213,12 @@ impl DiagramTab {
     /// Number of foreign key lines in the diagram, with or without the guessed ones.
     #[cfg(test)]
     pub fn edge_count(&self, inferred: bool) -> usize {
-        self.diagram.edges.iter().filter(|e| e.inferred == inferred).count()
+        self.diagram.edges.iter().filter(|e| (e.kind == EdgeKind::Inferred) == inferred).count()
     }
 
     /// Number of links guessed from column names.
     fn inferred_count(&self) -> usize {
-        self.diagram.edges.iter().filter(|e| e.inferred).count()
+        self.diagram.edges.iter().filter(|e| e.kind == EdgeKind::Inferred).count()
     }
 
     /// Position of the table called `name`.
@@ -284,6 +355,7 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
         tab.jump_to(i, canvas);
     }
     handle_input(ui, tab, &resp, origin, &mut actions);
+    painter.text(canvas.left_bottom() + vec2(12.0, -10.0), Align2::LEFT_BOTTOM, "Drag from the edge of a column to another column to link them. Right click a drawn link to delete it.", FontId::proportional(11.0), theme::MUTED);
     if std::mem::take(&mut tab.save_pending) {
         actions.push(DiagramAction::Save(tab.positions_by_name()));
     }
@@ -305,12 +377,17 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
         }
     }
     if resp.drag_started() {
-        tab.dragging = resp.interact_pointer_pos().and_then(|p| hit(p, tab));
-        if tab.dragging.is_some() {
-            tab.selected = tab.dragging;
+        // egui reports a drag after the pointer moved a little: the press position is where it started
+        let start = ui.input(|i| i.pointer.press_origin()).or_else(|| resp.interact_pointer_pos());
+        tab.linking = start.and_then(|p| port_at(tab, p, origin)).map(|(table, column, right)| Linking { table, column, right });
+        if tab.linking.is_none() {
+            tab.dragging = start.and_then(|p| hit(p, tab));
+            if tab.dragging.is_some() {
+                tab.selected = tab.dragging;
+            }
         }
     }
-    if resp.dragged() {
+    if resp.dragged() && tab.linking.is_none() {
         match tab.dragging {
             Some(i) => {
                 let d = resp.drag_delta() / tab.zoom;
@@ -320,9 +397,38 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
             None => tab.pan += resp.drag_delta(),
         }
     }
-    if resp.drag_stopped() && tab.dragging.take().is_some() {
-        tab.save_pending = true;
+    if resp.drag_stopped() {
+        if let Some(l) = tab.linking.take() {
+            let target = ui.input(|i| i.pointer.latest_pos()).and_then(|p| column_at(tab, p, origin));
+            if let Some((t, c)) = target.filter(|&(t, c)| (t, c) != (l.table, l.column)) {
+                let (from, to) = (&tab.diagram.tables[l.table], &tab.diagram.tables[t]);
+                actions.push(DiagramAction::RequestLink(DocLink { from_table: from.name.clone(), from_column: from.columns[l.column].name.clone(), to_table: to.name.clone(), to_column: to.columns[c].name.clone() }));
+            }
+        } else if tab.dragging.take().is_some() {
+            tab.save_pending = true;
+        }
     }
+    if resp.secondary_clicked() {
+        tab.menu_edge = resp.interact_pointer_pos().and_then(|p| edge_near(tab, p, origin));
+    }
+    resp.context_menu(|ui| {
+        widgets::flat_menu_style(ui);
+        let edge = tab.menu_edge.and_then(|i| tab.diagram.edges.get(i));
+        match edge {
+            Some(e) if e.kind == EdgeKind::Manual => {
+                if ui.button("Delete link").clicked() {
+                    if let Some(l) = tab.link_of(e) {
+                        actions.push(DiagramAction::DeleteLink(l));
+                    }
+                    ui.close_menu();
+                }
+            }
+            Some(_) => {
+                ui.add_enabled(false, egui::Button::new("Only links drawn here can be deleted"));
+            }
+            None => ui.close_menu(),
+        }
+    });
     if resp.clicked() {
         tab.selected = resp.interact_pointer_pos().and_then(|p| hit(p, tab));
     }
@@ -332,9 +438,80 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
         }
     }
     if resp.hovered() {
-        let over = resp.hover_pos().and_then(|p| hit(p, tab)).is_some();
-        ui.ctx().set_cursor_icon(if tab.dragging.is_some() { CursorIcon::Grabbing } else if over { CursorIcon::Grab } else { CursorIcon::Default });
+        let pointer = resp.hover_pos();
+        let over = pointer.and_then(|p| hit(p, tab)).is_some();
+        let port = pointer.and_then(|p| port_at(tab, p, origin)).is_some();
+        let icon = if tab.linking.is_some() || port {
+            CursorIcon::Crosshair
+        } else if tab.dragging.is_some() {
+            CursorIcon::Grabbing
+        } else if over {
+            CursorIcon::Grab
+        } else {
+            CursorIcon::Default
+        };
+        ui.ctx().set_cursor_icon(icon);
     }
+}
+
+/// Column row under `p`, as (table, column).
+fn column_at(tab: &DiagramTab, p: Pos2, origin: Pos2) -> Option<(usize, usize)> {
+    let z = tab.zoom;
+    (0..tab.positions.len()).rev().find_map(|i| {
+        let rect = tab.rect_of(i, origin);
+        if !rect.contains(p) {
+            return None;
+        }
+        let row = ((p.y - rect.min.y) / z - HEADER_H) / ROW_H;
+        (row >= 0.0 && (row as usize) < tab.diagram.tables[i].columns.len()).then_some((i, row as usize))
+    })
+}
+
+/// Column whose left or right edge is under `p`, with the side: where a link can start.
+fn port_at(tab: &DiagramTab, p: Pos2, origin: Pos2) -> Option<(usize, usize, bool)> {
+    let (t, c) = column_at(tab, p, origin)?;
+    let rect = tab.rect_of(t, origin);
+    if (p.x - rect.max.x).abs() <= PORT_PX {
+        Some((t, c, true))
+    } else if (p.x - rect.min.x).abs() <= PORT_PX {
+        Some((t, c, false))
+    } else {
+        None
+    }
+}
+
+/// Screen point of the edge of a column row.
+fn port_pos(tab: &DiagramTab, table: usize, column: usize, right: bool, origin: Pos2) -> Pos2 {
+    let rect = tab.rect_of(table, origin);
+    pos2(if right { rect.max.x } else { rect.min.x }, rect.min.y + (HEADER_H + ROW_H * column as f32 + ROW_H / 2.0) * tab.zoom)
+}
+
+/// Index of the visible line closest to `p`, when it is near enough.
+fn edge_near(tab: &DiagramTab, p: Pos2, origin: Pos2) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for (i, e) in tab.diagram.edges.iter().enumerate() {
+        if e.kind == EdgeKind::Inferred && !tab.show_inferred {
+            continue;
+        }
+        let (a, b, c1, c2) = edge_geometry(tab, origin, e);
+        let points = egui::epaint::CubicBezierShape::from_points_stroke([a, c1, c2, b], false, Color32::TRANSPARENT, Stroke::NONE).flatten(Some(1.0));
+        let d = points.windows(2).map(|w| distance_to_segment(p, w[0], w[1])).fold(f32::MAX, f32::min);
+        if d <= EDGE_HIT_PX && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, i));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// Distance from `p` to the segment `a`-`b`.
+fn distance_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 == 0.0 {
+        return (p - a).length();
+    }
+    let t = (((p - a).x * ab.x + (p - a).y * ab.y) / len2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
 }
 
 /// Draws the lines first, then the boxes on top.
@@ -342,10 +519,14 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
     let z = tab.zoom;
     let show_text = z >= TEXT_ZOOM;
     let focus = tab.selected;
-    for e in tab.diagram.edges.iter().filter(|e| tab.show_inferred || !e.inferred) {
+    for e in tab.diagram.edges.iter().filter(|e| tab.show_inferred || e.kind != EdgeKind::Inferred) {
         let involved = focus.is_some_and(|f| f == e.from_table || f == e.to_table);
-        let base = if e.inferred { theme::LABEL } else { group_color(tab.groups[e.from_table]).unwrap_or(theme::LABEL) };
-        let color = if involved && e.inferred { theme::TEXT } else if involved { base } else if focus.is_some() { base.gamma_multiply(0.25) } else { base.gamma_multiply(0.7) };
+        let base = match e.kind {
+            EdgeKind::Real => group_color(tab.groups[e.from_table]).unwrap_or(theme::LABEL),
+            EdgeKind::Inferred => theme::LABEL,
+            EdgeKind::Manual => theme::SECONDARY,
+        };
+        let color = if involved && e.kind == EdgeKind::Inferred { theme::TEXT } else if involved { base } else if focus.is_some() { base.gamma_multiply(0.25) } else { base.gamma_multiply(0.7) };
         let width = if involved { 2.0_f32 } else { 1.2_f32 };
         paint_edge(p, tab, origin, e, Stroke::new(width, color));
     }
@@ -384,10 +565,42 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
             p.text(pos2(rect.max.x - 8.0 * z, y), Align2::RIGHT_CENTER, &c.type_name, FontId::proportional(10.5 * z), theme::MUTED);
         }
     }
+    paint_link_overlay(p, tab, origin, hover);
 }
 
-/// Draws the line of one foreign key between the two column rows.
-fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &dbzilla_core::diagram::DiagramEdge, stroke: Stroke) {
+/// The handle under the pointer, and while a link is dragged the rubber band and the column it would land on.
+fn paint_link_overlay(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Option<Pos2>) {
+    let z = tab.zoom.max(0.6);
+    let Some(h) = hover else { return };
+    match &tab.linking {
+        None => {
+            if let Some((t, c, right)) = port_at(tab, h, origin) {
+                let at = port_pos(tab, t, c, right, origin);
+                p.circle_filled(at, 5.0 * z, theme::PRIMARY);
+                p.circle_stroke(at, 5.0 * z, Stroke::new(1.5_f32, theme::TEXT));
+            }
+        }
+        Some(l) => {
+            let from = port_pos(tab, l.table, l.column, l.right, origin);
+            let target = column_at(tab, h, origin).filter(|&(t, c)| (t, c) != (l.table, l.column));
+            let end = match target {
+                Some((t, c)) => {
+                    let rect = tab.rect_of(t, origin);
+                    let row = Rect::from_min_size(pos2(rect.min.x, rect.min.y + (HEADER_H + ROW_H * c as f32) * tab.zoom), vec2(rect.width(), ROW_H * tab.zoom));
+                    p.rect_filled(row, 0.0, theme::PRIMARY.gamma_multiply(0.35));
+                    p.rect_stroke(row, 0.0, Stroke::new(1.5_f32, theme::SECONDARY), StrokeKind::Inside);
+                    h
+                }
+                None => h,
+            };
+            p.circle_filled(from, 4.0 * z, theme::SECONDARY);
+            p.extend(egui::Shape::dashed_line(&[from, end], Stroke::new(2.0_f32, theme::SECONDARY), 6.0, 4.0));
+        }
+    }
+}
+
+/// End points and control points of the line of one edge.
+fn edge_geometry(tab: &DiagramTab, origin: Pos2, e: &DiagramEdge) -> (Pos2, Pos2, Pos2, Pos2) {
     let z = tab.zoom;
     let (from, to) = (tab.rect_of(e.from_table, origin), tab.rect_of(e.to_table, origin));
     let row_y = |r: Rect, col: Option<usize>| r.min.y + col.map_or(HEADER_H / 2.0, |c| HEADER_H + ROW_H * c as f32 + ROW_H / 2.0) * z;
@@ -408,8 +621,15 @@ fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &dbzilla_cor
         let (a, b) = (pos2(from.max.x, y1), pos2(to.max.x, y2));
         (a, b, a + vec2(reach, 0.0), b + vec2(reach, 0.0))
     };
+    (a, b, c1, c2)
+}
+
+/// Draws the line of one edge between the two column rows: solid for a foreign key, dashed for the others.
+fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge, stroke: Stroke) {
+    let z = tab.zoom;
+    let (a, b, c1, c2) = edge_geometry(tab, origin, e);
     let curve = egui::epaint::CubicBezierShape::from_points_stroke([a, c1, c2, b], false, Color32::TRANSPARENT, stroke);
-    if e.inferred {
+    if e.kind != EdgeKind::Real {
         let dash = 6.0 * z.max(0.6);
         p.extend(egui::Shape::dashed_line(&curve.flatten(Some(0.5)), stroke, dash, dash * 0.7));
     } else {

@@ -242,6 +242,18 @@ pub fn rewrite_create(ddl: &str, tmp_quoted: &str, ch: &ColumnChange<'_>, quote:
 /// Rewrites `ddl` into a `CREATE TABLE <tmp_quoted> (...)` with a table level `PRIMARY KEY (cols)` added.
 /// Refuses tables that already define a primary key anywhere, since replacing it is not safe to do textually.
 pub fn add_primary_key(ddl: &str, tmp_quoted: &str, cols: &[String], quote: &dyn Fn(&str) -> String) -> Result<String, String> {
+    let list: Vec<String> = cols.iter().map(|c| quote(c)).collect();
+    append_table_element(ddl, tmp_quoted, &format!("PRIMARY KEY ({})", list.join(", ")), Some(("PRIMARY", "the table already has a primary key")))
+}
+
+/// Rewrites `ddl` into a `CREATE TABLE <tmp_quoted> (...)` with one more table level constraint,
+/// for instance `FOREIGN KEY (a) REFERENCES b (c)`. Everything else in the table text is kept.
+pub fn add_table_constraint(ddl: &str, tmp_quoted: &str, constraint: &str) -> Result<String, String> {
+    append_table_element(ddl, tmp_quoted, constraint, None)
+}
+
+/// Appends `element` to the column list of `ddl`, optionally refusing when an element has the word `forbidden.0`.
+fn append_table_element(ddl: &str, tmp_quoted: &str, element: &str, forbidden: Option<(&str, &str)>) -> Result<String, String> {
     let toks = scan(ddl);
     let open = toks.iter().position(|t| t.kind == Kind::Group).ok_or("the table text has no column list")?;
     let body = &toks[open].raw[1..toks[open].raw.len() - 1];
@@ -256,13 +268,14 @@ pub fn add_primary_key(ddl: &str, tmp_quoted: &str, cols: &[String], quote: &dyn
     }
     let mut rendered = Vec::new();
     for el in elements.iter().filter(|e| !e.is_empty()) {
-        if el.iter().any(|t| is_word(t, "PRIMARY")) {
-            return Err("the table already has a primary key".into());
+        if let Some((word, why)) = forbidden {
+            if el.iter().any(|t| is_word(t, word)) {
+                return Err(why.into());
+            }
         }
         rendered.push(el.iter().map(|t| t.raw.as_str()).collect::<Vec<_>>().join(" "));
     }
-    let list: Vec<String> = cols.iter().map(|c| quote(c)).collect();
-    rendered.push(format!("PRIMARY KEY ({})", list.join(", ")));
+    rendered.push(element.to_owned());
     let tail = if suffix.is_empty() { String::new() } else { format!(" {}", suffix.join(" ")) };
     Ok(format!("CREATE TABLE {tmp_quoted} (\n  {}\n){tail}", rendered.join(",\n  ")))
 }
@@ -289,6 +302,17 @@ mod tests {
         assert!(out.contains("UNIQUE (id, email)"), "{out}");
         assert!(out.contains("FOREIGN KEY (id) REFERENCES b (x)"), "{out}");
         assert!(out.contains("c INTEGER NOT NULL DEFAULT 5 CHECK (c > 0)"), "the other column keeps its text: {out}");
+        assert!(out.ends_with("STRICT"), "{out}");
+    }
+
+    /// A table constraint is appended and the rest of the text, including the options after the list, is kept.
+    #[test]
+    fn appends_a_table_constraint() {
+        let ddl = "CREATE TABLE a (id INTEGER PRIMARY KEY, u TEXT DEFAULT 'x,y', CHECK (id > 0)) STRICT";
+        let out = add_table_constraint(ddl, "\"a__new\"", "FOREIGN KEY (\"u\") REFERENCES \"b\" (\"id\") ON UPDATE NO ACTION ON DELETE CASCADE").unwrap();
+        assert!(out.starts_with("CREATE TABLE \"a__new\" ("), "{out}");
+        assert!(out.contains("u TEXT DEFAULT 'x,y'"), "{out}");
+        assert!(out.contains("CHECK (id > 0),\n  FOREIGN KEY (\"u\") REFERENCES \"b\" (\"id\")"), "{out}");
         assert!(out.ends_with("STRICT"), "{out}");
     }
 

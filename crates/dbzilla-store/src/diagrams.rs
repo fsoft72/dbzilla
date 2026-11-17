@@ -2,6 +2,7 @@
 
 use crate::atomic::{load_json, save_json};
 use crate::StoreResult;
+use dbzilla_core::diagram::DocLink;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,11 +19,13 @@ pub type Positions = BTreeMap<String, (f32, f32)>;
 struct DiagramFile {
     schema_version: u32,
     layouts: BTreeMap<String, Positions>,
+    /// Links drawn by the user, per diagram key.
+    links: BTreeMap<String, Vec<DocLink>>,
 }
 
 impl Default for DiagramFile {
     fn default() -> Self {
-        Self { schema_version: DIAGRAMS_VERSION, layouts: BTreeMap::new() }
+        Self { schema_version: DIAGRAMS_VERSION, layouts: BTreeMap::new(), links: BTreeMap::new() }
     }
 }
 
@@ -47,6 +50,18 @@ impl DiagramStore {
     /// Saved positions for `key`; empty when there are none or the file is unusable.
     pub fn load(&self, key: &str) -> Positions {
         load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value.layouts.remove(key).unwrap_or_default()
+    }
+
+    /// Links drawn by the user for `key`; empty when there are none or the file is unusable.
+    pub fn load_links(&self, key: &str) -> Vec<DocLink> {
+        load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value.links.remove(key).unwrap_or_default()
+    }
+
+    /// Replaces the links saved for `key`, keeping the positions and the other diagrams.
+    pub fn save_links(&self, key: &str, links: Vec<DocLink>) -> StoreResult<()> {
+        let mut file = load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value;
+        file.links.insert(key.to_owned(), links);
+        save_json(&self.path, &file)
     }
 
     /// Replaces the positions saved for `key`, keeping the other diagrams.
@@ -83,6 +98,29 @@ mod tests {
         store.save(&a, pos(&[("orders", 99.0, 0.0)])).unwrap();
         assert_eq!(store.load(&a), pos(&[("orders", 99.0, 0.0)]));
         assert_eq!(store.load(&b), pos(&[("log", 1.0, 2.0)]));
+    }
+
+    #[test]
+    fn links_round_trip_next_to_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiagramStore::new(dir.path().join("diagrams.json"));
+        let link = DocLink { from_table: "a".into(), from_column: "u".into(), to_table: "b".into(), to_column: "id".into() };
+        store.save("k", pos(&[("a", 1.0, 2.0)])).unwrap();
+        store.save_links("k", vec![link.clone()]).unwrap();
+        store.save("k", pos(&[("a", 3.0, 4.0)])).unwrap();
+        assert_eq!(store.load_links("k"), vec![link]);
+        assert_eq!(store.load("k"), pos(&[("a", 3.0, 4.0)]));
+        assert!(store.load_links("other").is_empty());
+    }
+
+    #[test]
+    fn a_file_without_links_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagrams.json");
+        std::fs::write(&path, r#"{"schema_version":1,"layouts":{"k":{"t":[1.0,2.0]}}}"#).unwrap();
+        let store = DiagramStore::new(path);
+        assert_eq!(store.load("k"), pos(&[("t", 1.0, 2.0)]));
+        assert!(store.load_links("k").is_empty());
     }
 
     #[test]

@@ -262,6 +262,7 @@ impl StructDraft {
                     return Err("This database cannot add a foreign key to an existing table".into());
                 }
                 ops.push(StructuralOp::AddForeignKey {
+                    current: None,
                     table: table.clone(),
                     fk: ForeignKeyDef { name: f.name.clone(), columns: vec![c.name.trim().to_owned()], ref_table: f.ref_table.clone(), ref_columns: f.ref_columns.clone(), on_update: f.on_update.clone(), on_delete: f.on_delete.clone() },
                 });

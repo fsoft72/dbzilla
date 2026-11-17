@@ -2,6 +2,7 @@
 //! Pure data and geometry, no UI and no I/O.
 
 use crate::model::TableStructure;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Gap between two tables in the automatic layout.
@@ -24,6 +25,26 @@ pub struct DiagramTable {
     pub columns: Vec<DiagramColumn>,
 }
 
+/// Where a line comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// A foreign key of the database.
+    Real,
+    /// Guessed from the column name.
+    Inferred,
+    /// Drawn by the user and kept in the application only.
+    Manual,
+}
+
+/// A link drawn by the user, by table and column name. It exists in the diagram only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocLink {
+    pub from_table: String,
+    pub from_column: String,
+    pub to_table: String,
+    pub to_column: String,
+}
+
 /// A foreign key line from a column to the column it references.
 /// `to_column` is `None` when the target column is unknown, so the line ends on the table header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +53,7 @@ pub struct DiagramEdge {
     pub from_column: usize,
     pub to_table: usize,
     pub to_column: Option<usize>,
-    /// Guessed from the column name, there is no foreign key in the database.
-    pub inferred: bool,
+    pub kind: EdgeKind,
 }
 
 /// Order of the tables in the diagram.
@@ -74,12 +94,29 @@ impl Diagram {
                 let target = ordered[to_table];
                 let wanted = fk.columns.first().cloned().or_else(|| target.primary_key.first().cloned());
                 let to_column = wanted.and_then(|w| target.columns.iter().position(|c| c.name == w));
-                edges.push(DiagramEdge { from_table, from_column, to_table, to_column, inferred: false });
+                edges.push(DiagramEdge { from_table, from_column, to_table, to_column, kind: EdgeKind::Real });
             }
         }
         let mut diagram = Diagram { tables, edges };
         diagram.infer_edges(&ordered);
         diagram
+    }
+
+    /// Adds the links drawn by the user. A link whose table or column no longer exists is skipped, and one
+    /// that repeats a foreign key of the database is ignored. A guessed link between the same columns is replaced.
+    pub fn add_manual(&mut self, links: &[DocLink]) {
+        for l in links {
+            let find_table = |name: &str| self.tables.iter().position(|t| t.name == name);
+            let (Some(from_table), Some(to_table)) = (find_table(&l.from_table), find_table(&l.to_table)) else { continue };
+            let find_col = |t: usize, name: &str| self.tables[t].columns.iter().position(|c| c.name == name);
+            let (Some(from_column), Some(to_column)) = (find_col(from_table, &l.from_column), find_col(to_table, &l.to_column)) else { continue };
+            let same = |e: &DiagramEdge| e.from_table == from_table && e.from_column == from_column && e.to_table == to_table;
+            if self.edges.iter().any(|e| same(e) && e.kind != EdgeKind::Inferred) {
+                continue;
+            }
+            self.edges.retain(|e| !(same(e) && e.kind == EdgeKind::Inferred));
+            self.edges.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), kind: EdgeKind::Manual });
+        }
     }
 
     /// Adds a dashed link for every column that looks like a reference but has no foreign key:
@@ -104,7 +141,7 @@ impl Diagram {
                 if type_family(&col.type_name) != type_family(&target.columns[to_column].type_name) {
                     continue;
                 }
-                found.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), inferred: true });
+                found.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), kind: EdgeKind::Inferred });
             }
         }
         self.edges.extend(found);
@@ -115,7 +152,7 @@ impl Diagram {
     pub fn groups(&self) -> Vec<Option<usize>> {
         let mut parent: Vec<usize> = (0..self.tables.len()).collect();
         let mut linked = vec![false; self.tables.len()];
-        for e in self.edges.iter().filter(|e| e.from_table != e.to_table && !e.inferred) {
+        for e in self.edges.iter().filter(|e| e.from_table != e.to_table && e.kind == EdgeKind::Real) {
             linked[e.from_table] = true;
             linked[e.to_table] = true;
             let (a, b) = (find(&mut parent, e.from_table), find(&mut parent, e.to_table));
@@ -156,7 +193,7 @@ impl Diagram {
             return Vec::new();
         }
         let mut parent: Vec<usize> = (0..n).collect();
-        for e in self.edges.iter().filter(|e| e.from_table != e.to_table && !e.inferred) {
+        for e in self.edges.iter().filter(|e| e.from_table != e.to_table && e.kind == EdgeKind::Real) {
             let (a, b) = (find(&mut parent, e.from_table), find(&mut parent, e.to_table));
             if a != b {
                 parent[a] = b;
@@ -231,7 +268,7 @@ impl Diagram {
         // A table sits right of the tables it references. The relaxation is capped, so a cycle cannot loop.
         for _ in 0..members.len() {
             let mut changed = false;
-            for e in self.edges.iter().filter(|e| e.from_table != e.to_table && !e.inferred && members.contains(&e.from_table)) {
+            for e in self.edges.iter().filter(|e| e.from_table != e.to_table && e.kind == EdgeKind::Real && members.contains(&e.from_table)) {
                 if rank[e.from_table] < rank[e.to_table] + 1 && rank[e.to_table] + 1 < members.len() {
                     rank[e.from_table] = rank[e.to_table] + 1;
                     changed = true;
@@ -251,7 +288,7 @@ impl Diagram {
         for (li, layer) in layers.iter_mut().enumerate() {
             if li > 0 {
                 let key = |t: usize| -> f32 {
-                    let neighbours: Vec<f32> = self.edges.iter().filter(|e| e.from_table == t && !e.inferred && rank[e.to_table] < li).map(|e| slot[e.to_table]).collect();
+                    let neighbours: Vec<f32> = self.edges.iter().filter(|e| e.from_table == t && e.kind == EdgeKind::Real && rank[e.to_table] < li).map(|e| slot[e.to_table]).collect();
                     if neighbours.is_empty() { f32::MAX } else { neighbours.iter().sum::<f32>() / neighbours.len() as f32 }
                 };
                 layer.sort_by(|a, b| key(*a).partial_cmp(&key(*b)).unwrap_or(std::cmp::Ordering::Equal));
@@ -367,8 +404,8 @@ mod tests {
         let names: Vec<_> = d.tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["audit", "customers", "items", "orders"]);
         assert_eq!(d.edges.len(), 2);
-        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0), inferred: false }));
-        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0), inferred: false }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Real }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0), kind: EdgeKind::Real }));
     }
 
     #[test]
@@ -514,14 +551,14 @@ mod tests {
     }
 
     fn inferred(d: &Diagram) -> Vec<&DiagramEdge> {
-        d.edges.iter().filter(|e| e.inferred).collect()
+        d.edges.iter().filter(|e| e.kind == EdgeKind::Inferred).collect()
     }
 
     #[test]
     fn id_user_points_to_the_key_of_users() {
         let d = Diagram::build(&users_and_notifications("id_user", "text(64)"), DiagramSort::Name);
         // sorted: notifications, users
-        assert_eq!(inferred(&d), vec![&DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), inferred: true }]);
+        assert_eq!(inferred(&d), vec![&DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Inferred }]);
     }
 
     #[test]
@@ -570,7 +607,7 @@ mod tests {
         let s = vec![table("users", vec![col("id", true, None)]), table("notes", vec![col("id", true, None), col("user_id", false, Some(("users", "id")))])];
         let d = Diagram::build(&s, DiagramSort::Name);
         assert_eq!(d.edges.len(), 1);
-        assert!(!d.edges[0].inferred);
+        assert_eq!(d.edges[0].kind, EdgeKind::Real);
     }
 
     #[test]
@@ -587,6 +624,39 @@ mod tests {
         let sizes = vec![(100.0, 50.0); 2];
         assert_eq!(b.groups(), vec![None, None]);
         assert_eq!(a.layout(&sizes), b.layout(&sizes));
+    }
+
+    fn link(a: &str, ac: &str, b: &str, bc: &str) -> DocLink {
+        DocLink { from_table: a.into(), from_column: ac.into(), to_table: b.into(), to_column: bc.into() }
+    }
+
+    #[test]
+    fn manual_links_are_added_by_name() {
+        let mut d = Diagram::build(&users_and_notifications("owner", "text(64)"), DiagramSort::Name);
+        d.add_manual(&[link("notifications", "owner", "users", "id")]);
+        assert_eq!(d.edges, vec![DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Manual }]);
+        assert_eq!(d.groups(), vec![None, None], "a manual link does not make a group");
+    }
+
+    #[test]
+    fn manual_links_to_missing_tables_or_columns_are_skipped() {
+        let mut d = Diagram::build(&users_and_notifications("owner", "text(64)"), DiagramSort::Name);
+        d.add_manual(&[link("gone", "x", "users", "id"), link("notifications", "nope", "users", "id"), link("notifications", "owner", "users", "nope")]);
+        assert!(d.edges.is_empty());
+    }
+
+    #[test]
+    fn a_manual_link_replaces_the_guess_and_never_repeats_a_real_key() {
+        let mut d = Diagram::build(&users_and_notifications("id_user", "text(64)"), DiagramSort::Name);
+        assert_eq!(d.edges.len(), 1);
+        d.add_manual(&[link("notifications", "id_user", "users", "id"), link("notifications", "id_user", "users", "id")]);
+        assert_eq!(d.edges.len(), 1);
+        assert_eq!(d.edges[0].kind, EdgeKind::Manual);
+        let s = vec![table("users", vec![col("id", true, None)]), table("notes", vec![col("id", true, None), col("user_id", false, Some(("users", "id")))])];
+        let mut d = Diagram::build(&s, DiagramSort::Name);
+        d.add_manual(&[link("notes", "user_id", "users", "id")]);
+        assert_eq!(d.edges.len(), 1);
+        assert_eq!(d.edges[0].kind, EdgeKind::Real);
     }
 
     #[test]
