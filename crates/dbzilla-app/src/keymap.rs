@@ -451,4 +451,83 @@ mod tests {
         let text = format_shortcut(&s);
         assert!(text.ends_with("Shift+P"), "{text}");
     }
+
+    /// Every default shortcut survives the settings text form.
+    #[test]
+    fn shortcut_text_round_trips() {
+        let km = KeyMap::default();
+        for a in Action::ALL {
+            if let Some(s) = km.shortcut(a) {
+                assert_eq!(decode_shortcut(&encode_shortcut(&s)), Some(s), "{a:?}");
+            }
+        }
+        assert_eq!(decode_shortcut("Nope+P"), None);
+        assert_eq!(decode_shortcut("Mod+NotAKey"), None);
+    }
+
+    /// Action ids are unique, because they are the keys of the stored map.
+    #[test]
+    fn action_ids_are_unique() {
+        let ids: std::collections::HashSet<_> = Action::ALL.iter().map(|a| a.id()).collect();
+        assert_eq!(ids.len(), Action::ALL.len());
+    }
+
+    /// Without changes nothing is stored; custom and cleared shortcuts come back after a reload.
+    #[test]
+    fn overrides_round_trip() {
+        let mut km = KeyMap::default();
+        assert!(km.overrides().is_empty());
+        km.rebind(Action::Preview, cmd(Key::J)).unwrap();
+        km.clear(Action::Cancel);
+        let stored = km.overrides();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored["cancel"], "");
+        let back = KeyMap::from_overrides(&stored);
+        assert_eq!(back.shortcut(Action::Preview), Some(cmd(Key::J)));
+        assert_eq!(back.shortcut(Action::Cancel), None);
+    }
+
+    /// A damaged or conflicting stored shortcut leaves the default in place.
+    #[test]
+    fn bad_overrides_are_ignored() {
+        let mut o = BTreeMap::new();
+        o.insert("preview".to_owned(), "garbage".to_owned());
+        o.insert("commit".to_owned(), encode_shortcut(&cmd(Key::P))); // taken by Open Anything
+        o.insert("no_such_action".to_owned(), "Mod+J".to_owned());
+        let km = KeyMap::from_overrides(&o);
+        assert_eq!(km.shortcut(Action::Preview), KeyMap::default_shortcut(Action::Preview));
+        assert_eq!(km.shortcut(Action::Commit), KeyMap::default_shortcut(Action::Commit));
+    }
+
+    /// A shortcut needs Mod or Ctrl, except function keys.
+    #[test]
+    fn validation_rule() {
+        assert!(validate(&KeyboardShortcut::new(Modifiers::NONE, Key::A)).is_err());
+        assert!(validate(&KeyboardShortcut::new(Modifiers::SHIFT, Key::A)).is_err());
+        assert!(validate(&KeyboardShortcut::new(Modifiers::NONE, Key::F5)).is_ok());
+        assert!(validate(&cmd(Key::A)).is_ok());
+        let mut km = KeyMap::default();
+        assert!(km.rebind(Action::Preview, KeyboardShortcut::new(Modifiers::NONE, Key::A)).is_err());
+    }
+
+    /// Reset and Restore Defaults put the defaults back, also for a cleared shortcut.
+    #[test]
+    fn reset_and_restore() {
+        let mut km = KeyMap::default();
+        km.clear(Action::Commit);
+        assert!(!km.is_default(Action::Commit));
+        km.reset(Action::Commit);
+        assert!(km.is_default(Action::Commit));
+        km.rebind(Action::Preview, cmd(Key::J)).unwrap();
+        km.restore_defaults();
+        assert!(km.overrides().is_empty());
+    }
+
+    /// A global action cannot reuse the key of an editor or grid action.
+    #[test]
+    fn global_overlaps_contexts() {
+        let mut km = KeyMap::default();
+        assert!(km.rebind(Action::Preview, cmd(Key::D)).is_err()); // Duplicate Rows
+        assert!(km.rebind(Action::Beautify, cmd(Key::F)).is_err()); // Toggle Filters is global
+    }
 }

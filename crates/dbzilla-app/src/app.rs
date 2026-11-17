@@ -132,6 +132,7 @@ impl App {
                 PasswordMode::Command(cmd) => run_password_command(cmd).map(Some),
             })
         };
+        let keymap = KeyMap::from_overrides(&settings.value.keymap);
         let mcp = McpHost::new(paths.mcp_tokens_file(), paths.mcp_activity_file(), resolver);
         let mut app = Self {
             paths,
@@ -139,7 +140,7 @@ impl App {
             store: store.value,
             tags: tags.value,
             secrets,
-            keymap: KeyMap::default(),
+            keymap,
             rt,
             toasts,
             confirm: None,
@@ -281,7 +282,7 @@ impl App {
 
     /// Handles global shortcuts.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() && !ctx.input(|i| i.modifiers.command) {
+        if settings::is_capturing(ctx) || (ctx.wants_keyboard_input() && !ctx.input(|i| i.modifiers.command)) {
             return;
         }
         for a in self.keymap.triggered(ctx) {
@@ -708,7 +709,7 @@ impl eframe::App for App {
                     let width = ui.available_width().min(DETAIL_MAX_WIDTH);
                     let rect = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, ui.max_rect().height()));
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        changed = settings::show(ui, &mut self.settings, &mut self.settings_tab, &mut |ui, s| crate::ui::mcp::settings_tab(ui, s, &mut self.mcp));
+                        changed = settings::show(ui, &mut self.settings, &mut self.keymap, &mut self.settings_tab, &mut |ui, s| crate::ui::mcp::settings_tab(ui, s, &mut self.mcp));
                     });
                 });
                 if changed {

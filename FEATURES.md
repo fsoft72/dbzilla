@@ -33,7 +33,7 @@ Out of scope on purpose (see the SPEC change log): plugins, light and Auto theme
 
 ## Editor and settings
 
-- [ ] Keymap editor (14.5)
+- [x] Keymap editor (14.5): Keymap tab in Settings with every action, click and press to rebind, Delete for `Not Set`, Esc to cancel, Reset per row, Restore Defaults, conflicts and shortcuts without `Mod` or `Ctrl` refused, saved in the settings file
 - [ ] Verify the Vim key binding visually and fix what is off
 
 ## Other databases
