@@ -6,9 +6,9 @@ edition.workspace = true
 [dependencies]
 async-trait = "0.1.92"
 axum = "0.8.9"
-dbzilla-core = { version = "0.4.0", path = "../dbzilla-core" }
-dbzilla-drivers = { version = "0.4.0", path = "../dbzilla-drivers" }
-dbzilla-io = { version = "0.4.0", path = "../dbzilla-io" }
+dbzilla-core = { version = "0.5.0", path = "../dbzilla-core" }
+dbzilla-drivers = { version = "0.5.0", path = "../dbzilla-drivers" }
+dbzilla-io = { version = "0.5.0", path = "../dbzilla-io" }
 getrandom = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
