@@ -184,6 +184,12 @@ struct LinkDialog {
     error: Option<String>,
 }
 
+/// A foreign key waiting for the user to confirm its deletion.
+struct FkDelete {
+    table: TableRef,
+    constraint: String,
+}
+
 /// Foreign key actions offered in menus.
 const FK_ACTIONS: [&str; 5] = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"];
 
@@ -391,6 +397,8 @@ pub struct Workspace {
     link_kind: LinkKind,
     /// The trigger window, when open.
     triggers: Option<TriggerEditor>,
+    /// The confirmation before a foreign key is dropped from the diagram.
+    fk_delete: Option<FkDelete>,
     /// Functions a PostgreSQL trigger can call, as last listed by the server.
     trigger_functions: Vec<TableRef>,
     pending_copy: Option<(TableRef, ScriptKind)>,
@@ -483,6 +491,7 @@ impl Workspace {
             link_dialog: None,
             link_kind: LinkKind::DiagramOnly,
             triggers: None,
+            fk_delete: None,
             trigger_functions: Vec::new(),
             pending_copy: None,
             clipboard_out: None,
@@ -637,6 +646,10 @@ impl Workspace {
             Event::Diagram { tables, skipped, .. } => {
                 let key = self.diagram_key();
                 let (saved, links) = (self.diagrams.load(&key), self.diagrams.load_links(&key));
+                let blocked = (!self.caps.add_fk_after_create).then(|| if self.conn.driver == DriverId::Sqlite { "SQLite cannot drop a foreign key from an existing table" } else { "This database cannot drop a foreign key from an existing table" }.to_owned());
+                if let Some(d) = self.diagram_tab_mut() {
+                    d.set_fk_drop_blocked(blocked);
+                }
                 let fresh = self.diagram_tab_mut().and_then(|d| d.set_tables(tables, skipped, &saved, links));
                 if let Some(positions) = fresh {
                     self.save_diagram_positions(positions);
@@ -1128,6 +1141,13 @@ impl Workspace {
         }
     }
 
+    /// Drops the confirmed foreign key through the safe-mode gate; the diagram reloads when it is done.
+    fn apply_fk_delete(&mut self, d: FkDelete) {
+        let message = format!("Foreign key {} deleted", d.constraint);
+        let op = StructuralOp::DropForeignKey { table: d.table, name: d.constraint };
+        self.submit_ddl(vec![op], DdlAfter { closed: None, reload: None, message });
+    }
+
     /// Applies the link dialog: a real foreign key goes through the safe-mode gate, a drawn link is kept.
     /// On a problem the dialog stays open with the reason.
     fn apply_link_dialog(&mut self, dialog: LinkDialog) {
@@ -1395,6 +1415,15 @@ impl Workspace {
                     d.remove_link(&link);
                 }
                 self.save_diagram_links();
+            }
+            DiagramAction::DeleteForeignKey { table, constraint } => {
+                if !self.caps.add_fk_after_create {
+                    return self.notices.push((true, "This database cannot drop a foreign key from an existing table".into()));
+                }
+                let Some(table) = self.objects.iter().find(|o| o.kind == ObjectKind::Table && o.table.name == table).map(|o| o.table.clone()) else {
+                    return self.notices.push((true, format!("The table {table} is no longer in the schema")));
+                };
+                self.fk_delete = Some(FkDelete { table, constraint });
             }
             DiagramAction::OpenTable(name) => {
                 let table = self.objects.iter().find(|o| o.table.name == name).map(|o| o.table.clone());
@@ -3042,6 +3071,27 @@ impl Workspace {
         if self.triggers.is_some() {
             self.triggers_window(ctx);
         }
+        if let Some(d) = &self.fk_delete {
+            let text = format!("Delete foreign key {} on table {}?", d.constraint, d.table.name);
+            let mut decision = None;
+            widgets::modal(ctx, "Delete foreign key", |ui| {
+                ui.label(text);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::danger_button(ui, "Delete").clicked() {
+                        decision = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+            match (decision, self.fk_delete.take()) {
+                (Some(true), Some(d)) => self.apply_fk_delete(d),
+                (None, d) => self.fk_delete = d,
+                _ => {}
+            }
+        }
     }
 
     /// Opens the trigger window of a table tab and asks for the functions a PostgreSQL trigger can call.
@@ -4177,6 +4227,112 @@ mod tests {
                 cfg.clone(),
                 &["CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(40), qty INT) ENGINE=InnoDB"],
                 "SELECT count(*) FROM information_schema.triggers WHERE trigger_schema = 'shop' AND trigger_name = 'trg_items'",
+            );
+        }));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Opens the diagram of a workspace and waits for it to load; returns the tab id.
+    fn diagram_ready(ws: &mut Workspace) -> TabId {
+        ws.load_schema();
+        ws.open_diagram();
+        wait(ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id
+    }
+
+    /// SQLite cannot drop a foreign key: the diagram says why, the action is refused with a notice and nothing changes.
+    #[test]
+    fn deleting_a_foreign_key_on_sqlite_is_refused_with_a_notice() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER CONSTRAINT fk_owner REFERENCES users(id));").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        let id = diagram_ready(&mut ws);
+        assert!(ws.diagram_tab_mut().unwrap().fk_drop_blocked().is_some_and(|r| r.contains("SQLite")), "the menu entry is disabled with the reason");
+        ws.notices.clear();
+        ws.diagram_action(id, DiagramAction::DeleteForeignKey { table: "logs".into(), constraint: "fk_owner".into() });
+        assert!(ws.notices.iter().any(|(error, text)| *error && text.contains("cannot drop a foreign key")), "{:?}", ws.notices);
+        assert!(ws.fk_delete.is_none() && ws.gate.is_none());
+        assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    /// When the driver allows it, the action asks for a confirmation first and drops nothing yet.
+    #[test]
+    fn foreign_key_delete_dialog_opens_when_the_driver_allows_it() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER CONSTRAINT fk_owner REFERENCES users(id));").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        let id = diagram_ready(&mut ws);
+        ws.caps.add_fk_after_create = true;
+        ws.diagram_action(id, DiagramAction::DeleteForeignKey { table: "logs".into(), constraint: "fk_owner".into() });
+        let d = ws.fk_delete.as_ref().expect("a confirmation");
+        assert_eq!((d.table.name.as_str(), d.constraint.as_str()), ("logs", "fk_owner"));
+        assert!(ws.gate.is_none());
+        assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    /// Drops a real foreign key from the diagram of a real server and checks the line is gone.
+    fn exercise_fk_delete(rt: &tokio::runtime::Runtime, cfg: ConnectConfig, create: &[&str], count_sql: &str) {
+        server_exec(rt, &cfg, create);
+        let (_dir, mut ws) = remote(rt, cfg.clone());
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "orders"));
+        let id = diagram_ready(&mut ws);
+        assert!(ws.diagram_tab_mut().unwrap().fk_drop_blocked().is_none());
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(1));
+        ws.diagram_action(id, DiagramAction::DeleteForeignKey { table: "orders".into(), constraint: "fk_customer".into() });
+        let dialog = ws.fk_delete.take().expect("a confirmation");
+        ws.apply_fk_delete(dialog);
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.edge_count(false) == 0));
+        assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(0));
+    }
+
+    /// Deleting a foreign key from the diagram on a real PostgreSQL server.
+    #[test]
+    fn postgres_diagram_foreign_key_delete() {
+        const LABEL: &str = "dbzilla-test-app-pg-fk";
+        let Some(c) = crate::testsupport::start(LABEL, "postgres:16-alpine", &[("POSTGRES_PASSWORD", "pw")], 5432) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cfg = ConnectConfig { driver: DriverId::Postgres, host: "127.0.0.1".into(), port: Some(c.port), user: "postgres".into(), password: Some("pw".into()), database: "postgres".into(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        wait_for_server(&rt, &cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_fk_delete(
+                &rt,
+                cfg.clone(),
+                &["CREATE TABLE customers (id serial PRIMARY KEY)", "CREATE TABLE orders (id serial PRIMARY KEY, customer_id int, CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id))"],
+                "SELECT count(*) FROM pg_constraint WHERE conname = 'fk_customer'",
+            );
+        }));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Deleting a foreign key from the diagram on a real MySQL server.
+    #[test]
+    fn mysql_diagram_foreign_key_delete() {
+        const LABEL: &str = "dbzilla-test-app-mysql-fk";
+        let Some(c) = crate::testsupport::start(LABEL, "mysql:8.4", &[("MYSQL_ROOT_PASSWORD", "pw"), ("MYSQL_DATABASE", "shop")], 3306) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cfg = ConnectConfig { driver: DriverId::MySql, host: "127.0.0.1".into(), port: Some(c.port), user: "root".into(), password: Some("pw".into()), database: "shop".into(), ssl: SslMode::Disabled, bootstrap: vec![] };
+        wait_for_server(&rt, &cfg);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_fk_delete(
+                &rt,
+                cfg.clone(),
+                &["CREATE TABLE customers (id INT AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB", "CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT, CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id)) ENGINE=InnoDB"],
+                "SELECT count(*) FROM information_schema.table_constraints WHERE table_schema = 'shop' AND constraint_name = 'fk_customer'",
             );
         }));
         crate::testsupport::cleanup(LABEL);

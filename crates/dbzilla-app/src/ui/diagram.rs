@@ -40,6 +40,8 @@ pub enum DiagramAction {
     RequestLink(DocLink),
     /// The user deleted a link they had drawn.
     DeleteLink(DocLink),
+    /// The user asked to drop a real foreign key of the database.
+    DeleteForeignKey { table: String, constraint: String },
 }
 
 /// A link being dragged from a column.
@@ -80,6 +82,8 @@ pub struct DiagramTab {
     menu_edge: Option<usize>,
     /// The positions changed and must be handed to the store.
     save_pending: bool,
+    /// Why a foreign key of the database cannot be dropped here, when it cannot.
+    fk_drop_blocked: Option<String>,
 }
 
 impl DiagramTab {
@@ -108,7 +112,19 @@ impl DiagramTab {
             linking: None,
             menu_edge: None,
             save_pending: false,
+            fk_drop_blocked: None,
         }
+    }
+
+    /// Sets, or clears, the reason a foreign key of the database cannot be dropped.
+    pub fn set_fk_drop_blocked(&mut self, reason: Option<String>) {
+        self.fk_drop_blocked = reason;
+    }
+
+    /// The reason a foreign key of the database cannot be dropped, when it cannot (tests).
+    #[cfg(test)]
+    pub fn fk_drop_blocked(&self) -> Option<&str> {
+        self.fk_drop_blocked.as_deref()
     }
 
     /// Takes the tables read from the database and lays them out, using the saved positions
@@ -419,6 +435,19 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
                 if ui.button("Delete link").clicked() {
                     if let Some(l) = tab.link_of(e) {
                         actions.push(DiagramAction::DeleteLink(l));
+                    }
+                    ui.close_menu();
+                }
+            }
+            Some(e) if e.kind == EdgeKind::Real => {
+                let table = tab.diagram.tables[e.from_table].name.clone();
+                let reason = tab.fk_drop_blocked.clone().or_else(|| e.constraint.is_none().then(|| "This foreign key has no name".to_owned()));
+                let resp = ui.add_enabled(reason.is_none(), egui::Button::new("Delete foreign key"));
+                if let Some(r) = &reason {
+                    resp.on_disabled_hover_text(r);
+                } else if resp.clicked() {
+                    if let Some(constraint) = e.constraint.clone() {
+                        actions.push(DiagramAction::DeleteForeignKey { table, constraint });
                     }
                     ui.close_menu();
                 }
