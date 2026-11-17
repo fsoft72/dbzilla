@@ -43,3 +43,4 @@
 - Release workflow: removed the macOS targets (CI kept failing); only Linux and Windows binaries are built.
 - Release 0.1.3.
 - SPEC: removed plugins/custom scripts (§17), light and Auto themes, multi-window, connection sources and other team features (§6.8, shared query folder), multi-caret (§10.4) and split panes (§10.7).
+- Query parameters (SPEC 10.11): dbzilla-core::params finds and substitutes placeholders in all six formats (colon, percent, question mark, dollar braces, dollar, double braces), skipping comments and, by default, quoted strings and dollar-quoted bodies. A Variables dialog (Apply, Cleanup, Cancel) asks for the values before a run when the feature is on; values are remembered for the session. Settings > Editor gained the enable switch, the format and the quoted-strings option. ParamFormat moved to core.

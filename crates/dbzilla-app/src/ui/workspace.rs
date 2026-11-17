@@ -201,6 +201,25 @@ struct GateModal {
     error: Option<String>,
 }
 
+/// What the user chose in the Variables dialog.
+enum ParamsDecision {
+    Apply,
+    Cleanup,
+    Cancel,
+}
+
+/// Variables dialog of the query parameters (SPEC 10.11), shown before a run.
+struct ParamsModal {
+    tab: TabId,
+    /// Statements to run: (text with placeholders, result tab label).
+    statements: Vec<(String, Option<String>)>,
+    /// Variable names in order of appearance.
+    names: Vec<String>,
+    /// Typed values, parallel to `names`.
+    values: Vec<String>,
+    error: Option<String>,
+}
+
 /// Dialog choosing the key columns of a table without a primary key.
 struct KeyDialog {
     tab: TabId,
@@ -331,6 +350,11 @@ pub struct Workspace {
     fmt_upper: bool,
     pub details: DetailsState,
     gate: Option<GateModal>,
+    params_modal: Option<ParamsModal>,
+    /// Last value typed for each variable, offered again on the next run.
+    param_values: std::collections::BTreeMap<String, String>,
+    param_opts: dbzilla_core::params::ParamOptions,
+    params_enabled: bool,
     preview: Option<Vec<String>>,
     key_dialog: Option<KeyDialog>,
     /// Messages for the toast area: (is_error, text).
@@ -405,6 +429,10 @@ impl Workspace {
             fmt_upper: true,
             details: DetailsState::default(),
             gate: None,
+            params_modal: None,
+            param_values: std::collections::BTreeMap::new(),
+            param_opts: dbzilla_core::params::ParamOptions::default(),
+            params_enabled: false,
             preview: None,
             key_dialog: None,
             notices: Vec::new(),
@@ -980,10 +1008,60 @@ impl Workspace {
         if stmts.is_empty() {
             return self.notices.push((false, "There is nothing to run".into()));
         }
-        let limit = tab.row_limit;
-        let texts: Vec<String> = stmts.iter().map(|s| apply_row_limit(&s.text, limit)).collect();
-        let labels: Vec<Option<String>> = stmts.iter().map(|s| s.label.clone()).collect();
-        let originals: Vec<String> = stmts.iter().map(|s| s.text.clone()).collect();
+        let raw: Vec<(String, Option<String>)> = stmts.into_iter().map(|s| (s.text, s.label)).collect();
+        if self.params_enabled {
+            let mut names: Vec<String> = Vec::new();
+            for (text, _) in &raw {
+                for n in dbzilla_core::params::param_names(text, self.param_opts) {
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+            }
+            if !names.is_empty() {
+                let values = names.iter().map(|n| self.param_values.get(n).cloned().unwrap_or_default()).collect();
+                self.params_modal = Some(ParamsModal { tab: id, statements: raw, names, values, error: None });
+                return;
+            }
+        }
+        self.start_run(id, raw);
+    }
+
+    /// Stores the typed values, substitutes them in the statements and starts the run.
+    fn apply_params(&mut self) {
+        let Some(m) = self.params_modal.take() else { return };
+        for (n, v) in m.names.iter().zip(&m.values) {
+            self.param_values.insert(n.clone(), v.clone());
+        }
+        let values: std::collections::BTreeMap<String, String> = m.names.iter().cloned().zip(m.values.iter().cloned()).collect();
+        let mut out = Vec::with_capacity(m.statements.len());
+        for (text, label) in &m.statements {
+            match dbzilla_core::params::substitute(text, self.param_opts, &values) {
+                Ok(t) => out.push((t, label.clone())),
+                Err(e) => {
+                    self.notices.push((true, e.to_string()));
+                    return;
+                }
+            }
+        }
+        self.start_run(m.tab, out);
+    }
+
+    /// Forgets the remembered values of variables that the current dialog does not use.
+    fn cleanup_params(&mut self) {
+        let Some(m) = self.params_modal.as_ref() else { return };
+        let keep: Vec<String> = m.names.clone();
+        self.param_values.retain(|k, _| keep.contains(k));
+        self.notices.push((false, "Unused variables forgotten".into()));
+    }
+
+    /// Applies the row limit and the safe-mode gate to statements ready to run.
+    fn start_run(&mut self, id: TabId, stmts: Vec<(String, Option<String>)>) {
+        let driver = self.conn.driver;
+        let Some(limit) = self.sql_tab_mut(id).map(|t| t.row_limit) else { return };
+        let texts: Vec<String> = stmts.iter().map(|(t, _)| apply_row_limit(t, limit)).collect();
+        let labels: Vec<Option<String>> = stmts.iter().map(|(_, l)| l.clone()).collect();
+        let originals: Vec<String> = stmts.into_iter().map(|(t, _)| t).collect();
         match gate_check(self.conn.safe_level, driver, &texts) {
             GateDecision::Allow => self.send_run(id, texts, labels, originals),
             GateDecision::Confirm(t) => self.gate = Some(GateModal { action: GateAction::Run { labels, originals }, statements: t, needs_password: false, input: String::new(), reveal: false, tab: id, error: None }),
@@ -1970,6 +2048,8 @@ impl Workspace {
         self.fmt_with = env.settings.indent_with;
         self.fmt_kind = env.settings.indent_type;
         self.fmt_upper = env.settings.uppercase_keywords;
+        self.params_enabled = env.settings.query_params.enabled;
+        self.param_opts = dbzilla_core::params::ParamOptions { format: env.settings.query_params.format, allow_in_quotes: env.settings.query_params.allow_in_quotes };
         self.page_size = env.settings.page_size;
         let csv = CsvOptions { delimiter: env.settings.csv.delimiter, quote: env.settings.csv.quote, quote_always: env.settings.csv.quote_always, line_break: env.settings.csv.line_break.clone(), decimal: env.settings.csv.decimal, null_as_empty: false };
         let row_height = (env.settings.table_row_padding + 12.0).clamp(20.0, 60.0);
@@ -2183,6 +2263,40 @@ impl Workspace {
                     self.discard_active();
                 }
                 Some(_) => self.preview = None,
+                None => {}
+            }
+        }
+        if let Some(m) = self.params_modal.as_mut() {
+            let mut decision = None;
+            widgets::modal(ctx, "Variables", |ui| {
+                widgets::muted(ui, "Values are inserted into the SQL as typed. Add the quotes yourself for text.");
+                let max_h = (ctx.screen_rect().height() * 0.5).max(120.0);
+                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, n) in m.names.iter().enumerate() {
+                        widgets::field_label(ui, n);
+                        widgets::input(ui, &mut m.values[i], "");
+                    }
+                });
+                if let Some(e) = &m.error {
+                    ui.colored_label(theme::ERROR, e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, "Apply").clicked() || ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter)) {
+                        decision = Some(ParamsDecision::Apply);
+                    }
+                    if widgets::secondary_button(ui, "Cleanup").on_hover_text("Forget the remembered values of variables not used in this SQL").clicked() {
+                        decision = Some(ParamsDecision::Cleanup);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        decision = Some(ParamsDecision::Cancel);
+                    }
+                });
+            });
+            match decision {
+                Some(ParamsDecision::Apply) => self.apply_params(),
+                Some(ParamsDecision::Cleanup) => self.cleanup_params(),
+                Some(ParamsDecision::Cancel) => self.params_modal = None,
                 None => {}
             }
         }
@@ -2853,6 +2967,42 @@ mod tests {
         ws.run_sql(true);
         wait(&mut ws, |w| !sql_running(w));
         assert_eq!(ws.active_sql_mut().unwrap().1.results[0].rows.len(), 2);
+    }
+
+    /// With query parameters on, a run asks for the variables and runs the substituted SQL.
+    #[test]
+    fn query_parameters_are_asked_and_substituted() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        ws.params_enabled = true;
+        open_sql_focused(&mut ws, "SELECT :a + :b AS s, ':a' AS q");
+        ws.run_sql(true);
+        assert_eq!(ws.params_modal.as_ref().expect("the Variables dialog").names, vec!["a", "b"]);
+        assert!(!sql_running(&mut ws), "nothing runs before Apply");
+        ws.params_modal.as_mut().unwrap().values = vec!["40".into(), "2".into()];
+        ws.apply_params();
+        wait(&mut ws, |w| !sql_running(w));
+        let (_, t) = ws.active_sql_mut().unwrap();
+        assert_eq!(t.results[0].rows, vec![vec![Value::I64(42), Value::Text(":a".into())]]);
+        // the values are remembered for the next run
+        ws.run_sql(true);
+        assert_eq!(ws.params_modal.as_ref().unwrap().values, vec!["40", "2"]);
+    }
+
+    /// Without placeholders, or with the feature off, the dialog never shows up.
+    #[test]
+    fn query_parameters_do_not_interfere_when_unused() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, _path, mut ws) = connected(&rt);
+        open_sql_focused(&mut ws, "SELECT :a");
+        ws.params_enabled = false;
+        ws.run_sql(true);
+        assert!(ws.params_modal.is_none());
+        wait(&mut ws, |w| !sql_running(w));
+        ws.params_enabled = true;
+        ws.active_sql_mut().unwrap().1.text = "SELECT 1".into();
+        ws.run_sql(true);
+        assert!(ws.params_modal.is_none());
     }
 
     /// Pinned results survive the next run; the others are replaced.

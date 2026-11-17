@@ -136,6 +136,18 @@ fn editor(ui: &mut Ui, s: &mut Settings) {
         });
     });
     widgets::card(ui, |ui| {
+        ui.checkbox(&mut s.query_params.enabled, "Enable query parameters");
+        ui.add_enabled_ui(s.query_params.enabled, |ui| {
+            ui.checkbox(&mut s.query_params.allow_in_quotes, "Allow searching for variables in quoted strings");
+            field_label(ui, "Variable format");
+            egui::ComboBox::from_id_salt("paramformat").selected_text(s.query_params.format.label()).show_ui(ui, |ui| {
+                for f in dbzilla_core::params::ParamFormat::ALL {
+                    ui.selectable_value(&mut s.query_params.format, f, f.label());
+                }
+            });
+        });
+    });
+    widgets::card(ui, |ui| {
         field_label(ui, "Indent with");
         ui.horizontal(|ui| {
             ui.selectable_value(&mut s.indent_with, IndentWith::Spaces, "Spaces");

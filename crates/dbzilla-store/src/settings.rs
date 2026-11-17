@@ -57,17 +57,7 @@ pub enum IndentType {
     TabularRight,
 }
 
-/// Query parameter placeholder format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ParamFormat {
-    #[default]
-    Colon,
-    Percent,
-    Question,
-    DollarBraces,
-    Dollar,
-    DoubleBraces,
-}
+pub use dbzilla_core::params::ParamFormat;
 
 /// How results of several statements are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
