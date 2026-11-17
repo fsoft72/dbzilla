@@ -124,7 +124,8 @@ fn select_sql(d: &dyn Dialect, src: &ExportSource) -> String {
             }
             if let Some((offset, limit)) = page {
                 sql.push(' ');
-                sql.push_str(&d.limit_offset(*limit, *offset));
+                let sorted = order_sql.as_ref().is_some_and(|o| !o.trim().is_empty());
+                sql.push_str(&d.page_clause(*limit, *offset, sorted));
             }
             sql
         }

@@ -24,7 +24,7 @@ pub fn build_select(d: &dyn Dialect, table: &TableRef, cols: &[ColumnMeta], filt
         sql.push_str(&format!(" ORDER BY {}", keys.join(", ")));
     }
     sql.push(' ');
-    sql.push_str(&d.limit_offset(limit, offset));
+    sql.push_str(&d.page_clause(limit, offset, !sort.is_empty()));
     sql
 }
 

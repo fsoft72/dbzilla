@@ -1,6 +1,7 @@
 //! Row limit injection for the SQL editor (SPEC 10.2).
 
-use dbzilla_core::rowlimit::{apply_row_limit, ROW_LIMITS};
+use dbzilla_core::dialect::{dialect_for, DriverId};
+use dbzilla_core::rowlimit::{apply_row_limit, apply_row_limit_for, ROW_LIMITS};
 
 #[test]
 fn appends_limit_to_plain_select() {
@@ -53,4 +54,28 @@ fn data_changing_statements_are_left_alone() {
         assert_eq!(apply_row_limit(sql, Some(10)), sql, "{sql}");
     }
     assert_eq!(apply_row_limit("SELECT 'update' AS w FROM t", Some(10)), "SELECT 'update' AS w FROM t\nLIMIT 10");
+}
+
+#[test]
+fn sqlserver_limits_with_offset_fetch() {
+    let d = dialect_for(DriverId::SqlServer);
+    assert_eq!(apply_row_limit_for(d.as_ref(), "SELECT * FROM t", Some(50)), "SELECT * FROM t\nORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY");
+    let sql = apply_row_limit_for(d.as_ref(), "SELECT * FROM t ORDER BY a;", Some(50));
+    assert_eq!(sql, "SELECT * FROM t ORDER BY a\nOFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY");
+    assert_eq!(sql.matches("ORDER BY").count(), 1);
+}
+
+#[test]
+fn sqlserver_keeps_statements_that_already_limit() {
+    let d = dialect_for(DriverId::SqlServer);
+    for sql in ["SELECT TOP 5 * FROM t", "SELECT * FROM t ORDER BY a OFFSET 5 ROWS FETCH NEXT 5 ROWS ONLY", "SELECT * INTO c FROM t"] {
+        assert_eq!(apply_row_limit_for(d.as_ref(), sql, Some(100)), sql);
+    }
+}
+
+#[test]
+fn other_dialects_keep_the_limit_suffix() {
+    for id in [DriverId::Sqlite, DriverId::Postgres, DriverId::MySql] {
+        assert_eq!(apply_row_limit_for(dialect_for(id).as_ref(), "SELECT * FROM t", Some(100)), "SELECT * FROM t\nLIMIT 100");
+    }
 }

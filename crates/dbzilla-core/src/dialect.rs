@@ -25,6 +25,23 @@ pub trait Dialect: Send + Sync {
     fn limit_offset(&self, limit: u64, offset: u64) -> String {
         format!("LIMIT {limit} OFFSET {offset}")
     }
+    /// Paging clause of the data tab. `has_order_by` is true when the statement already sorts, for the
+    /// dialects (SQL Server) where paging is a syntax error without an `ORDER BY`.
+    fn page_clause(&self, limit: u64, offset: u64, _has_order_by: bool) -> String {
+        self.limit_offset(limit, offset)
+    }
+    /// Clause that caps the rows of a typed `SELECT`, appended after the statement.
+    fn row_limit_clause(&self, n: u64, _has_order_by: bool) -> String {
+        format!("LIMIT {n}")
+    }
+    /// Words that, at the top level of a `SELECT`, mean it already limits itself (besides `LIMIT`, `TOP` and `FETCH`).
+    fn extra_limit_blockers(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// The "first n rows" script of Copy Script As.
+    fn select_top(&self, quoted_table: &str, n: u64) -> String {
+        format!("SELECT * FROM {quoted_table} LIMIT {n};")
+    }
     /// Data types offered in the structure editor.
     fn types(&self) -> &'static [&'static str];
     /// Keywords for highlight, completion and formatting.
@@ -277,6 +294,22 @@ impl Dialect for MsSqlDialect {
             Value::Json(j) => format!("N{}", quote_text(&j.to_string(), false)),
             other => literal_common(other, false, |b| if b { "1" } else { "0" }, |b| format!("0x{}", hex(b))),
         }
+    }
+    fn limit_offset(&self, limit: u64, offset: u64) -> String {
+        format!("OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+    }
+    fn page_clause(&self, limit: u64, offset: u64, has_order_by: bool) -> String {
+        let order = if has_order_by { "" } else { "ORDER BY (SELECT NULL) " };
+        format!("{order}{}", self.limit_offset(limit, offset))
+    }
+    fn row_limit_clause(&self, n: u64, has_order_by: bool) -> String {
+        self.page_clause(n, 0, has_order_by)
+    }
+    fn extra_limit_blockers(&self) -> &'static [&'static str] {
+        &["OFFSET"]
+    }
+    fn select_top(&self, quoted_table: &str, n: u64) -> String {
+        format!("SELECT TOP {n} * FROM {quoted_table};")
     }
     fn now_expr(&self) -> &'static str {
         "GETDATE()"

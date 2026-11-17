@@ -33,7 +33,7 @@ use dbzilla_core::copyfmt::{copy_script, format_rows, CopyContext, CopyFormat, C
 use dbzilla_core::ddl::{generate_ddl, StructuralOp};
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
-use dbzilla_core::rowlimit::apply_row_limit;
+use dbzilla_core::rowlimit::apply_row_limit_for;
 use dbzilla_core::safemode::SafeLevel;
 use dbzilla_core::model::{ObjectInfo, ObjectKind, TableRef, TableStructure};
 use dbzilla_drivers::DatabaseInfo;
@@ -1560,7 +1560,7 @@ impl Workspace {
     fn start_run(&mut self, id: TabId, stmts: Vec<(String, Option<String>)>) {
         let driver = self.conn.driver;
         let Some(limit) = self.sql_tab_mut(id).map(|t| t.row_limit) else { return };
-        let texts: Vec<String> = stmts.iter().map(|(t, _)| apply_row_limit(t, limit)).collect();
+        let texts: Vec<String> = stmts.iter().map(|(t, _)| apply_row_limit_for(dialect_for(self.conn.driver).as_ref(), t, limit)).collect();
         let labels: Vec<Option<String>> = stmts.iter().map(|(_, l)| l.clone()).collect();
         let originals: Vec<String> = stmts.into_iter().map(|(t, _)| t).collect();
         match gate_check(self.conn.safe_level, driver, &texts) {

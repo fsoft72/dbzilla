@@ -1,5 +1,7 @@
 //! Row limit injection for statements typed in the SQL editor.
 
+use crate::dialect::Dialect;
+
 /// Values of the row limit menu (SPEC 10.2): no limit, then 100 up to 500,000.
 pub const ROW_LIMITS: [Option<u64>; 9] = [None, Some(100), Some(500), Some(1000), Some(5000), Some(10_000), Some(50_000), Some(100_000), Some(500_000)];
 
@@ -61,12 +63,19 @@ fn top_level_words(sql: &str) -> Vec<String> {
 /// Appends `LIMIT n` to a `SELECT` (or `WITH ... SELECT`) that has no limit of its own.
 /// Anything else, or `None`, returns the statement unchanged.
 pub fn apply_row_limit(sql: &str, limit: Option<u64>) -> String {
+    apply_row_limit_for(&crate::dialect::SqliteDialect, sql, limit)
+}
+
+/// Like [`apply_row_limit`], with the limit clause and the "already limited" words of the dialect.
+pub fn apply_row_limit_for(d: &dyn Dialect, sql: &str, limit: Option<u64>) -> String {
     let Some(n) = limit else { return sql.to_owned() };
     let words = top_level_words(sql);
     let is_select = matches!(words.first().map(String::as_str), Some("SELECT" | "WITH"));
-    if !is_select || words.iter().any(|w| BLOCKERS.contains(&w.as_str())) {
+    let blocked = |w: &String| BLOCKERS.contains(&w.as_str()) || d.extra_limit_blockers().contains(&w.as_str());
+    if !is_select || words.iter().any(blocked) {
         return sql.to_owned();
     }
+    let has_order_by = words.windows(2).any(|w| w[0] == "ORDER" && w[1] == "BY");
     let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
-    format!("{trimmed}\nLIMIT {n}")
+    format!("{trimmed}\n{}", d.row_limit_clause(n, has_order_by))
 }

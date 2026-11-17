@@ -98,3 +98,10 @@ fn copy_scripts() {
         "CREATE TABLE \"public\".\"t\" (\n  \"id\" integer NOT NULL,\n  PRIMARY KEY (\"id\")\n);"
     );
 }
+
+#[test]
+fn sqlserver_select_top_100_script() {
+    let d = dialect_for(DriverId::SqlServer);
+    let st = TableStructure { table: TableRef { database: None, schema: Some("dbo".into()), name: "t".into() }, ..Default::default() };
+    assert_eq!(copy_script(ScriptKind::SelectTop100, &st, d.as_ref()), "SELECT TOP 100 * FROM [dbo].[t];");
+}

@@ -157,6 +157,6 @@ pub fn copy_script(kind: ScriptKind, st: &TableStructure, d: &dyn Dialect) -> St
         }
         ScriptKind::Drop => format!("{};", one(StructuralOp::DropTable { table: table.clone(), cascade: false })),
         ScriptKind::Truncate => format!("{};", one(StructuralOp::Truncate { table: table.clone(), cascade: false, restart_identity: false })),
-        ScriptKind::SelectTop100 => format!("SELECT * FROM {} {};", d.quote_table(table), d.limit_offset(100, 0).replace(" OFFSET 0", "")),
+        ScriptKind::SelectTop100 => d.select_top(&d.quote_table(table), 100),
     }
 }

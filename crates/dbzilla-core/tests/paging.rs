@@ -36,3 +36,16 @@ fn count_ignores_sort_and_paging() {
     assert_eq!(build_count(d.as_ref(), &TableRef::simple("t"), &cols(), &[filter()], false), "SELECT COUNT(*) FROM \"t\" WHERE \"id\" = 5");
     assert_eq!(build_count(d.as_ref(), &TableRef::simple("t"), &cols(), &[], false), "SELECT COUNT(*) FROM \"t\"");
 }
+
+#[test]
+fn sqlserver_pages_with_offset_fetch_and_a_fallback_order() {
+    let d = dialect_for(DriverId::SqlServer);
+    assert_eq!(
+        build_select(d.as_ref(), &TableRef::simple("t"), &[], &[], false, &[], 300, 600),
+        "SELECT * FROM [t] ORDER BY (SELECT NULL) OFFSET 600 ROWS FETCH NEXT 300 ROWS ONLY"
+    );
+    let sort = vec![SortKey { column: "id".into(), desc: true }];
+    let sql = build_select(d.as_ref(), &TableRef::simple("t"), &[], &[], false, &sort, 300, 0);
+    assert_eq!(sql, "SELECT * FROM [t] ORDER BY [id] DESC OFFSET 0 ROWS FETCH NEXT 300 ROWS ONLY");
+    assert_eq!(sql.matches("ORDER BY").count(), 1);
+}
