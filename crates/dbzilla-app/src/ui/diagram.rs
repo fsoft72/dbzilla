@@ -1,4 +1,4 @@
-//! ER diagram tab (SPEC 11.3): tables as boxes, one line per foreign key, read only.
+//! ER diagram tab (SPEC 11.3): tables as boxes, one line per foreign key.
 
 use super::widgets;
 use crate::glyphs::Ico;
@@ -6,7 +6,7 @@ use crate::theme;
 use dbzilla_core::diagram::{Diagram, DiagramEdge, DiagramSort, DocLink, EdgeKind};
 use dbzilla_core::model::TableStructure;
 use dbzilla_store::diagrams::Positions;
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 /// Height of the table header and of one column row, at zoom 1.
 const HEADER_H: f32 = 26.0;
@@ -42,6 +42,10 @@ pub enum DiagramAction {
     DeleteLink(DocLink),
     /// The user asked to drop a real foreign key of the database.
     DeleteForeignKey { table: String, constraint: String },
+    /// The "Inferred links" switch changed: keep it for the next time.
+    SetInferred(bool),
+    /// A message for the user (error flag, text).
+    Notice(bool, String),
 }
 
 /// A link being dragged from a column.
@@ -69,10 +73,13 @@ pub struct DiagramTab {
     selected: Option<usize>,
     /// Draw the dashed links guessed from column names.
     show_inferred: bool,
+    /// The search box takes the keyboard focus on the next frame.
+    focus_search: bool,
     dragging: Option<usize>,
     search: String,
     found: Vec<usize>,
-    found_at: usize,
+    /// Match the search stands on, as an index into `found`; none until the user steps.
+    cursor: Option<usize>,
     /// The next reload ignores the saved positions (Rearrange).
     forget_saved: bool,
     /// Links drawn by the user, kept in the application only.
@@ -103,10 +110,11 @@ impl DiagramTab {
             fit_pending: true,
             selected: None,
             show_inferred: true,
+            focus_search: false,
             dragging: None,
             search: String::new(),
             found: Vec::new(),
-            found_at: 0,
+            cursor: None,
             forget_saved: false,
             links: Vec::new(),
             linking: None,
@@ -114,6 +122,38 @@ impl DiagramTab {
             save_pending: false,
             fk_drop_blocked: None,
         }
+    }
+
+    /// Shows or hides the lines guessed from column names.
+    pub fn set_show_inferred(&mut self, show: bool) {
+        self.show_inferred = show;
+    }
+
+    /// Whether the lines guessed from column names are shown (tests).
+    #[cfg(test)]
+    pub fn show_inferred(&self) -> bool {
+        self.show_inferred
+    }
+
+    /// Moves the keyboard focus to the search box.
+    pub fn focus_search(&mut self) {
+        self.focus_search = true;
+    }
+
+    /// Steps to the next (or previous) search match and returns its table.
+    fn step_found(&mut self, forward: bool) -> Option<usize> {
+        let n = self.found.len();
+        if n == 0 {
+            return None;
+        }
+        let next = match self.cursor {
+            None if forward => 0,
+            None => n - 1,
+            Some(c) if forward => (c + 1) % n,
+            Some(c) => (c + n - 1) % n,
+        };
+        self.cursor = Some(next);
+        Some(self.found[next])
     }
 
     /// Sets, or clears, the reason a foreign key of the database cannot be dropped.
@@ -217,7 +257,7 @@ impl DiagramTab {
     /// Recomputes the search matches after the text or the tables changed.
     fn refresh_search(&mut self) {
         self.found = self.diagram.search(&self.search);
-        self.found_at = 0;
+        self.cursor = None;
     }
 
     /// Number of tables in the diagram.
@@ -332,15 +372,37 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
             }
             ui.separator();
             let guessed = tab.inferred_count();
-            ui.add_enabled(guessed > 0, egui::Checkbox::new(&mut tab.show_inferred, format!("Inferred links ({guessed})"))).on_hover_text("Dashed lines for columns named like id_user or user_id when the database has no foreign key");
+            let switch = ui.add_enabled(guessed > 0, egui::Checkbox::new(&mut tab.show_inferred, format!("Inferred links ({guessed})"))).on_hover_text("Dashed lines for columns named like id_user or user_id when the database has no foreign key");
+            if switch.changed() {
+                actions.push(DiagramAction::SetInferred(tab.show_inferred));
+            }
+            if widgets::secondary_button(ui, "Export SVG").on_hover_text("Save the diagram as an SVG image").clicked() {
+                actions.push(export_svg(tab));
+            }
             ui.separator();
             let r = widgets::search_box(ui, &mut tab.search, "Find table or column");
+            if std::mem::take(&mut tab.focus_search) {
+                r.request_focus();
+            }
             if r.changed() {
                 tab.refresh_search();
             }
-            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !tab.found.is_empty() {
-                canvas_jump = Some(tab.found[tab.found_at % tab.found.len()]);
-                tab.found_at = (tab.found_at + 1) % tab.found.len();
+            // Enter and Down go to the next match, Shift+Enter and Up to the previous one
+            let step = if r.has_focus() || r.lost_focus() {
+                ui.input_mut(|i| {
+                    if i.consume_key(Modifiers::NONE, Key::ArrowUp) || (r.lost_focus() && i.consume_key(Modifiers::SHIFT, Key::Enter)) {
+                        Some(false)
+                    } else if i.consume_key(Modifiers::NONE, Key::ArrowDown) || (r.lost_focus() && i.consume_key(Modifiers::NONE, Key::Enter)) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(forward) = step {
+                canvas_jump = tab.step_found(forward);
                 r.request_focus();
             }
             if !tab.search.trim().is_empty() {
@@ -630,8 +692,11 @@ fn paint_link_overlay(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: 
 
 /// End points and control points of the line of one edge.
 fn edge_geometry(tab: &DiagramTab, origin: Pos2, e: &DiagramEdge) -> (Pos2, Pos2, Pos2, Pos2) {
-    let z = tab.zoom;
-    let (from, to) = (tab.rect_of(e.from_table, origin), tab.rect_of(e.to_table, origin));
+    edge_curve(tab.rect_of(e.from_table, origin), tab.rect_of(e.to_table, origin), e, tab.zoom)
+}
+
+/// End points and control points of the line of one edge, given the rectangles of its two tables and the zoom.
+fn edge_curve(from: Rect, to: Rect, e: &DiagramEdge, z: f32) -> (Pos2, Pos2, Pos2, Pos2) {
     let row_y = |r: Rect, col: Option<usize>| r.min.y + col.map_or(HEADER_H / 2.0, |c| HEADER_H + ROW_H * c as f32 + ROW_H / 2.0) * z;
     let (y1, y2) = (row_y(from, Some(e.from_column)), row_y(to, e.to_column));
     let reach = 40.0 * z;
@@ -670,4 +735,122 @@ fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge
     let side = vec2(-dir.y, dir.x);
     let s = 6.0 * z.max(0.6);
     p.add(egui::epaint::PathShape::convex_polygon(vec![b, b - dir * s + side * s * 0.5, b - dir * s - side * s * 0.5], stroke.color, Stroke::NONE));
+}
+
+/// Asks where to save, writes the diagram as SVG and reports the outcome.
+fn export_svg(tab: &DiagramTab) -> DiagramAction {
+    let Some(path) = rfd::FileDialog::new().set_file_name("diagram.svg").add_filter("SVG image", &["svg"]).save_file() else {
+        return DiagramAction::Notice(false, "Export cancelled".into());
+    };
+    match std::fs::write(&path, tab.to_svg()) {
+        Ok(()) => DiagramAction::Notice(false, format!("Diagram saved to {}", path.display())),
+        Err(e) => DiagramAction::Notice(true, format!("cannot save the diagram: {e}")),
+    }
+}
+
+/// `#rrggbb` form of a colour (the alpha is returned apart, as 0 to 1).
+fn hex(c: Color32) -> (String, f32) {
+    let c = c.to_srgba_unmultiplied();
+    (format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]), f32::from(c[3]) / 255.0)
+}
+
+/// Escapes the characters that mean something in XML text.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+impl DiagramTab {
+    /// The diagram as an SVG document: the boxes and the visible lines at zoom 1.
+    pub fn to_svg(&self) -> String {
+        use std::fmt::Write;
+        let rects: Vec<Rect> = (0..self.positions.len()).map(|i| Rect::from_min_size(pos2(self.positions[i].0, self.positions[i].1), vec2(self.sizes[i].0, self.sizes[i].1))).collect();
+        let bounds = rects.iter().fold(Rect::NOTHING, |acc, r| acc.union(*r)).expand(MARGIN);
+        let bounds = if rects.is_empty() { Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0)) } else { bounds };
+        let mut out = String::new();
+        let _ = writeln!(out, r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x} {y} {w} {h}" font-family="sans-serif">"#, x = bounds.min.x, y = bounds.min.y, w = bounds.width(), h = bounds.height());
+        let (bg, _) = hex(theme::DEEP_DARK);
+        let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{bg}"/>"#, bounds.min.x, bounds.min.y, bounds.width(), bounds.height());
+        for e in self.diagram.edges.iter().filter(|e| self.show_inferred || e.kind != EdgeKind::Inferred) {
+            let base = match e.kind {
+                EdgeKind::Real => group_color(self.groups[e.from_table]).unwrap_or(theme::LABEL),
+                EdgeKind::Inferred => theme::LABEL,
+                EdgeKind::Manual => theme::SECONDARY,
+            };
+            let (a, b, c1, c2) = edge_curve(rects[e.from_table], rects[e.to_table], e, 1.0);
+            let (color, _) = hex(base);
+            let dash = if e.kind == EdgeKind::Real { "" } else { r#" stroke-dasharray="6 4""# };
+            let _ = writeln!(out, r#"<path d="M {} {} C {} {}, {} {}, {} {}" fill="none" stroke="{color}" stroke-width="1.5"{dash}/>"#, a.x, a.y, c1.x, c1.y, c2.x, c2.y, b.x, b.y);
+            let _ = writeln!(out, r#"<circle cx="{}" cy="{}" r="2.5" fill="{color}"/>"#, a.x, a.y);
+        }
+        for (i, t) in self.diagram.tables.iter().enumerate() {
+            let r = rects[i];
+            let color = group_color(self.groups[i]);
+            let (fill, _) = hex(theme::SURFACE);
+            let (head, _) = hex(color.map_or(theme::FIELD_ROW_BG, |c| c.gamma_multiply(0.38)));
+            let (border, _) = hex(color.map_or(theme::FIELD_ROW_BORDER, |c| c.gamma_multiply(0.7)));
+            let (text, _) = hex(theme::TEXT);
+            let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{}" rx="6" fill="{fill}" stroke="{border}"/>"#, r.min.x, r.min.y, r.width(), r.height());
+            let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{HEADER_H}" rx="6" fill="{head}"/>"#, r.min.x, r.min.y, r.width());
+            let _ = writeln!(out, r#"<text x="{}" y="{}" font-size="13" font-weight="600" fill="{text}" dominant-baseline="middle">{}</text>"#, r.min.x + 8.0, r.min.y + HEADER_H / 2.0, xml_escape(&t.name));
+            for (row, c) in t.columns.iter().enumerate() {
+                let y = r.min.y + HEADER_H + ROW_H * row as f32 + ROW_H / 2.0;
+                let (name_color, _) = hex(if c.is_pk { theme::TERTIARY } else if c.is_fk { theme::SECONDARY } else { theme::TEXT });
+                let tag = if c.is_pk { "PK " } else if c.is_fk { "FK " } else { "" };
+                let (muted, _) = hex(theme::MUTED);
+                let _ = writeln!(out, r#"<text x="{}" y="{y}" font-size="11.5" fill="{name_color}" dominant-baseline="middle">{}</text>"#, r.min.x + 8.0, xml_escape(&format!("{tag}{}", c.name)));
+                let _ = writeln!(out, r#"<text x="{}" y="{y}" font-size="10.5" fill="{muted}" text-anchor="end" dominant-baseline="middle">{}</text>"#, r.max.x - 8.0, xml_escape(&c.type_name));
+            }
+        }
+        out.push_str("</svg>\n");
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbzilla_core::model::{ColumnMeta, TableRef};
+
+    fn column(name: &str, pk: bool) -> ColumnMeta {
+        ColumnMeta { name: name.into(), type_name: "int".into(), nullable: false, default: None, is_pk: pk, fk: None, ordinal: 0, extra: Default::default() }
+    }
+
+    fn tab(names: &[&str]) -> DiagramTab {
+        let tables = names.iter().map(|n| TableStructure { table: TableRef { name: (*n).into(), ..Default::default() }, columns: vec![column("id", true), column("name", false)], ..Default::default() }).collect();
+        let mut t = DiagramTab::new();
+        t.set_tables(tables, Vec::new(), &Positions::new(), Vec::new());
+        t
+    }
+
+    #[test]
+    fn search_steps_forward_and_back_and_wraps() {
+        let mut t = tab(&["alpha", "beta", "gamma"]);
+        t.search = "a".into();
+        t.refresh_search();
+        assert_eq!(t.found.len(), 3);
+        let first = t.step_found(true).unwrap();
+        let second = t.step_found(true).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(t.step_found(false), Some(first), "Up goes back");
+        assert_eq!(t.step_found(false), t.found.last().copied(), "and wraps to the last match");
+        t.search = "zzz".into();
+        t.refresh_search();
+        assert_eq!(t.step_found(true), None);
+    }
+
+    #[test]
+    fn svg_has_one_box_per_table_and_escapes_names() {
+        let t = tab(&["a<b", "orders"]);
+        let svg = t.to_svg();
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains("a&lt;b"));
+        assert!(!svg.contains("a<b"));
+        assert_eq!(svg.matches(r#"rx="6" fill=""#).count(), 4, "a box and a header for each table");
+    }
+
+    #[test]
+    fn svg_of_an_empty_diagram_is_valid() {
+        assert!(DiagramTab::new().to_svg().contains("</svg>"));
+    }
 }

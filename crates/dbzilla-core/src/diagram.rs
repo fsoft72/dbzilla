@@ -355,6 +355,12 @@ fn type_family(type_name: &str) -> TypeFamily {
     }
 }
 
+/// True when two column types are of a different kind (an integer and a text, or two unrelated types).
+/// Types of the same family, such as `int4` and `bigint`, do not differ.
+pub fn types_differ(a: &str, b: &str) -> bool {
+    type_family(a) != type_family(b)
+}
+
 /// A laid out group of tables, positions relative to the block origin.
 struct Block {
     positions: Vec<(usize, (f32, f32))>,
@@ -676,6 +682,15 @@ mod tests {
         d.add_manual(&[link("notes", "user_id", "users", "id")]);
         assert_eq!(d.edges.len(), 1);
         assert_eq!(d.edges[0].kind, EdgeKind::Real);
+    }
+
+    #[test]
+    fn types_of_the_same_family_do_not_differ() {
+        assert!(!types_differ("int4", "BIGINT unsigned"));
+        assert!(!types_differ("varchar(20)", "text"));
+        assert!(!types_differ("timestamp", "TIMESTAMP"));
+        assert!(types_differ("integer", "text"));
+        assert!(types_differ("date", "timestamp"));
     }
 
     #[test]

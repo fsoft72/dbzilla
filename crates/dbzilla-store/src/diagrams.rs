@@ -4,7 +4,7 @@ use crate::atomic::{load_json, save_json};
 use crate::StoreResult;
 use dbzilla_core::diagram::DocLink;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Current file schema version.
@@ -21,11 +21,13 @@ struct DiagramFile {
     layouts: BTreeMap<String, Positions>,
     /// Links drawn by the user, per diagram key.
     links: BTreeMap<String, Vec<DocLink>>,
+    /// Diagram keys whose guessed links are hidden (they are shown by default).
+    hide_inferred: BTreeSet<String>,
 }
 
 impl Default for DiagramFile {
     fn default() -> Self {
-        Self { schema_version: DIAGRAMS_VERSION, layouts: BTreeMap::new(), links: BTreeMap::new() }
+        Self { schema_version: DIAGRAMS_VERSION, layouts: BTreeMap::new(), links: BTreeMap::new(), hide_inferred: BTreeSet::new() }
     }
 }
 
@@ -61,6 +63,22 @@ impl DiagramStore {
     pub fn save_links(&self, key: &str, links: Vec<DocLink>) -> StoreResult<()> {
         let mut file = load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value;
         file.links.insert(key.to_owned(), links);
+        save_json(&self.path, &file)
+    }
+
+    /// Whether the guessed links of the diagram `key` are shown; true when nothing was saved.
+    pub fn load_show_inferred(&self, key: &str) -> bool {
+        !load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value.hide_inferred.contains(key)
+    }
+
+    /// Remembers whether the guessed links of the diagram `key` are shown.
+    pub fn save_show_inferred(&self, key: &str, show: bool) -> StoreResult<()> {
+        let mut file = load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value;
+        if show {
+            file.hide_inferred.remove(key);
+        } else {
+            file.hide_inferred.insert(key.to_owned());
+        }
         save_json(&self.path, &file)
     }
 
@@ -111,6 +129,20 @@ mod tests {
         assert_eq!(store.load_links("k"), vec![link]);
         assert_eq!(store.load("k"), pos(&[("a", 3.0, 4.0)]));
         assert!(store.load_links("other").is_empty());
+    }
+
+    #[test]
+    fn the_inferred_switch_is_remembered_per_diagram() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiagramStore::new(dir.path().join("diagrams.json"));
+        assert!(store.load_show_inferred("k"), "shown by default");
+        store.save("k", pos(&[("a", 1.0, 2.0)])).unwrap();
+        store.save_show_inferred("k", false).unwrap();
+        assert!(!store.load_show_inferred("k"));
+        assert!(store.load_show_inferred("other"));
+        assert_eq!(store.load("k"), pos(&[("a", 1.0, 2.0)]));
+        store.save_show_inferred("k", true).unwrap();
+        assert!(store.load_show_inferred("k"));
     }
 
     #[test]

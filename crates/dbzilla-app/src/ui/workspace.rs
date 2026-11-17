@@ -182,6 +182,8 @@ struct LinkDialog {
     on_update: String,
     on_delete: String,
     error: Option<String>,
+    /// Shown when the two columns have types of a different kind.
+    warning: Option<String>,
 }
 
 /// A foreign key waiting for the user to confirm its deletion.
@@ -645,10 +647,11 @@ impl Workspace {
             Event::TriggerFunctions { functions, .. } => self.trigger_functions = functions,
             Event::Diagram { tables, skipped, .. } => {
                 let key = self.diagram_key();
-                let (saved, links) = (self.diagrams.load(&key), self.diagrams.load_links(&key));
+                let (saved, links, show_inferred) = (self.diagrams.load(&key), self.diagrams.load_links(&key), self.diagrams.load_show_inferred(&key));
                 let blocked = (!self.caps.add_fk_after_create).then(|| if self.conn.driver == DriverId::Sqlite { "SQLite cannot drop a foreign key from an existing table" } else { "This database cannot drop a foreign key from an existing table" }.to_owned());
                 if let Some(d) = self.diagram_tab_mut() {
                     d.set_fk_drop_blocked(blocked);
+                    d.set_show_inferred(show_inferred);
                 }
                 let fresh = self.diagram_tab_mut().and_then(|d| d.set_tables(tables, skipped, &saved, links));
                 if let Some(positions) = fresh {
@@ -1020,7 +1023,9 @@ impl Workspace {
             }
             Action::ReloadWorkspace => self.load_schema(),
             Action::ToggleFilters => {
-                if let Some((_, t)) = self.active_tab_mut() {
+                if let Some(d) = self.focused_diagram_mut() {
+                    d.focus_search();
+                } else if let Some((_, t)) = self.active_tab_mut() {
                     t.data.bar.open = !t.data.bar.open;
                 } else if let Some((_, s)) = self.active_sql_mut() {
                     s.find = if s.find.is_some() { None } else { Some(sqltab::FindState { focus: true, ..Default::default() }) };
@@ -1118,6 +1123,14 @@ impl Workspace {
         })
     }
 
+    /// The ER diagram tab when it is the focused one.
+    fn focused_diagram_mut(&mut self) -> Option<&mut DiagramTab> {
+        self.dock.find_active_focused().and_then(|(_, t)| match &mut t.kind {
+            TabKind::Diagram(d) => Some(d.as_mut()),
+            _ => None,
+        })
+    }
+
     /// Key under which the positions of the current diagram are saved.
     fn diagram_key(&self) -> String {
         let schema = if self.caps.schemas { Some(self.current_schema.as_deref().unwrap_or("public")) } else { None };
@@ -1182,6 +1195,14 @@ impl Workspace {
                 self.submit_ddl(vec![op], DdlAfter { closed: None, reload: None, message: format!("Foreign key from {}.{} to {}.{} created", l.from_table, l.from_column, l.to_table, l.to_column) });
             }
         }
+    }
+
+    /// A warning for the link dialog when the two columns have types of a different kind.
+    fn link_type_warning(&mut self, link: &DocLink) -> Option<String> {
+        let d = self.diagram_tab_mut()?;
+        let type_of = |table: &str, column: &str| d.structure(table).and_then(|s| s.columns.iter().find(|c| c.name == column)).map(|c| c.type_name.clone());
+        let (from, to) = (type_of(&link.from_table, &link.from_column)?, type_of(&link.to_table, &link.to_column)?);
+        dbzilla_core::diagram::types_differ(&from, &to).then(|| format!("The columns have different types: {from} and {to}. A foreign key between them may be refused."))
     }
 
     /// Asks the session for every table of the current schema.
@@ -1408,8 +1429,15 @@ impl Workspace {
             }
             DiagramAction::Save(positions) => self.save_diagram_positions(positions),
             DiagramAction::RequestLink(link) => {
-                self.link_dialog = Some(LinkDialog { link, kind: self.link_kind, constraint: String::new(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into(), error: None });
+                let warning = self.link_type_warning(&link);
+                self.link_dialog = Some(LinkDialog { link, kind: self.link_kind, constraint: String::new(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into(), error: None, warning });
             }
+            DiagramAction::SetInferred(show) => {
+                if let Err(e) = self.diagrams.save_show_inferred(&self.diagram_key(), show) {
+                    self.notices.push((true, format!("cannot save the diagram setting: {e}")));
+                }
+            }
+            DiagramAction::Notice(error, text) => self.notices.push((error, text)),
             DiagramAction::DeleteLink(link) => {
                 if let Some(d) = self.diagram_tab_mut() {
                     d.remove_link(&link);
@@ -2627,6 +2655,7 @@ impl Workspace {
             Some(SidebarAction::ExportTable(t)) => self.open_export(Some(t)),
             Some(SidebarAction::ImportInto(t)) => self.open_import(Some(t)),
             Some(SidebarAction::NewTable) => self.new_table(),
+            Some(SidebarAction::ShowDiagram) => self.open_diagram(),
             None => {}
         }
         if self.palette.is_some() {
@@ -3019,6 +3048,10 @@ impl Workspace {
             let sqlite = self.conn.driver == DriverId::Sqlite;
             widgets::modal(ctx, "Link columns", |ui| {
                 ui.label(RichText::new(format!("{}.{}  ->  {}.{}", d.link.from_table, d.link.from_column, d.link.to_table, d.link.to_column)).color(theme::TEXT));
+                if let Some(w) = &d.warning {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(w).color(theme::TERTIARY));
+                }
                 ui.add_space(8.0);
                 ui.radio_value(&mut d.kind, LinkKind::DiagramOnly, "Only in the diagram");
                 widgets::muted(ui, "A dashed line kept in DBZilla. The database is not changed.");
@@ -3913,6 +3946,43 @@ mod tests {
         let d = ws.diagram_tab_mut().unwrap();
         assert_eq!(d.edge_count(false), 0);
         assert_eq!(d.edge_count(true), 1);
+    }
+
+    /// The "Inferred links" switch is remembered between openings of the diagram.
+    #[test]
+    fn diagram_remembers_the_inferred_switch() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, id_user INTEGER);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert!(ws.diagram_tab_mut().unwrap().show_inferred(), "shown by default");
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        ws.diagram_action(id, DiagramAction::SetInferred(false));
+        ws.diagram_action(id, DiagramAction::Close);
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert!(!ws.diagram_tab_mut().unwrap().show_inferred());
+    }
+
+    /// The link dialog warns when the two columns have types of a different kind.
+    #[test]
+    fn link_dialog_warns_about_different_types() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER, label TEXT);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        let link = |column: &str| DocLink { from_table: "logs".into(), from_column: column.into(), to_table: "users".into(), to_column: "id".into() };
+        ws.diagram_action(id, DiagramAction::RequestLink(link("owner")));
+        assert!(ws.link_dialog.take().unwrap().warning.is_none());
+        ws.diagram_action(id, DiagramAction::RequestLink(link("label")));
+        assert!(ws.link_dialog.take().unwrap().warning.unwrap().contains("different types"));
     }
 
     /// A link drawn between two columns can stay in the diagram only: it is saved, comes back and can be deleted.
