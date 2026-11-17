@@ -409,12 +409,20 @@ impl Actor {
     }
 }
 
+/// The statement that opens a transaction: MySQL has `START TRANSACTION`, and in T-SQL a bare `BEGIN` starts a block.
+fn begin_statement(driver: Option<DriverId>) -> &'static str {
+    match driver {
+        Some(DriverId::MySql) => "START TRANSACTION",
+        Some(DriverId::SqlServer) => "BEGIN TRANSACTION",
+        _ => "BEGIN",
+    }
+}
+
 /// Runs the statements in one transaction, one at a time. A row statement (UPDATE or DELETE) that
 /// touches more than one row, or none, rolls everything back: the key did not identify one row.
 /// MySQL reports changed rows rather than matched rows, so "no row" is only checked elsewhere.
 async fn commit_checked(conn: &mut dyn Conn, driver: Option<DriverId>, statements: &[String]) -> Result<Vec<u64>, String> {
-    let begin = if driver == Some(DriverId::MySql) { "START TRANSACTION" } else { "BEGIN" };
-    conn.execute_batch(&[begin.to_owned()], false).await.map_err(|e| e.to_string())?;
+    conn.execute_batch(&[begin_statement(driver).to_owned()], false).await.map_err(|e| e.to_string())?;
     let mut counts = Vec::with_capacity(statements.len());
     for (i, sql) in statements.iter().enumerate() {
         let outcome = match conn.execute_batch(std::slice::from_ref(sql), false).await {
@@ -439,4 +447,18 @@ async fn commit_checked(conn: &mut dyn Conn, driver: Option<DriverId>, statement
     }
     conn.execute_batch(&["COMMIT".to_owned()], false).await.map_err(|e| e.to_string())?;
     Ok(counts)
+}
+
+#[cfg(test)]
+mod begin_tests {
+    use super::*;
+
+    #[test]
+    fn each_driver_opens_a_transaction_with_its_own_statement() {
+        assert_eq!(begin_statement(Some(DriverId::MySql)), "START TRANSACTION");
+        assert_eq!(begin_statement(Some(DriverId::SqlServer)), "BEGIN TRANSACTION");
+        assert_eq!(begin_statement(Some(DriverId::Postgres)), "BEGIN");
+        assert_eq!(begin_statement(Some(DriverId::Sqlite)), "BEGIN");
+        assert_eq!(begin_statement(None), "BEGIN");
+    }
 }

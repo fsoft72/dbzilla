@@ -422,3 +422,79 @@ async fn a_collation_that_is_not_a_plain_name_is_refused() {
     assert!(matches!(&err, DriverError::Query(m) if m.contains("not a valid collation")), "{err:?}");
     assert!(!conn.list_databases().await.unwrap().iter().any(|d| d.name == "t7_bad"));
 }
+
+#[tokio::test]
+async fn cancel_stops_waitfor_and_the_connection_recovers() {
+    let Some(c) = container().await else { return };
+    raw_exec(c.port, &["IF DB_ID('t8_cancel') IS NULL CREATE DATABASE t8_cancel"]).await;
+    let mut conn = connect(c.port, "").await;
+    conn.set_database("t8_cancel").await.unwrap();
+    let token = conn.cancel_handle().await.expect("cancel token");
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        token.cancel().await
+    });
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let started = Instant::now();
+    let err = conn.query_stream("WAITFOR DELAY '00:00:30'", opts(), tx).await.expect_err("the query must be cancelled");
+    assert!(matches!(err, DriverError::Cancelled), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "cancel took {:?}", started.elapsed());
+    canceller.await.unwrap().expect("KILL succeeded");
+    let (batches, _) = collect(&mut conn, "SELECT DB_NAME()", opts()).await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::Text("t8_cancel".into())]]);
+}
+
+#[tokio::test]
+async fn a_cancel_token_taken_after_a_cancel_targets_the_new_session() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let first = conn.cancel_handle().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let slow = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        first.cancel().await
+    });
+    assert!(matches!(conn.query_stream("WAITFOR DELAY '00:00:30'", opts(), tx).await, Err(DriverError::Cancelled)));
+    slow.await.unwrap().unwrap();
+    // The session was killed: a new token must reconnect first and point at the new session id.
+    let second = conn.cancel_handle().await.unwrap();
+    let again = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        second.cancel().await
+    });
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    assert!(matches!(conn.query_stream("WAITFOR DELAY '00:00:30'", opts(), tx).await, Err(DriverError::Cancelled)));
+    again.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn timeout_stops_the_work_on_the_server() {
+    let Some(c) = container().await else { return };
+    let mut conn = connect(c.port, "").await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let err = conn.query_stream("WAITFOR DELAY '00:00:21'", QueryOpts { timeout: Duration::from_secs(1), ..opts() }, tx).await.expect_err("must time out");
+    assert!(matches!(&err, DriverError::Query(m) if m.contains("timed out")), "{err:?}");
+    let mut probe = connect(c.port, "").await;
+    let (batches, _) = collect(
+        &mut probe,
+        "SELECT COUNT(*) FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE t.text LIKE '%00:00:21%' AND t.text NOT LIKE '%dm_exec_requests%'",
+        opts(),
+    )
+    .await;
+    assert_eq!(rows_of(&batches), vec![vec![Value::I64(0)]], "the timed out query is still running on the server");
+}
+
+#[tokio::test]
+async fn a_transaction_opened_in_one_call_spans_the_next_calls() {
+    let Some(c) = container().await else { return };
+    let mut conn = batch_fixture(c.port, "t8_tx").await;
+    let step = |sql: &str| vec![sql.to_owned()];
+    conn.execute_batch(&step("BEGIN TRANSACTION"), false).await.unwrap();
+    conn.execute_batch(&step("INSERT INTO dbo.t8_tx (a) VALUES (1)"), false).await.unwrap();
+    conn.execute_batch(&step("ROLLBACK"), false).await.unwrap();
+    assert_eq!(count_rows(&mut conn, "t8_tx").await, Value::I64(0));
+    conn.execute_batch(&step("BEGIN TRANSACTION"), false).await.unwrap();
+    conn.execute_batch(&step("INSERT INTO dbo.t8_tx (a) VALUES (2)"), false).await.unwrap();
+    conn.execute_batch(&step("COMMIT"), false).await.unwrap();
+    assert_eq!(count_rows(&mut conn, "t8_tx").await, Value::I64(1));
+}

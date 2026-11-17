@@ -8,6 +8,8 @@ use dbzilla_core::ddl::create_from_structure;
 use dbzilla_core::model::{ColumnMeta, ForeignKeyRef, IndexInfo, ObjectInfo, ObjectKind, TableRef, TableStructure, TriggerInfo};
 use dbzilla_core::value::Value;
 use futures_util::TryStreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tiberius::{AuthMethod, Client, ColumnData, ColumnType, Config, EncryptionLevel, FromSql, QueryItem, Row};
 use tokio::net::TcpStream;
@@ -287,6 +289,29 @@ async fn init_session(client: &mut MsClient, cfg: &ConnectConfig) -> DriverResul
     Ok((row.get::<i32, _>(0).unwrap_or_default(), text(&row, 1)))
 }
 
+/// Cancels by running `KILL <spid>` on a second connection. That ends the session and rolls back its
+/// transaction, which is what SQL Server documents for it; the connection reconnects on its next call.
+struct MsCancel {
+    cfg: ConnectConfig,
+    ssl: SslMode,
+    spid: i32,
+    /// Shared with the connection, so the broken socket of the killed session reads as a cancel.
+    cancelled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl CancelToken for MsCancel {
+    async fn cancel(&self) -> DriverResult<()> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let mut client = connect_client(&self.cfg, "", self.ssl).await?;
+        let kill = match client.simple_query(format!("KILL {}", self.spid)).await {
+            Ok(stream) => stream.into_results().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        kill.map_err(map_err)
+    }
+}
+
 /// An open connection. `client` is `None` after the socket died or the session was killed; the next call reconnects.
 struct MsConn {
     client: Option<MsClient>,
@@ -297,6 +322,8 @@ struct MsConn {
     current_db: String,
     /// Server session id, used to cancel from a second connection.
     spid: i32,
+    /// Set by a cancel token; read by `query_stream` to report `Cancelled` instead of a broken socket.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl MsConn {
@@ -304,7 +331,7 @@ impl MsConn {
     async fn open(cfg: ConnectConfig) -> DriverResult<Self> {
         let (mut client, ssl) = open_client(&cfg, &cfg.database).await?;
         let (spid, current_db) = init_session(&mut client, &cfg).await?;
-        Ok(Self { client: Some(client), cfg, ssl, current_db, spid })
+        Ok(Self { client: Some(client), cfg, ssl, current_db, spid, cancelled: Arc::new(AtomicBool::new(false)) })
     }
 
     /// The live client, reconnecting (and returning to `current_db`) when it is gone.
@@ -372,10 +399,6 @@ impl MsConn {
         };
         result.map_err(|e| self.fail(e))
     }
-}
-
-fn unsupported<T>(what: &str) -> DriverResult<T> {
-    Err(DriverError::Unsupported(format!("{what} is not implemented for SQL Server yet")))
 }
 
 #[async_trait]
@@ -517,10 +540,22 @@ impl Conn for MsConn {
     async fn query_stream(&mut self, sql: &str, opts: QueryOpts, tx: RowSink) -> DriverResult<QuerySummary> {
         let start = Instant::now();
         self.ensure_client().await?;
+        self.cancelled.store(false, Ordering::SeqCst);
         let outcome = {
             let client = self.client.as_mut().expect("client was just ensured");
             tokio::time::timeout(opts.timeout, run_statement(client, sql, &opts, &tx)).await
         };
+        if self.cancelled.load(Ordering::SeqCst) {
+            // The session was (or is being) killed: drop the socket so the next call opens a new one.
+            self.client = None;
+            return match outcome {
+                Ok(Ok(mut summary)) => {
+                    summary.elapsed = start.elapsed();
+                    Ok(summary)
+                }
+                _ => Err(DriverError::Cancelled),
+            };
+        }
         match outcome {
             Ok(Ok(mut summary)) => {
                 summary.elapsed = start.elapsed();
@@ -568,7 +603,9 @@ impl Conn for MsConn {
     }
 
     async fn cancel_handle(&mut self) -> DriverResult<Box<dyn CancelToken>> {
-        unsupported("cancelling")
+        // After a cancel the session is gone: reconnect first, so the token holds the id of the live one.
+        self.ensure_client().await?;
+        Ok(Box::new(MsCancel { cfg: self.cfg.clone(), ssl: self.ssl, spid: self.spid, cancelled: Arc::clone(&self.cancelled) }))
     }
 
     async fn ping(&mut self) -> DriverResult<()> {
