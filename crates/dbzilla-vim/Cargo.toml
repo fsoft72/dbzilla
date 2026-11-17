@@ -1,0 +1,9 @@
+[package]
+name = "dbzilla-vim"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+regex = "1.13.1"
+ropey = { version = "1.6", default-features = false }
+thiserror = "2.0.21"
