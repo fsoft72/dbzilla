@@ -4,7 +4,7 @@ use crate::atomic::{load_json, save_json};
 use crate::StoreResult;
 use dbzilla_core::diagram::DocLink;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Current file schema version.
@@ -21,11 +21,15 @@ struct DiagramFile {
     layouts: BTreeMap<String, Positions>,
     /// Links drawn by the user, per diagram key.
     links: BTreeMap<String, Vec<DocLink>>,
+    /// Diagram keys whose guessed links are hidden (they are shown by default).
+    hide_inferred: BTreeSet<String>,
+    /// Palette index chosen for a table, per diagram key.
+    colors: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 impl Default for DiagramFile {
     fn default() -> Self {
-        Self { schema_version: DIAGRAMS_VERSION, layouts: BTreeMap::new(), links: BTreeMap::new() }
+        Self { schema_version: DIAGRAMS_VERSION, layouts: BTreeMap::new(), links: BTreeMap::new(), hide_inferred: BTreeSet::new(), colors: BTreeMap::new() }
     }
 }
 
@@ -61,6 +65,34 @@ impl DiagramStore {
     pub fn save_links(&self, key: &str, links: Vec<DocLink>) -> StoreResult<()> {
         let mut file = load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value;
         file.links.insert(key.to_owned(), links);
+        save_json(&self.path, &file)
+    }
+
+    /// Colours chosen for the tables of the diagram `key` (table name to palette index).
+    pub fn load_colors(&self, key: &str) -> BTreeMap<String, usize> {
+        load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value.colors.remove(key).unwrap_or_default()
+    }
+
+    /// Replaces the colours saved for `key`.
+    pub fn save_colors(&self, key: &str, colors: BTreeMap<String, usize>) -> StoreResult<()> {
+        let mut file = load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value;
+        file.colors.insert(key.to_owned(), colors);
+        save_json(&self.path, &file)
+    }
+
+    /// Whether the guessed links of the diagram `key` are shown; true when nothing was saved.
+    pub fn load_show_inferred(&self, key: &str) -> bool {
+        !load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value.hide_inferred.contains(key)
+    }
+
+    /// Remembers whether the guessed links of the diagram `key` are shown.
+    pub fn save_show_inferred(&self, key: &str, show: bool) -> StoreResult<()> {
+        let mut file = load_json::<DiagramFile>(&self.path, u64::from(DIAGRAMS_VERSION)).value;
+        if show {
+            file.hide_inferred.remove(key);
+        } else {
+            file.hide_inferred.insert(key.to_owned());
+        }
         save_json(&self.path, &file)
     }
 
@@ -111,6 +143,31 @@ mod tests {
         assert_eq!(store.load_links("k"), vec![link]);
         assert_eq!(store.load("k"), pos(&[("a", 3.0, 4.0)]));
         assert!(store.load_links("other").is_empty());
+    }
+
+    #[test]
+    fn the_inferred_switch_is_remembered_per_diagram() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiagramStore::new(dir.path().join("diagrams.json"));
+        assert!(store.load_show_inferred("k"), "shown by default");
+        store.save("k", pos(&[("a", 1.0, 2.0)])).unwrap();
+        store.save_show_inferred("k", false).unwrap();
+        assert!(!store.load_show_inferred("k"));
+        assert!(store.load_show_inferred("other"));
+        assert_eq!(store.load("k"), pos(&[("a", 1.0, 2.0)]));
+        store.save_show_inferred("k", true).unwrap();
+        assert!(store.load_show_inferred("k"));
+    }
+
+    #[test]
+    fn table_colours_round_trip_per_diagram() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiagramStore::new(dir.path().join("diagrams.json"));
+        assert!(store.load_colors("k").is_empty());
+        store.save_colors("k", BTreeMap::from([("orders".to_owned(), 2)])).unwrap();
+        store.save("k", pos(&[("orders", 1.0, 1.0)])).unwrap();
+        assert_eq!(store.load_colors("k").get("orders"), Some(&2));
+        assert!(store.load_colors("other").is_empty());
     }
 
     #[test]

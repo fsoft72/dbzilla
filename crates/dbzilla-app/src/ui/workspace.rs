@@ -30,7 +30,7 @@ use crate::theme;
 use dbzilla_core::caps::Capabilities;
 use dbzilla_core::changes::generate_sql;
 use dbzilla_core::copyfmt::{copy_script, format_rows, CopyContext, CopyFormat, CsvOptions, ScriptKind};
-use dbzilla_core::ddl::{ForeignKeyDef, generate_ddl, StructuralOp};
+use dbzilla_core::ddl::{generate_ddl, StructuralOp};
 use dbzilla_core::dialect::{dialect_for, Dialect, DriverId};
 use dbzilla_core::filter::Filter;
 use dbzilla_core::rowlimit::apply_row_limit;
@@ -121,6 +121,8 @@ impl TableTab {
 /// What happens after a statement batch that is not a tab commit.
 #[derive(Debug, Clone, Default)]
 struct DdlAfter {
+    /// The statements are the pending changes of the diagram: they are cleared when they succeed.
+    diagram: bool,
     closed: Option<TableRef>,
     /// A table whose structure is read again once the statements are over, done or failed.
     reload: Option<TableRef>,
@@ -182,12 +184,8 @@ struct LinkDialog {
     on_update: String,
     on_delete: String,
     error: Option<String>,
-}
-
-/// A foreign key waiting for the user to confirm its deletion.
-struct FkDelete {
-    table: TableRef,
-    constraint: String,
+    /// Shown when the two columns have types of a different kind.
+    warning: Option<String>,
 }
 
 /// Foreign key actions offered in menus.
@@ -398,7 +396,6 @@ pub struct Workspace {
     /// The trigger window, when open.
     triggers: Option<TriggerEditor>,
     /// The confirmation before a foreign key is dropped from the diagram.
-    fk_delete: Option<FkDelete>,
     /// Functions a PostgreSQL trigger can call, as last listed by the server.
     trigger_functions: Vec<TableRef>,
     pending_copy: Option<(TableRef, ScriptKind)>,
@@ -491,7 +488,6 @@ impl Workspace {
             link_dialog: None,
             link_kind: LinkKind::DiagramOnly,
             triggers: None,
-            fk_delete: None,
             trigger_functions: Vec::new(),
             pending_copy: None,
             clipboard_out: None,
@@ -645,10 +641,15 @@ impl Workspace {
             Event::TriggerFunctions { functions, .. } => self.trigger_functions = functions,
             Event::Diagram { tables, skipped, .. } => {
                 let key = self.diagram_key();
-                let (saved, links) = (self.diagrams.load(&key), self.diagrams.load_links(&key));
+                let (saved, links, show_inferred, colors) = (self.diagrams.load(&key), self.diagrams.load_links(&key), self.diagrams.load_show_inferred(&key), self.diagrams.load_colors(&key));
+                let template = TableRef { database: None, schema: self.current_schema.clone().filter(|_| self.caps.schemas), name: String::new() };
+                let int_type = self.dialect.types().first().copied().unwrap_or("integer").to_owned();
                 let blocked = (!self.caps.add_fk_after_create).then(|| if self.conn.driver == DriverId::Sqlite { "SQLite cannot drop a foreign key from an existing table" } else { "This database cannot drop a foreign key from an existing table" }.to_owned());
                 if let Some(d) = self.diagram_tab_mut() {
                     d.set_fk_drop_blocked(blocked);
+                    d.set_show_inferred(show_inferred);
+                    d.set_colors(colors);
+                    d.configure(template, &int_type);
                 }
                 let fresh = self.diagram_tab_mut().and_then(|d| d.set_tables(tables, skipped, &saved, links));
                 if let Some(positions) = fresh {
@@ -1020,7 +1021,9 @@ impl Workspace {
             }
             Action::ReloadWorkspace => self.load_schema(),
             Action::ToggleFilters => {
-                if let Some((_, t)) = self.active_tab_mut() {
+                if let Some(d) = self.focused_diagram_mut() {
+                    d.focus_search();
+                } else if let Some((_, t)) = self.active_tab_mut() {
                     t.data.bar.open = !t.data.bar.open;
                 } else if let Some((_, s)) = self.active_sql_mut() {
                     s.find = if s.find.is_some() { None } else { Some(sqltab::FindState { focus: true, ..Default::default() }) };
@@ -1045,9 +1048,25 @@ impl Workspace {
             Action::Cancel => self.cancel_sql(),
             Action::Beautify => self.sql_action(SqlAction::Beautify),
             Action::ToggleComment => self.sql_action(SqlAction::Comment),
-            Action::Commit => self.commit_active(),
+            Action::Commit => {
+                if self.focused_diagram_mut().is_some() {
+                    self.commit_diagram();
+                } else {
+                    self.commit_active();
+                }
+            }
             Action::Preview => self.preview_active(),
             Action::Discard => self.discard_active(),
+            Action::Undo if self.focused_diagram_mut().is_some() => {
+                if let Some(d) = self.focused_diagram_mut() {
+                    d.undo();
+                }
+            }
+            Action::Redo if self.focused_diagram_mut().is_some() => {
+                if let Some(d) = self.focused_diagram_mut() {
+                    d.redo();
+                }
+            }
             Action::Undo => self.row_op(|t| {
                 t.data.pending.undo(&mut t.data.rows);
             }),
@@ -1118,6 +1137,14 @@ impl Workspace {
         })
     }
 
+    /// The ER diagram tab when it is the focused one.
+    fn focused_diagram_mut(&mut self) -> Option<&mut DiagramTab> {
+        self.dock.find_active_focused().and_then(|(_, t)| match &mut t.kind {
+            TabKind::Diagram(d) => Some(d.as_mut()),
+            _ => None,
+        })
+    }
+
     /// Key under which the positions of the current diagram are saved.
     fn diagram_key(&self) -> String {
         let schema = if self.caps.schemas { Some(self.current_schema.as_deref().unwrap_or("public")) } else { None };
@@ -1141,11 +1168,24 @@ impl Workspace {
         }
     }
 
-    /// Drops the confirmed foreign key through the safe-mode gate; the diagram reloads when it is done.
-    fn apply_fk_delete(&mut self, d: FkDelete) {
-        let message = format!("Foreign key {} deleted", d.constraint);
-        let op = StructuralOp::DropForeignKey { table: d.table, name: d.constraint };
-        self.submit_ddl(vec![op], DdlAfter { closed: None, reload: None, message });
+    /// Sends the pending changes of the diagram through the safe-mode gate; they stay pending until they succeed.
+    pub fn commit_diagram(&mut self) {
+        let (caps, sqlite) = (self.caps.clone(), self.conn.driver == DriverId::Sqlite);
+        let Some(d) = self.diagram_tab_mut() else { return };
+        if d.pending_count() == 0 {
+            return self.notices.push((false, "There are no pending changes".into()));
+        }
+        match d.pending_ops(&caps, sqlite) {
+            Ok(ops) => self.submit_ddl(ops, DdlAfter { diagram: true, closed: None, reload: None, message: "Diagram changes applied".into() }),
+            Err(e) => self.notices.push((true, e)),
+        }
+    }
+
+    /// Keeps the colours chosen for the tables of the current diagram; a failure becomes a notice.
+    fn save_diagram_colors(&mut self, colors: std::collections::BTreeMap<String, usize>) {
+        if let Err(e) = self.diagrams.save_colors(&self.diagram_key(), colors) {
+            self.notices.push((true, format!("cannot save the table colours: {e}")));
+        }
     }
 
     /// Applies the link dialog: a real foreign key goes through the safe-mode gate, a drawn link is kept.
@@ -1166,22 +1206,26 @@ impl Workspace {
                 }
             }
             LinkKind::Database => {
-                let l = &dialog.link;
-                let (Some(from), Some(to)) = (self.diagram_tab_mut().and_then(|d| d.structure(&l.from_table).cloned()), self.diagram_tab_mut().and_then(|d| d.structure(&l.to_table).cloned())) else {
-                    return reopen(self, dialog, "The table is no longer in the diagram".into());
-                };
+                let l = dialog.link.clone();
                 let name = dialog.constraint.trim();
-                let op = StructuralOp::AddForeignKey {
-                    table: from.table.clone(),
-                    fk: ForeignKeyDef { name: (!name.is_empty()).then(|| name.to_owned()), columns: vec![l.from_column.clone()], ref_table: to.table.clone(), ref_columns: vec![l.to_column.clone()], on_update: dialog.on_update.clone(), on_delete: dialog.on_delete.clone() },
-                    current: Some(Box::new(from)),
+                let name = (!name.is_empty()).then(|| name.to_owned());
+                let staged = match self.diagram_tab_mut() {
+                    Some(d) => d.stage_foreign_key(&l, name, &dialog.on_update, &dialog.on_delete),
+                    None => Err("The diagram is closed".into()),
                 };
-                if let Err(e) = generate_ddl(&op, dialect_for(self.conn.driver).as_ref()) {
-                    return reopen(self, dialog, e.to_string());
+                match staged {
+                    Ok(()) => self.notices.push((false, format!("Foreign key from {}.{} to {}.{} added to the pending changes", l.from_table, l.from_column, l.to_table, l.to_column))),
+                    Err(e) => reopen(self, dialog, e),
                 }
-                self.submit_ddl(vec![op], DdlAfter { closed: None, reload: None, message: format!("Foreign key from {}.{} to {}.{} created", l.from_table, l.from_column, l.to_table, l.to_column) });
             }
         }
+    }
+
+    /// A warning for the link dialog when the two columns have types of a different kind.
+    fn link_type_warning(&mut self, link: &DocLink) -> Option<String> {
+        let d = self.diagram_tab_mut()?;
+        let (from, to) = (d.column_type(&link.from_table, &link.from_column)?, d.column_type(&link.to_table, &link.to_column)?);
+        dbzilla_core::diagram::types_differ(&from, &to).then(|| format!("The columns have different types: {from} and {to}. A foreign key between them may be refused."))
     }
 
     /// Asks the session for every table of the current schema.
@@ -1408,8 +1452,15 @@ impl Workspace {
             }
             DiagramAction::Save(positions) => self.save_diagram_positions(positions),
             DiagramAction::RequestLink(link) => {
-                self.link_dialog = Some(LinkDialog { link, kind: self.link_kind, constraint: String::new(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into(), error: None });
+                let warning = self.link_type_warning(&link);
+                self.link_dialog = Some(LinkDialog { link, kind: self.link_kind, constraint: String::new(), on_update: FK_ACTIONS[0].into(), on_delete: FK_ACTIONS[0].into(), error: None, warning });
             }
+            DiagramAction::SetInferred(show) => {
+                if let Err(e) = self.diagrams.save_show_inferred(&self.diagram_key(), show) {
+                    self.notices.push((true, format!("cannot save the diagram setting: {e}")));
+                }
+            }
+            DiagramAction::Notice(error, text) => self.notices.push((error, text)),
             DiagramAction::DeleteLink(link) => {
                 if let Some(d) = self.diagram_tab_mut() {
                     d.remove_link(&link);
@@ -1420,11 +1471,12 @@ impl Workspace {
                 if !self.caps.add_fk_after_create {
                     return self.notices.push((true, "This database cannot drop a foreign key from an existing table".into()));
                 }
-                let Some(table) = self.objects.iter().find(|o| o.kind == ObjectKind::Table && o.table.name == table).map(|o| o.table.clone()) else {
-                    return self.notices.push((true, format!("The table {table} is no longer in the schema")));
-                };
-                self.fk_delete = Some(FkDelete { table, constraint });
+                if let Some(d) = self.diagram_tab_mut() {
+                    d.stage_drop_foreign_key(&table, &constraint);
+                }
             }
+            DiagramAction::Apply => self.commit_diagram(),
+            DiagramAction::SetColors(colors) => self.save_diagram_colors(colors),
             DiagramAction::OpenTable(name) => {
                 let table = self.objects.iter().find(|o| o.table.name == name).map(|o| o.table.clone());
                 if let Some(t) = table {
@@ -1912,6 +1964,16 @@ impl Workspace {
             }
             Some((_, ReqKind::Ddl)) => {
                 let after = self.ddl_after.remove(&req).unwrap_or_default();
+                if after.diagram {
+                    // the new tables keep the place they had in the diagram
+                    let placed = self.diagram_tab_mut().map(|d| d.positions_all());
+                    if let Some(p) = placed {
+                        self.save_diagram_positions(p);
+                    }
+                    if let Some(d) = self.diagram_tab_mut() {
+                        d.discard_pending();
+                    }
+                }
                 if let Some(closed) = &after.closed {
                     let closed = closed.clone();
                     self.structures.remove(&closed);
@@ -2627,6 +2689,7 @@ impl Workspace {
             Some(SidebarAction::ExportTable(t)) => self.open_export(Some(t)),
             Some(SidebarAction::ImportInto(t)) => self.open_import(Some(t)),
             Some(SidebarAction::NewTable) => self.new_table(),
+            Some(SidebarAction::ShowDiagram) => self.open_diagram(),
             None => {}
         }
         if self.palette.is_some() {
@@ -2938,12 +3001,12 @@ impl Workspace {
                                     let mut target = source.clone();
                                     target.name = name.trim().to_owned();
                                     let msg = format!("Cloned {} to {}", source.name, target.name);
-                                    self.submit_ddl(vec![StructuralOp::CloneTable { source, target, with_data }], DdlAfter { closed: None, reload: None, message: msg });
+                                    self.submit_ddl(vec![StructuralOp::CloneTable { source, target, with_data }], DdlAfter { diagram: false, closed: None, reload: None, message: msg });
                                 }
                             }
                             OpDialog::Truncate { table, cascade, restart } => {
                                 let msg = format!("Truncated {}", table.name);
-                                self.submit_ddl(vec![StructuralOp::Truncate { table: table.clone(), cascade, restart_identity: restart }], DdlAfter { closed: None, reload: None, message: msg });
+                                self.submit_ddl(vec![StructuralOp::Truncate { table: table.clone(), cascade, restart_identity: restart }], DdlAfter { diagram: false, closed: None, reload: None, message: msg });
                                 let tabs: Vec<TabId> = self.dock.iter_all_tabs().filter(|(_, t)| matches!(&t.kind, TabKind::Table(tt) if tt.table == table)).map(|(_, t)| t.id).collect();
                                 for id in tabs {
                                     if let Some(t) = self.table_tab_mut(id) {
@@ -2953,7 +3016,7 @@ impl Workspace {
                             }
                             OpDialog::Drop { table, cascade } => {
                                 let msg = format!("Deleted {}", table.name);
-                                self.submit_ddl(vec![StructuralOp::DropTable { table: table.clone(), cascade }], DdlAfter { closed: Some(table), reload: None, message: msg });
+                                self.submit_ddl(vec![StructuralOp::DropTable { table: table.clone(), cascade }], DdlAfter { diagram: false, closed: Some(table), reload: None, message: msg });
                             }
                         }
                     }
@@ -3019,6 +3082,10 @@ impl Workspace {
             let sqlite = self.conn.driver == DriverId::Sqlite;
             widgets::modal(ctx, "Link columns", |ui| {
                 ui.label(RichText::new(format!("{}.{}  ->  {}.{}", d.link.from_table, d.link.from_column, d.link.to_table, d.link.to_column)).color(theme::TEXT));
+                if let Some(w) = &d.warning {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(w).color(theme::TERTIARY));
+                }
                 ui.add_space(8.0);
                 ui.radio_value(&mut d.kind, LinkKind::DiagramOnly, "Only in the diagram");
                 widgets::muted(ui, "A dashed line kept in DBZilla. The database is not changed.");
@@ -3071,27 +3138,6 @@ impl Workspace {
         if self.triggers.is_some() {
             self.triggers_window(ctx);
         }
-        if let Some(d) = &self.fk_delete {
-            let text = format!("Delete foreign key {} on table {}?", d.constraint, d.table.name);
-            let mut decision = None;
-            widgets::modal(ctx, "Delete foreign key", |ui| {
-                ui.label(text);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if widgets::danger_button(ui, "Delete").clicked() {
-                        decision = Some(true);
-                    }
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-            match (decision, self.fk_delete.take()) {
-                (Some(true), Some(d)) => self.apply_fk_delete(d),
-                (None, d) => self.fk_delete = d,
-                _ => {}
-            }
-        }
     }
 
     /// Opens the trigger window of a table tab and asks for the functions a PostgreSQL trigger can call.
@@ -3112,7 +3158,7 @@ impl Workspace {
         for a in editor.show(ctx, &env) {
             match a {
                 TriggerAction::Close => keep = false,
-                TriggerAction::Submit { ops, message } => self.submit_ddl(ops, DdlAfter { closed: None, reload: Some(editor.table.clone()), message }),
+                TriggerAction::Submit { ops, message } => self.submit_ddl(ops, DdlAfter { diagram: false, closed: None, reload: Some(editor.table.clone()), message }),
             }
         }
         if keep {
@@ -3296,7 +3342,8 @@ impl TabViewer for Viewer<'_> {
         let t = match &mut tab.kind {
             TabKind::Table(t) => t,
             TabKind::Diagram(d) => {
-                for a in diagram::show(ui, d) {
+                let denv = diagram::DiagramEnv { caps: self.caps, types: self.dialect.types() };
+                for a in diagram::show(ui, d, &denv) {
                     self.diagram_actions.push((id, a));
                 }
                 return;
@@ -3818,7 +3865,7 @@ mod tests {
         assert_eq!(count("t_clone"), 2);
         ws.submit_ddl(vec![StructuralOp::Truncate { table: TableRef::simple("t_clone"), cascade: false, restart_identity: false }], DdlAfter::default());
         wait(&mut ws, |_| count("t_clone") == 0);
-        ws.submit_ddl(vec![StructuralOp::DropTable { table: TableRef::simple("t"), cascade: false }], DdlAfter { closed: Some(TableRef::simple("t")), reload: None, message: String::new() });
+        ws.submit_ddl(vec![StructuralOp::DropTable { table: TableRef::simple("t"), cascade: false }], DdlAfter { diagram: false, closed: Some(TableRef::simple("t")), reload: None, message: String::new() });
         wait(&mut ws, |w| !w.objects.iter().any(|o| o.table.name == "t") && w.dock.iter_all_tabs().next().is_none());
     }
 
@@ -3915,6 +3962,43 @@ mod tests {
         assert_eq!(d.edge_count(true), 1);
     }
 
+    /// The "Inferred links" switch is remembered between openings of the diagram.
+    #[test]
+    fn diagram_remembers_the_inferred_switch() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, id_user INTEGER);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert!(ws.diagram_tab_mut().unwrap().show_inferred(), "shown by default");
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        ws.diagram_action(id, DiagramAction::SetInferred(false));
+        ws.diagram_action(id, DiagramAction::Close);
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert!(!ws.diagram_tab_mut().unwrap().show_inferred());
+    }
+
+    /// The link dialog warns when the two columns have types of a different kind.
+    #[test]
+    fn link_dialog_warns_about_different_types() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER, label TEXT);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let id = ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id;
+        let link = |column: &str| DocLink { from_table: "logs".into(), from_column: column.into(), to_table: "users".into(), to_column: "id".into() };
+        ws.diagram_action(id, DiagramAction::RequestLink(link("owner")));
+        assert!(ws.link_dialog.take().unwrap().warning.is_none());
+        ws.diagram_action(id, DiagramAction::RequestLink(link("label")));
+        assert!(ws.link_dialog.take().unwrap().warning.unwrap().contains("different types"));
+    }
+
     /// A link drawn between two columns can stay in the diagram only: it is saved, comes back and can be deleted.
     #[test]
     fn diagram_only_links_are_kept_and_deleted() {
@@ -3965,18 +4049,20 @@ mod tests {
         ws.apply_link_dialog(dialog);
         assert!(ws.link_dialog.is_none(), "{:?}", ws.link_dialog.as_ref().map(|d| d.error.clone()));
         assert_eq!(ws.link_kind, LinkKind::Database, "the choice is remembered");
-        if let Some(g) = ws.gate.take() {
-            ws.send_ddl(g.statements, DdlAfter::default());
-        }
-        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.edge_count(false) == 1));
+        assert!(ws.gate.is_none(), "nothing is sent before the changes are applied");
+        assert_eq!(ws.diagram_tab_mut().unwrap().pending_count(), 1);
+        assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        apply_diagram(&mut ws);
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.pending_count() == 0));
+        assert_eq!(ws.diagram_tab_mut().unwrap().edge_count(false), 1);
         let db = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(db.query_row("SELECT count(*) FROM logs", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "the data is kept");
         assert_eq!(db.query_row("SELECT on_delete FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, String>(0)).unwrap(), "CASCADE");
     }
 
-    /// Adding a foreign key to a table that others refer to is refused with a reason, and the dialog stays open.
+    /// Adding a foreign key to a table that others refer to is refused with a reason when the changes are applied; they stay pending.
     #[test]
-    fn diagram_link_refused_by_the_database_keeps_the_dialog() {
+    fn diagram_link_refused_by_the_database_stays_pending() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let (_dir, path, mut ws) = connected(&rt);
         rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, x INTEGER); CREATE TABLE c (b_id INTEGER REFERENCES b(id));").unwrap();
@@ -3989,9 +4075,13 @@ mod tests {
         let mut dialog = ws.link_dialog.take().unwrap();
         dialog.kind = LinkKind::Database;
         ws.apply_link_dialog(dialog);
-        let again = ws.link_dialog.as_ref().expect("the dialog stays open");
-        assert!(again.error.as_deref().is_some_and(|e| e.contains("refer to it")), "{:?}", again.error);
+        assert!(ws.link_dialog.is_none());
+        assert_eq!(ws.diagram_tab_mut().unwrap().pending_count(), 1);
+        ws.notices.clear();
+        ws.commit_diagram();
+        assert!(ws.notices.iter().any(|(error, text)| *error && text.contains("refer to it")), "{:?}", ws.notices);
         assert!(ws.gate.is_none());
+        assert_eq!(ws.diagram_tab_mut().unwrap().pending_count(), 1, "the change stays pending");
     }
 
     /// Moved tables come back where they were; Rearrange forgets them.
@@ -4144,7 +4234,7 @@ mod tests {
         let table = ws.table_tab_mut(id).unwrap().table.clone();
         let save = |ws: &mut Workspace, d: &TriggerDraft| {
             let ops = d.to_ops(&table).unwrap();
-            ws.submit_ddl(ops, DdlAfter { closed: None, reload: Some(table.clone()), message: "saved".into() });
+            ws.submit_ddl(ops, DdlAfter { diagram: false, closed: None, reload: Some(table.clone()), message: "saved".into() });
         };
         save(&mut ws, &draft);
         wait(&mut ws, |w| active_triggers(w) == vec!["trg_items".to_owned()]);
@@ -4166,7 +4256,7 @@ mod tests {
         assert!(bad.to_ops(&table).is_err());
         assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(1));
         // delete
-        ws.submit_ddl(super::super::triggers::delete_ops(&table, "trg_items"), DdlAfter { closed: None, reload: Some(table.clone()), message: "deleted".into() });
+        ws.submit_ddl(super::super::triggers::delete_ops(&table, "trg_items"), DdlAfter { diagram: false, closed: None, reload: Some(table.clone()), message: "deleted".into() });
         wait(&mut ws, |w| active_triggers(w).is_empty());
         assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(0));
         // an edit the server refuses: PostgreSQL rolls the drop back, MySQL cannot, and either way the list shows the truth
@@ -4243,6 +4333,62 @@ mod tests {
         ws.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).unwrap().id
     }
 
+    /// A table added in the diagram is created when the changes are applied, and a dropped one is removed.
+    #[test]
+    fn diagram_adds_and_drops_tables_through_the_pending_changes() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "logs"));
+        diagram_ready(&mut ws);
+        let exists = |name: &str| rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM sqlite_master WHERE name = ?1", [name], |r| r.get::<_, i64>(0)).unwrap() == 1;
+        let d = ws.diagram_tab_mut().unwrap();
+        let base = d.table_count();
+        d.add_table();
+        d.drop_table("logs");
+        assert_eq!((d.table_count(), d.pending_count()), (base + 1, 2), "the new table is drawn and the dropped one stays until applied");
+        assert!(!exists("untitled_table_1") && exists("logs"), "nothing happens before the changes are applied");
+        apply_diagram(&mut ws);
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.pending_count() == 0));
+        assert!(exists("untitled_table_1"));
+        assert!(!exists("logs"));
+        assert!(exists("users"));
+        assert_eq!(ws.diagram_tab_mut().unwrap().table_count(), base);
+    }
+
+    /// Discarding forgets the pending changes without touching the database, and Undo steps back one change.
+    #[test]
+    fn diagram_discard_and_undo() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "users"));
+        diagram_ready(&mut ws);
+        let d = ws.diagram_tab_mut().unwrap();
+        let base = d.table_count();
+        d.add_table();
+        d.add_table();
+        d.undo();
+        assert_eq!((d.table_count(), d.pending_count()), (base + 1, 1));
+        d.discard_pending();
+        assert_eq!((d.table_count(), d.pending_count()), (base, 0));
+        ws.notices.clear();
+        ws.commit_diagram();
+        assert!(ws.notices.iter().any(|(_, t)| t.contains("no pending")));
+        assert!(ws.gate.is_none());
+    }
+
+    /// Applies the pending changes of the diagram, passing the safe-mode gate when it asks.
+    fn apply_diagram(ws: &mut Workspace) {
+        ws.commit_diagram();
+        if let Some(g) = ws.gate.take() {
+            let GateAction::Ddl(after) = g.action else { panic!("a DDL gate") };
+            ws.send_ddl(g.statements, after);
+        }
+    }
+
     /// SQLite cannot drop a foreign key: the diagram says why, the action is refused with a notice and nothing changes.
     #[test]
     fn deleting_a_foreign_key_on_sqlite_is_refused_with_a_notice() {
@@ -4256,13 +4402,14 @@ mod tests {
         ws.notices.clear();
         ws.diagram_action(id, DiagramAction::DeleteForeignKey { table: "logs".into(), constraint: "fk_owner".into() });
         assert!(ws.notices.iter().any(|(error, text)| *error && text.contains("cannot drop a foreign key")), "{:?}", ws.notices);
-        assert!(ws.fk_delete.is_none() && ws.gate.is_none());
+        assert!(ws.gate.is_none());
+        assert_eq!(ws.diagram_tab_mut().unwrap().pending_count(), 0);
         assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 
-    /// When the driver allows it, the action asks for a confirmation first and drops nothing yet.
+    /// When the driver allows it, the foreign key drop is staged and the database is not touched yet.
     #[test]
-    fn foreign_key_delete_dialog_opens_when_the_driver_allows_it() {
+    fn foreign_key_delete_is_staged_when_the_driver_allows_it() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let (_dir, path, mut ws) = connected(&rt);
         rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY); CREATE TABLE logs (id INTEGER PRIMARY KEY, owner INTEGER CONSTRAINT fk_owner REFERENCES users(id));").unwrap();
@@ -4271,8 +4418,7 @@ mod tests {
         let id = diagram_ready(&mut ws);
         ws.caps.add_fk_after_create = true;
         ws.diagram_action(id, DiagramAction::DeleteForeignKey { table: "logs".into(), constraint: "fk_owner".into() });
-        let d = ws.fk_delete.as_ref().expect("a confirmation");
-        assert_eq!((d.table.name.as_str(), d.constraint.as_str()), ("logs", "fk_owner"));
+        assert_eq!(ws.diagram_tab_mut().unwrap().pending_count(), 1);
         assert!(ws.gate.is_none());
         assert_eq!(rusqlite::Connection::open(&path).unwrap().query_row("SELECT count(*) FROM pragma_foreign_key_list('logs')", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
@@ -4287,9 +4433,9 @@ mod tests {
         assert!(ws.diagram_tab_mut().unwrap().fk_drop_blocked().is_none());
         assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(1));
         ws.diagram_action(id, DiagramAction::DeleteForeignKey { table: "orders".into(), constraint: "fk_customer".into() });
-        let dialog = ws.fk_delete.take().expect("a confirmation");
-        ws.apply_fk_delete(dialog);
-        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.edge_count(false) == 0));
+        apply_diagram(&mut ws);
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading && d.pending_count() == 0));
+        assert_eq!(ws.diagram_tab_mut().unwrap().edge_count(false), 0);
         assert_eq!(server_scalar(rt, &cfg, count_sql), Value::I64(0));
     }
 

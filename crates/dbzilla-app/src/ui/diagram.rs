@@ -1,12 +1,17 @@
-//! ER diagram tab (SPEC 11.3): tables as boxes, one line per foreign key, read only.
+//! ER diagram tab (SPEC 11.3): tables as boxes, one line per foreign key.
 
+use super::diagram_pending::{DiagramPending, Markers};
+use super::structure::{self, StructAction, StructEnv};
 use super::widgets;
 use crate::glyphs::Ico;
 use crate::theme;
+use dbzilla_core::caps::Capabilities;
+use dbzilla_core::ddl::StructuralOp;
 use dbzilla_core::diagram::{Diagram, DiagramEdge, DiagramSort, DocLink, EdgeKind};
-use dbzilla_core::model::TableStructure;
+use dbzilla_core::model::{TableRef, TableStructure};
+use std::collections::BTreeMap;
 use dbzilla_store::diagrams::Positions;
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 /// Height of the table header and of one column row, at zoom 1.
 const HEADER_H: f32 = 26.0;
@@ -42,6 +47,37 @@ pub enum DiagramAction {
     DeleteLink(DocLink),
     /// The user asked to drop a real foreign key of the database.
     DeleteForeignKey { table: String, constraint: String },
+    /// The "Inferred links" switch changed: keep it for the next time.
+    SetInferred(bool),
+    /// A message for the user (error flag, text).
+    Notice(bool, String),
+    /// Apply the pending changes to the database.
+    Apply,
+    /// The colours chosen for tables changed: keep them (table name to palette index).
+    SetColors(BTreeMap<String, usize>),
+}
+
+/// What the diagram needs to know about the database to edit tables.
+pub struct DiagramEnv<'a> {
+    pub caps: &'a Capabilities,
+    /// Data types of the dialect.
+    pub types: &'a [&'a str],
+}
+
+/// Page of the table settings window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Columns,
+    Indexes,
+}
+
+/// The table settings window.
+struct Settings {
+    /// Key of the draft: the name of an existing table, the current name of a new one.
+    key: String,
+    /// Name the table is drawn with.
+    shown: String,
+    page: SettingsPage,
 }
 
 /// A link being dragged from a column.
@@ -69,10 +105,13 @@ pub struct DiagramTab {
     selected: Option<usize>,
     /// Draw the dashed links guessed from column names.
     show_inferred: bool,
+    /// The search box takes the keyboard focus on the next frame.
+    focus_search: bool,
     dragging: Option<usize>,
     search: String,
     found: Vec<usize>,
-    found_at: usize,
+    /// Match the search stands on, as an index into `found`; none until the user steps.
+    cursor: Option<usize>,
     /// The next reload ignores the saved positions (Rearrange).
     forget_saved: bool,
     /// Links drawn by the user, kept in the application only.
@@ -84,6 +123,19 @@ pub struct DiagramTab {
     save_pending: bool,
     /// Why a foreign key of the database cannot be dropped here, when it cannot.
     fk_drop_blocked: Option<String>,
+    /// Changes waiting to be applied.
+    pending: DiagramPending,
+    markers: Markers,
+    settings: Option<Settings>,
+    /// Table the right click menu was opened on, with the column under the pointer.
+    menu_table: Option<(usize, Option<usize>)>,
+    /// Palette index chosen for a table, by name.
+    colors: BTreeMap<String, usize>,
+    /// Where a new table is created (schema) and the type of its first column.
+    template: TableRef,
+    int_type: String,
+    /// Centre the view on this table at the next frame.
+    jump_to_name: Option<String>,
 }
 
 impl DiagramTab {
@@ -103,17 +155,148 @@ impl DiagramTab {
             fit_pending: true,
             selected: None,
             show_inferred: true,
+            focus_search: false,
             dragging: None,
             search: String::new(),
             found: Vec::new(),
-            found_at: 0,
+            cursor: None,
             forget_saved: false,
             links: Vec::new(),
             linking: None,
             menu_edge: None,
             save_pending: false,
             fk_drop_blocked: None,
+            pending: DiagramPending::default(),
+            markers: Markers::default(),
+            settings: None,
+            menu_table: None,
+            colors: BTreeMap::new(),
+            template: TableRef::default(),
+            int_type: "integer".into(),
+            jump_to_name: None,
         }
+    }
+
+    /// Where new tables are created and the type of their first column.
+    pub fn configure(&mut self, template: TableRef, int_type: &str) {
+        self.template = template;
+        self.int_type = int_type.to_owned();
+    }
+
+    /// Colours chosen for tables.
+    pub fn set_colors(&mut self, colors: BTreeMap<String, usize>) {
+        self.colors = colors;
+    }
+
+    /// Number of pending changes.
+    pub fn pending_count(&self) -> usize {
+        self.pending.change_count()
+    }
+
+    /// The pending changes as operations, or the reason they cannot be applied.
+    pub fn pending_ops(&self, caps: &Capabilities, sqlite: bool) -> Result<Vec<StructuralOp>, String> {
+        self.pending.to_ops(&self.structures, caps, sqlite)
+    }
+
+    /// Forgets every pending change and closes the settings window.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.settings = None;
+        self.reapply(None);
+    }
+
+    /// Positions of every table, new ones included (to keep them once the tables exist).
+    pub fn positions_all(&self) -> Positions {
+        self.diagram.tables.iter().zip(&self.positions).map(|(t, p)| (t.name.clone(), *p)).collect()
+    }
+
+    /// Stages a foreign key from the column of a link to the other one.
+    pub fn stage_foreign_key(&mut self, link: &DocLink, name: Option<String>, on_update: &str, on_delete: &str) -> Result<(), String> {
+        self.pending.stage_fk(&self.structures, (&link.from_table, &link.from_column), (&link.to_table, &link.to_column), name, on_update, on_delete)?;
+        self.reapply(None);
+        Ok(())
+    }
+
+    /// Stages the drop of a foreign key of the database.
+    pub fn stage_drop_foreign_key(&mut self, table: &str, constraint: &str) {
+        self.pending.stage_drop_fk(table, constraint);
+        self.reapply(None);
+    }
+
+    /// Type of a column as the diagram draws it (pending changes included).
+    pub fn column_type(&self, table: &str, column: &str) -> Option<String> {
+        self.diagram.tables.iter().find(|t| t.name == table)?.columns.iter().find(|c| c.name == column).map(|c| c.type_name.clone())
+    }
+
+    /// Adds a table called `untitled_table_N`, selects it and opens its settings.
+    pub fn add_table(&mut self) {
+        let name = self.pending.add_table(&self.structures, &self.template, &self.int_type);
+        self.reapply(None);
+        self.open_settings(&name);
+        self.jump_to_name = Some(name);
+    }
+
+    /// Marks a table to be dropped.
+    pub fn drop_table(&mut self, name: &str) {
+        self.settings = None;
+        self.pending.drop_table(name);
+        self.reapply(None);
+    }
+
+    /// Opens the settings window of a table.
+    fn open_settings(&mut self, name: &str) {
+        if self.markers.dropped.contains(name) {
+            return;
+        }
+        self.settings = Some(Settings { key: name.to_owned(), shown: name.to_owned(), page: SettingsPage::Columns });
+    }
+
+    /// Goes back one pending step.
+    pub fn undo(&mut self) {
+        self.settings = None;
+        if self.pending.undo() {
+            self.reapply(None);
+        }
+    }
+
+    /// Goes forward one pending step.
+    pub fn redo(&mut self) {
+        self.settings = None;
+        if self.pending.redo() {
+            self.reapply(None);
+        }
+    }
+
+    /// Shows or hides the lines guessed from column names.
+    pub fn set_show_inferred(&mut self, show: bool) {
+        self.show_inferred = show;
+    }
+
+    /// Whether the lines guessed from column names are shown (tests).
+    #[cfg(test)]
+    pub fn show_inferred(&self) -> bool {
+        self.show_inferred
+    }
+
+    /// Moves the keyboard focus to the search box.
+    pub fn focus_search(&mut self) {
+        self.focus_search = true;
+    }
+
+    /// Steps to the next (or previous) search match and returns its table.
+    fn step_found(&mut self, forward: bool) -> Option<usize> {
+        let n = self.found.len();
+        if n == 0 {
+            return None;
+        }
+        let next = match self.cursor {
+            None if forward => 0,
+            None => n - 1,
+            Some(c) if forward => (c + 1) % n,
+            Some(c) => (c + n - 1) % n,
+        };
+        self.cursor = Some(next);
+        Some(self.found[next])
     }
 
     /// Sets, or clears, the reason a foreign key of the database cannot be dropped.
@@ -172,16 +355,35 @@ impl DiagramTab {
         self.refresh_edges();
     }
 
-    /// Structure of the table called `name`.
-    pub fn structure(&self, name: &str) -> Option<&TableStructure> {
-        self.structures.iter().find(|s| s.table.name == name)
+    /// The diagram of the structures with the pending changes and the links drawn by the user.
+    fn build_diagram(&self) -> Diagram {
+        let mut d = Diagram::build(&self.pending.effective(&self.structures), self.sort);
+        d.add_manual(&self.links);
+        d
+    }
+
+    /// Draws again after a pending change: tables keep their positions by name (`renamed` is old and new name
+    /// of a table being renamed), the new ones are placed where they do not overlap.
+    fn reapply(&mut self, renamed: Option<(&str, &str)>) {
+        let mut by_name = self.positions_all();
+        let selected = self.selected.and_then(|i| self.diagram.tables.get(i)).map(|t| t.name.clone());
+        let selected = match (&selected, renamed) {
+            (Some(s), Some((old, new))) if s == old => Some(new.to_owned()),
+            _ => selected,
+        };
+        if let Some((old, new)) = renamed {
+            if let Some(p) = by_name.remove(old) {
+                by_name.insert(new.to_owned(), p);
+            }
+        }
+        self.relayout(Some(&by_name));
+        self.selected = selected.and_then(|n| self.diagram.tables.iter().position(|t| t.name == n));
+        self.refresh_search();
     }
 
     /// Rebuilds only the lines: the tables keep their order, so the positions stay valid.
     fn refresh_edges(&mut self) {
-        let mut d = Diagram::build(&self.structures, self.sort);
-        d.add_manual(&self.links);
-        self.diagram = d;
+        self.diagram = self.build_diagram();
         self.selected = self.selected.filter(|&i| i < self.positions.len());
     }
 
@@ -193,14 +395,23 @@ impl DiagramTab {
 
     /// Positions by table name, as kept in the store.
     fn positions_by_name(&self) -> Positions {
-        self.diagram.tables.iter().zip(&self.positions).map(|(t, p)| (t.name.clone(), *p)).collect()
+        self.diagram.tables.iter().zip(&self.positions).filter(|(t, _)| !self.markers.created.contains(&t.name)).map(|(t, p)| (t.name.clone(), *p)).collect()
     }
 
     /// Builds the diagram from the loaded tables with the current sort, and lays it out.
     /// A layout that does not come from the saved positions is saved.
     fn rebuild(&mut self, saved: Option<&Positions>) {
-        self.diagram = Diagram::build(&self.structures, self.sort);
-        self.diagram.add_manual(&self.links);
+        self.relayout(saved);
+        self.selected = None;
+        self.dragging = None;
+        self.fit_pending = true;
+        self.refresh_search();
+    }
+
+    /// Builds the diagram and lays it out, using `saved` positions when given (a new layout is saved).
+    fn relayout(&mut self, saved: Option<&Positions>) {
+        self.markers = self.pending.markers();
+        self.diagram = self.build_diagram();
         self.groups = self.diagram.groups();
         self.sizes = self.diagram.tables.iter().map(box_size).collect();
         self.positions = self.diagram.layout(&self.sizes);
@@ -208,16 +419,24 @@ impl DiagramTab {
             Some(saved) => self.diagram.apply_saved(&mut self.positions, &self.sizes, saved),
             None => self.save_pending = true,
         }
-        self.selected = None;
-        self.dragging = None;
-        self.fit_pending = true;
-        self.refresh_search();
+    }
+
+    /// True for a foreign key line that is not in the database yet.
+    fn edge_is_new(&self, e: &DiagramEdge) -> bool {
+        let from = &self.diagram.tables[e.from_table];
+        e.kind == EdgeKind::Real && (self.markers.created.contains(&from.name) || self.markers.new_fks.contains(&(from.name.clone(), from.columns[e.from_column].name.clone())))
+    }
+
+    /// Colour of table `i`: the one chosen by the user, else the one of its group.
+    fn color_of(&self, i: usize) -> Option<Color32> {
+        let chosen = self.colors.get(&self.diagram.tables[i].name).map(|&c| theme::DIAGRAM_GROUPS[c % theme::DIAGRAM_GROUPS.len()]);
+        chosen.or_else(|| group_color(self.groups[i]))
     }
 
     /// Recomputes the search matches after the text or the tables changed.
     fn refresh_search(&mut self) {
         self.found = self.diagram.search(&self.search);
-        self.found_at = 0;
+        self.cursor = None;
     }
 
     /// Number of tables in the diagram.
@@ -296,7 +515,7 @@ fn group_color(group: Option<usize>) -> Option<Color32> {
 }
 
 /// Draws the diagram tab and returns what the user asked for.
-pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
+pub fn show(ui: &mut Ui, tab: &mut DiagramTab, env: &DiagramEnv) -> Vec<DiagramAction> {
     let mut actions = Vec::new();
     let mut canvas_jump: Option<usize> = None;
     egui::TopBottomPanel::top(ui.id().with("diagram_bar")).exact_height(36.0).frame(egui::Frame::new().fill(theme::NAVY_DARK).inner_margin(egui::Margin::symmetric(10, 4))).show_inside(ui, |ui| {
@@ -327,20 +546,66 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
             if tab.sort != before {
                 tab.rebuild(None);
             }
-            if widgets::secondary_button(ui, "Rearrange").on_hover_text("Reload the schema and lay the tables out again").clicked() {
+            let clean = tab.pending.is_empty();
+            if ui.add_enabled(clean, egui::Button::new("Rearrange")).on_hover_text("Reload the schema and lay the tables out again").on_disabled_hover_text("Apply or discard the pending changes first").clicked() {
                 actions.push(DiagramAction::Rearrange);
             }
             ui.separator();
+            if widgets::secondary_button(ui, "Add table").on_hover_text("Add a table (applied with the other pending changes)").clicked() {
+                tab.add_table();
+            }
+            let selected = tab.selected.and_then(|i| tab.diagram.tables.get(i)).map(|t| t.name.clone());
+            if ui.add_enabled(selected.is_some(), egui::Button::new("Table settings")).on_hover_text("Name, colour, columns and indexes of the selected table").clicked() {
+                if let Some(n) = &selected {
+                    tab.open_settings(n);
+                }
+            }
+            if ui.add_enabled(tab.pending.can_undo(), egui::Button::new("Undo")).clicked() {
+                tab.undo();
+            }
+            if ui.add_enabled(tab.pending.can_redo(), egui::Button::new("Redo")).clicked() {
+                tab.redo();
+            }
+            let count = tab.pending.change_count();
+            if ui.add_enabled(count > 0, egui::Button::new(format!("Apply ({count})"))).on_hover_text("Write the pending changes to the database (Mod+S)").clicked() {
+                actions.push(DiagramAction::Apply);
+            }
+            if ui.add_enabled(count > 0, egui::Button::new("Discard")).on_hover_text("Forget the pending changes").clicked() {
+                tab.discard_pending();
+            }
+            ui.separator();
             let guessed = tab.inferred_count();
-            ui.add_enabled(guessed > 0, egui::Checkbox::new(&mut tab.show_inferred, format!("Inferred links ({guessed})"))).on_hover_text("Dashed lines for columns named like id_user or user_id when the database has no foreign key");
+            let switch = ui.add_enabled(guessed > 0, egui::Checkbox::new(&mut tab.show_inferred, format!("Inferred links ({guessed})"))).on_hover_text("Dashed lines for columns named like id_user or user_id when the database has no foreign key");
+            if switch.changed() {
+                actions.push(DiagramAction::SetInferred(tab.show_inferred));
+            }
+            if widgets::secondary_button(ui, "Export SVG").on_hover_text("Save the diagram as an SVG image").clicked() {
+                actions.push(export_svg(tab));
+            }
             ui.separator();
             let r = widgets::search_box(ui, &mut tab.search, "Find table or column");
+            if std::mem::take(&mut tab.focus_search) {
+                r.request_focus();
+            }
             if r.changed() {
                 tab.refresh_search();
             }
-            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !tab.found.is_empty() {
-                canvas_jump = Some(tab.found[tab.found_at % tab.found.len()]);
-                tab.found_at = (tab.found_at + 1) % tab.found.len();
+            // Enter and Down go to the next match, Shift+Enter and Up to the previous one
+            let step = if r.has_focus() || r.lost_focus() {
+                ui.input_mut(|i| {
+                    if i.consume_key(Modifiers::NONE, Key::ArrowUp) || (r.lost_focus() && i.consume_key(Modifiers::SHIFT, Key::Enter)) {
+                        Some(false)
+                    } else if i.consume_key(Modifiers::NONE, Key::ArrowDown) || (r.lost_focus() && i.consume_key(Modifiers::NONE, Key::Enter)) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(forward) = step {
+                canvas_jump = tab.step_found(forward);
                 r.request_focus();
             }
             if !tab.search.trim().is_empty() {
@@ -367,6 +632,9 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
     if tab.fit_pending {
         tab.fit(canvas);
     }
+    if let Some(name) = tab.jump_to_name.take() {
+        canvas_jump = tab.diagram.tables.iter().position(|t| t.name == name).or(canvas_jump);
+    }
     if let Some(i) = canvas_jump {
         tab.jump_to(i, canvas);
     }
@@ -376,7 +644,96 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
         actions.push(DiagramAction::Save(tab.positions_by_name()));
     }
     paint_diagram(&painter.with_clip_rect(canvas), tab, origin, resp.hover_pos());
+    settings_window(ui.ctx(), tab, env, &mut actions);
     actions
+}
+
+/// Colour swatches, the column and index editors and Delete table, in a window over the diagram.
+fn settings_window(ctx: &egui::Context, tab: &mut DiagramTab, env: &DiagramEnv, actions: &mut Vec<DiagramAction>) {
+    let Some(mut st) = tab.settings.take() else { return };
+    if !tab.pending.begin_edit(&tab.structures, &st.key) {
+        tab.pending.end_edit();
+        return;
+    }
+    let before = tab.pending.signature();
+    let mut colors = tab.colors.clone();
+    let mut open = true;
+    let mut delete = false;
+    let mut fk_hint = false;
+    // an existing table cannot get a foreign key from the column editor: the line is dragged in the diagram
+    let mut caps = env.caps.clone();
+    caps.add_fk_after_create = false;
+    let editor_env = StructEnv { caps: &caps, types: env.types, editable: true };
+    egui::Window::new(format!("Table settings: {}", st.shown)).id(egui::Id::new("diagram_table_settings")).open(&mut open).default_size([820.0, 460.0]).resizable(true).show(ctx, |ui| {
+        let Some(draft) = tab.pending.draft_mut(&st.key) else { return };
+        ui.horizontal(|ui| {
+            widgets::field_label(ui, "Colour");
+            let current = colors.get(&st.shown).copied();
+            if ui.selectable_label(current.is_none(), "Auto").clicked() {
+                colors.remove(&st.shown);
+            }
+            for (i, c) in theme::DIAGRAM_GROUPS.iter().enumerate() {
+                let (rect, r) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                ui.painter().rect_filled(rect, theme::RADIUS_CTRL, *c);
+                if current == Some(i) {
+                    ui.painter().rect_stroke(rect.expand(2.0), theme::RADIUS_CTRL, Stroke::new(2.0_f32, theme::TEXT), StrokeKind::Outside);
+                }
+                if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    colors.insert(st.shown.clone(), i);
+                }
+            }
+            ui.separator();
+            ui.selectable_value(&mut st.page, SettingsPage::Columns, "Columns");
+            ui.selectable_value(&mut st.page, SettingsPage::Indexes, "Indexes");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::danger_button(ui, "Delete table").clicked() {
+                    delete = true;
+                }
+            });
+        });
+        ui.separator();
+        match st.page {
+            SettingsPage::Columns => {
+                for a in structure::show_columns(ui, draft, &editor_env) {
+                    if matches!(a, StructAction::EditFk(_)) {
+                        fk_hint = true;
+                    }
+                }
+            }
+            SettingsPage::Indexes => structure::show_indexes(ui, draft, &editor_env),
+        }
+    });
+    if fk_hint {
+        actions.push(DiagramAction::Notice(false, "Drag from the edge of a column to another column to create a foreign key".into()));
+    }
+    let new_shown = tab.pending.draft_mut(&st.key).map(|d| d.new_name.trim().to_owned());
+    if tab.pending.signature() != before {
+        let renamed = new_shown.as_deref().filter(|n| *n != st.shown).map(|n| (st.shown.clone(), n.to_owned()));
+        if let Some((old, new)) = &renamed {
+            if let Some(c) = colors.remove(old) {
+                colors.insert(new.clone(), c);
+            }
+        }
+        tab.reapply(renamed.as_ref().map(|(o, n)| (o.as_str(), n.as_str())));
+        if let Some(n) = new_shown {
+            if tab.markers.created.contains(&n) {
+                st.key = n.clone();
+            }
+            st.shown = n;
+        }
+    }
+    if colors != tab.colors {
+        tab.colors = colors.clone();
+        actions.push(DiagramAction::SetColors(colors));
+    }
+    if delete {
+        tab.pending.end_edit();
+        tab.drop_table(&st.key);
+    } else if open {
+        tab.settings = Some(st);
+    } else {
+        tab.pending.end_edit();
+    }
 }
 
 /// Pan, zoom, table drag, selection and double click.
@@ -425,10 +782,36 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
         }
     }
     if resp.secondary_clicked() {
-        tab.menu_edge = resp.interact_pointer_pos().and_then(|p| edge_near(tab, p, origin));
+        let at = resp.interact_pointer_pos();
+        tab.menu_edge = at.and_then(|p| edge_near(tab, p, origin));
+        tab.menu_table = if tab.menu_edge.is_some() { None } else { at.and_then(|p| hit(p, tab).map(|t| (t, column_at(tab, p, origin).filter(|&(ct, _)| ct == t).map(|(_, c)| c)))) };
+        if let Some((t, _)) = tab.menu_table {
+            tab.selected = Some(t);
+        }
     }
     resp.context_menu(|ui| {
         widgets::flat_menu_style(ui);
+        if let Some((t, column)) = tab.menu_table {
+            let name = tab.diagram.tables[t].name.clone();
+            let dropped = tab.markers.dropped.contains(&name);
+            if ui.add_enabled(!dropped, egui::Button::new("Table settings...")).clicked() {
+                tab.open_settings(&name);
+                ui.close_menu();
+            }
+            if let Some(c) = column {
+                let col = tab.diagram.tables[t].columns[c].name.clone();
+                if ui.button(format!("Copy column name ({col})")).clicked() {
+                    ui.ctx().copy_text(col);
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            if ui.add_enabled(!dropped, egui::Button::new("Delete table")).on_disabled_hover_text("Already marked for deletion: use Undo to keep it").clicked() {
+                tab.drop_table(&name);
+                ui.close_menu();
+            }
+            return;
+        }
         let edge = tab.menu_edge.and_then(|i| tab.diagram.edges.get(i));
         match edge {
             Some(e) if e.kind == EdgeKind::Manual => {
@@ -436,6 +819,14 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
                     if let Some(l) = tab.link_of(e) {
                         actions.push(DiagramAction::DeleteLink(l));
                     }
+                    ui.close_menu();
+                }
+            }
+            Some(e) if e.kind == EdgeKind::Real && tab.edge_is_new(e) => {
+                if ui.button("Remove new foreign key").clicked() {
+                    let (table, column) = (tab.diagram.tables[e.from_table].name.clone(), tab.diagram.tables[e.from_table].columns[e.from_column].name.clone());
+                    tab.pending.unstage_fk(&table, &column);
+                    tab.reapply(None);
                     ui.close_menu();
                 }
             }
@@ -551,20 +942,22 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
     for e in tab.diagram.edges.iter().filter(|e| tab.show_inferred || e.kind != EdgeKind::Inferred) {
         let involved = focus.is_some_and(|f| f == e.from_table || f == e.to_table);
         let base = match e.kind {
-            EdgeKind::Real => group_color(tab.groups[e.from_table]).unwrap_or(theme::LABEL),
+            EdgeKind::Real if tab.edge_is_new(e) => theme::OK,
+            EdgeKind::Real => tab.color_of(e.from_table).unwrap_or(theme::LABEL),
             EdgeKind::Inferred => theme::LABEL,
             EdgeKind::Manual => theme::SECONDARY,
         };
         let color = if involved && e.kind == EdgeKind::Inferred { theme::TEXT } else if involved { base } else if focus.is_some() { base.gamma_multiply(0.25) } else { base.gamma_multiply(0.7) };
         let width = if involved { 2.0_f32 } else { 1.2_f32 };
-        paint_edge(p, tab, origin, e, Stroke::new(width, color));
+        paint_edge(p, tab, origin, e, Stroke::new(width, color), tab.edge_is_new(e));
     }
     for (i, t) in tab.diagram.tables.iter().enumerate() {
         let rect = tab.rect_of(i, origin);
         if !rect.intersects(p.clip_rect()) {
             continue;
         }
-        let color = group_color(tab.groups[i]);
+        let color = tab.color_of(i);
+        let (is_new, is_dropped, is_edited) = (tab.markers.created.contains(&t.name), tab.markers.dropped.contains(&t.name), tab.markers.edited.contains(&t.name));
         let selected = tab.selected == Some(i);
         let matched = tab.found.contains(&i);
         let hovered = hover.is_some_and(|h| rect.contains(h));
@@ -572,7 +965,11 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H * z));
         let header_fill = color.map_or(theme::FIELD_ROW_BG, |c| c.gamma_multiply(0.38));
         p.rect_filled(header, theme::RADIUS_CARD, header_fill);
-        let border = if selected {
+        let border = if is_dropped {
+            Stroke::new(2.0_f32, theme::ERROR)
+        } else if is_new {
+            Stroke::new(2.0_f32, theme::OK)
+        } else if selected {
             Stroke::new(2.0_f32, theme::SECONDARY)
         } else if matched {
             Stroke::new(2.0_f32, theme::TERTIARY)
@@ -585,7 +982,14 @@ fn paint_diagram(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: Optio
         if !show_text {
             continue;
         }
-        p.text(header.left_center() + vec2(8.0 * z, 0.0), Align2::LEFT_CENTER, &t.name, FontId::new(13.0 * z, theme::semibold()), theme::TEXT);
+        p.text(header.left_center() + vec2(8.0 * z, 0.0), Align2::LEFT_CENTER, &t.name, FontId::new(13.0 * z, theme::semibold()), if is_dropped { theme::MUTED } else { theme::TEXT });
+        let tag = if is_dropped { Some(("DROP", theme::ERROR)) } else if is_new { Some(("NEW", theme::OK)) } else if is_edited { Some(("EDITED", theme::TERTIARY)) } else { None };
+        if let Some((text, c)) = tag {
+            p.text(header.right_center() - vec2(8.0 * z, 0.0), Align2::RIGHT_CENTER, text, FontId::proportional(10.0 * z), c);
+        }
+        if is_dropped {
+            p.line_segment([header.left_center() + vec2(6.0 * z, 0.0), header.left_center() + vec2(8.0 * z + t.name.chars().count() as f32 * 7.5 * z, 0.0)], Stroke::new(1.5_f32, theme::ERROR));
+        }
         for (r, c) in t.columns.iter().enumerate() {
             let y = rect.min.y + (HEADER_H + ROW_H * r as f32 + ROW_H / 2.0) * z;
             let name_color = if c.is_pk { theme::TERTIARY } else if c.is_fk { theme::SECONDARY } else { theme::TEXT };
@@ -630,8 +1034,11 @@ fn paint_link_overlay(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, hover: 
 
 /// End points and control points of the line of one edge.
 fn edge_geometry(tab: &DiagramTab, origin: Pos2, e: &DiagramEdge) -> (Pos2, Pos2, Pos2, Pos2) {
-    let z = tab.zoom;
-    let (from, to) = (tab.rect_of(e.from_table, origin), tab.rect_of(e.to_table, origin));
+    edge_curve(tab.rect_of(e.from_table, origin), tab.rect_of(e.to_table, origin), e, tab.zoom)
+}
+
+/// End points and control points of the line of one edge, given the rectangles of its two tables and the zoom.
+fn edge_curve(from: Rect, to: Rect, e: &DiagramEdge, z: f32) -> (Pos2, Pos2, Pos2, Pos2) {
     let row_y = |r: Rect, col: Option<usize>| r.min.y + col.map_or(HEADER_H / 2.0, |c| HEADER_H + ROW_H * c as f32 + ROW_H / 2.0) * z;
     let (y1, y2) = (row_y(from, Some(e.from_column)), row_y(to, e.to_column));
     let reach = 40.0 * z;
@@ -654,11 +1061,11 @@ fn edge_geometry(tab: &DiagramTab, origin: Pos2, e: &DiagramEdge) -> (Pos2, Pos2
 }
 
 /// Draws the line of one edge between the two column rows: solid for a foreign key, dashed for the others.
-fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge, stroke: Stroke) {
+fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge, stroke: Stroke, pending: bool) {
     let z = tab.zoom;
     let (a, b, c1, c2) = edge_geometry(tab, origin, e);
     let curve = egui::epaint::CubicBezierShape::from_points_stroke([a, c1, c2, b], false, Color32::TRANSPARENT, stroke);
-    if e.kind != EdgeKind::Real {
+    if e.kind != EdgeKind::Real || pending {
         let dash = 6.0 * z.max(0.6);
         p.extend(egui::Shape::dashed_line(&curve.flatten(Some(0.5)), stroke, dash, dash * 0.7));
     } else {
@@ -670,4 +1077,122 @@ fn paint_edge(p: &egui::Painter, tab: &DiagramTab, origin: Pos2, e: &DiagramEdge
     let side = vec2(-dir.y, dir.x);
     let s = 6.0 * z.max(0.6);
     p.add(egui::epaint::PathShape::convex_polygon(vec![b, b - dir * s + side * s * 0.5, b - dir * s - side * s * 0.5], stroke.color, Stroke::NONE));
+}
+
+/// Asks where to save, writes the diagram as SVG and reports the outcome.
+fn export_svg(tab: &DiagramTab) -> DiagramAction {
+    let Some(path) = rfd::FileDialog::new().set_file_name("diagram.svg").add_filter("SVG image", &["svg"]).save_file() else {
+        return DiagramAction::Notice(false, "Export cancelled".into());
+    };
+    match std::fs::write(&path, tab.to_svg()) {
+        Ok(()) => DiagramAction::Notice(false, format!("Diagram saved to {}", path.display())),
+        Err(e) => DiagramAction::Notice(true, format!("cannot save the diagram: {e}")),
+    }
+}
+
+/// `#rrggbb` form of a colour (the alpha is returned apart, as 0 to 1).
+fn hex(c: Color32) -> (String, f32) {
+    let c = c.to_srgba_unmultiplied();
+    (format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]), f32::from(c[3]) / 255.0)
+}
+
+/// Escapes the characters that mean something in XML text.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+impl DiagramTab {
+    /// The diagram as an SVG document: the boxes and the visible lines at zoom 1.
+    pub fn to_svg(&self) -> String {
+        use std::fmt::Write;
+        let rects: Vec<Rect> = (0..self.positions.len()).map(|i| Rect::from_min_size(pos2(self.positions[i].0, self.positions[i].1), vec2(self.sizes[i].0, self.sizes[i].1))).collect();
+        let bounds = rects.iter().fold(Rect::NOTHING, |acc, r| acc.union(*r)).expand(MARGIN);
+        let bounds = if rects.is_empty() { Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0)) } else { bounds };
+        let mut out = String::new();
+        let _ = writeln!(out, r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x} {y} {w} {h}" font-family="sans-serif">"#, x = bounds.min.x, y = bounds.min.y, w = bounds.width(), h = bounds.height());
+        let (bg, _) = hex(theme::DEEP_DARK);
+        let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{bg}"/>"#, bounds.min.x, bounds.min.y, bounds.width(), bounds.height());
+        for e in self.diagram.edges.iter().filter(|e| self.show_inferred || e.kind != EdgeKind::Inferred) {
+            let base = match e.kind {
+                EdgeKind::Real => self.color_of(e.from_table).unwrap_or(theme::LABEL),
+                EdgeKind::Inferred => theme::LABEL,
+                EdgeKind::Manual => theme::SECONDARY,
+            };
+            let (a, b, c1, c2) = edge_curve(rects[e.from_table], rects[e.to_table], e, 1.0);
+            let (color, _) = hex(base);
+            let dash = if e.kind == EdgeKind::Real { "" } else { r#" stroke-dasharray="6 4""# };
+            let _ = writeln!(out, r#"<path d="M {} {} C {} {}, {} {}, {} {}" fill="none" stroke="{color}" stroke-width="1.5"{dash}/>"#, a.x, a.y, c1.x, c1.y, c2.x, c2.y, b.x, b.y);
+            let _ = writeln!(out, r#"<circle cx="{}" cy="{}" r="2.5" fill="{color}"/>"#, a.x, a.y);
+        }
+        for (i, t) in self.diagram.tables.iter().enumerate() {
+            let r = rects[i];
+            let color = self.color_of(i);
+            let (fill, _) = hex(theme::SURFACE);
+            let (head, _) = hex(color.map_or(theme::FIELD_ROW_BG, |c| c.gamma_multiply(0.38)));
+            let (border, _) = hex(color.map_or(theme::FIELD_ROW_BORDER, |c| c.gamma_multiply(0.7)));
+            let (text, _) = hex(theme::TEXT);
+            let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{}" rx="6" fill="{fill}" stroke="{border}"/>"#, r.min.x, r.min.y, r.width(), r.height());
+            let _ = writeln!(out, r#"<rect x="{}" y="{}" width="{}" height="{HEADER_H}" rx="6" fill="{head}"/>"#, r.min.x, r.min.y, r.width());
+            let _ = writeln!(out, r#"<text x="{}" y="{}" font-size="13" font-weight="600" fill="{text}" dominant-baseline="middle">{}</text>"#, r.min.x + 8.0, r.min.y + HEADER_H / 2.0, xml_escape(&t.name));
+            for (row, c) in t.columns.iter().enumerate() {
+                let y = r.min.y + HEADER_H + ROW_H * row as f32 + ROW_H / 2.0;
+                let (name_color, _) = hex(if c.is_pk { theme::TERTIARY } else if c.is_fk { theme::SECONDARY } else { theme::TEXT });
+                let tag = if c.is_pk { "PK " } else if c.is_fk { "FK " } else { "" };
+                let (muted, _) = hex(theme::MUTED);
+                let _ = writeln!(out, r#"<text x="{}" y="{y}" font-size="11.5" fill="{name_color}" dominant-baseline="middle">{}</text>"#, r.min.x + 8.0, xml_escape(&format!("{tag}{}", c.name)));
+                let _ = writeln!(out, r#"<text x="{}" y="{y}" font-size="10.5" fill="{muted}" text-anchor="end" dominant-baseline="middle">{}</text>"#, r.max.x - 8.0, xml_escape(&c.type_name));
+            }
+        }
+        out.push_str("</svg>\n");
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbzilla_core::model::{ColumnMeta, TableRef};
+
+    fn column(name: &str, pk: bool) -> ColumnMeta {
+        ColumnMeta { name: name.into(), type_name: "int".into(), nullable: false, default: None, is_pk: pk, fk: None, ordinal: 0, extra: Default::default() }
+    }
+
+    fn tab(names: &[&str]) -> DiagramTab {
+        let tables = names.iter().map(|n| TableStructure { table: TableRef { name: (*n).into(), ..Default::default() }, columns: vec![column("id", true), column("name", false)], ..Default::default() }).collect();
+        let mut t = DiagramTab::new();
+        t.set_tables(tables, Vec::new(), &Positions::new(), Vec::new());
+        t
+    }
+
+    #[test]
+    fn search_steps_forward_and_back_and_wraps() {
+        let mut t = tab(&["alpha", "beta", "gamma"]);
+        t.search = "a".into();
+        t.refresh_search();
+        assert_eq!(t.found.len(), 3);
+        let first = t.step_found(true).unwrap();
+        let second = t.step_found(true).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(t.step_found(false), Some(first), "Up goes back");
+        assert_eq!(t.step_found(false), t.found.last().copied(), "and wraps to the last match");
+        t.search = "zzz".into();
+        t.refresh_search();
+        assert_eq!(t.step_found(true), None);
+    }
+
+    #[test]
+    fn svg_has_one_box_per_table_and_escapes_names() {
+        let t = tab(&["a<b", "orders"]);
+        let svg = t.to_svg();
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains("a&lt;b"));
+        assert!(!svg.contains("a<b"));
+        assert_eq!(svg.matches(r#"rx="6" fill=""#).count(), 4, "a box and a header for each table");
+    }
+
+    #[test]
+    fn svg_of_an_empty_diagram_is_valid() {
+        assert!(DiagramTab::new().to_svg().contains("</svg>"));
+    }
 }

@@ -67,6 +67,7 @@ pub enum SidebarAction {
     ExportTable(TableRef),
     ImportInto(TableRef),
     NewTable,
+    ShowDiagram,
 }
 
 /// Section title of an object kind.
@@ -324,6 +325,10 @@ fn item_row(ui: &mut Ui, o: &ObjectInfo, active: bool) -> Option<SidebarAction> 
         }
         if matches!(o.kind, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView) && ui.button("Open structure").clicked() {
             action = Some(SidebarAction::OpenStructure(o.table.clone()));
+            ui.close_menu();
+        }
+        if o.kind == ObjectKind::Table && ui.button("Show diagram").clicked() {
+            action = Some(SidebarAction::ShowDiagram);
             ui.close_menu();
         }
         if ui.button("Copy name").clicked() {
