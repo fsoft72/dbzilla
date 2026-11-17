@@ -13,6 +13,7 @@ pub mod diagram;
 pub mod metrics;
 pub mod backup;
 pub mod process;
+pub mod users;
 pub mod filters;
 pub mod palette;
 pub mod pending;
