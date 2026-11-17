@@ -5,6 +5,7 @@ use crate::glyphs::Ico;
 use crate::theme;
 use dbzilla_core::diagram::{Diagram, DiagramSort};
 use dbzilla_core::model::TableStructure;
+use dbzilla_store::diagrams::Positions;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 /// Height of the table header and of one column row, at zoom 1.
@@ -29,6 +30,8 @@ pub enum DiagramAction {
     OpenTable(String),
     /// Go back to the workspace (close the tab).
     Close,
+    /// The positions changed: keep them for the next time.
+    Save(Positions),
 }
 
 /// State of a diagram tab.
@@ -50,6 +53,10 @@ pub struct DiagramTab {
     search: String,
     found: Vec<usize>,
     found_at: usize,
+    /// The next reload ignores the saved positions (Rearrange).
+    forget_saved: bool,
+    /// The positions changed and must be handed to the store.
+    save_pending: bool,
 }
 
 impl DiagramTab {
@@ -72,28 +79,45 @@ impl DiagramTab {
             search: String::new(),
             found: Vec::new(),
             found_at: 0,
+            forget_saved: false,
+            save_pending: false,
         }
     }
 
-    /// Takes the tables read from the database and lays them out.
-    pub fn set_tables(&mut self, tables: Vec<TableStructure>, skipped: Vec<String>) {
+    /// Takes the tables read from the database and lays them out, using the saved positions
+    /// unless a Rearrange asked for a fresh layout. Returns the positions to save when the layout is new.
+    pub fn set_tables(&mut self, tables: Vec<TableStructure>, skipped: Vec<String>, saved: &Positions) -> Option<Positions> {
         self.structures = tables;
         self.skipped = skipped;
         self.loading = false;
-        self.rebuild();
+        let use_saved = !self.forget_saved && !saved.is_empty();
+        self.forget_saved = false;
+        self.rebuild(use_saved.then_some(saved));
+        std::mem::take(&mut self.save_pending).then(|| self.positions_by_name())
     }
 
-    /// Marks the tab as reloading.
-    pub fn start_loading(&mut self) {
+    /// Marks the tab as reloading with a fresh layout (Rearrange).
+    pub fn start_rearrange(&mut self) {
         self.loading = true;
+        self.forget_saved = true;
+    }
+
+    /// Positions by table name, as kept in the store.
+    fn positions_by_name(&self) -> Positions {
+        self.diagram.tables.iter().zip(&self.positions).map(|(t, p)| (t.name.clone(), *p)).collect()
     }
 
     /// Builds the diagram from the loaded tables with the current sort, and lays it out.
-    fn rebuild(&mut self) {
+    /// A layout that does not come from the saved positions is saved.
+    fn rebuild(&mut self, saved: Option<&Positions>) {
         self.diagram = Diagram::build(&self.structures, self.sort);
         self.groups = self.diagram.groups();
         self.sizes = self.diagram.tables.iter().map(box_size).collect();
         self.positions = self.diagram.layout(&self.sizes);
+        match saved {
+            Some(saved) => self.diagram.apply_saved(&mut self.positions, &self.sizes, saved),
+            None => self.save_pending = true,
+        }
         self.selected = None;
         self.dragging = None;
         self.fit_pending = true;
@@ -116,6 +140,12 @@ impl DiagramTab {
     #[cfg(test)]
     pub fn edge_count(&self) -> usize {
         self.diagram.edges.len()
+    }
+
+    /// Position of the table called `name`.
+    #[cfg(test)]
+    pub fn position_of(&self, name: &str) -> Option<(f32, f32)> {
+        self.diagram.tables.iter().position(|t| t.name == name).map(|i| self.positions[i])
     }
 
     /// Screen rectangle of table `i`.
@@ -200,7 +230,7 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
                 ui.selectable_value(&mut tab.sort, DiagramSort::ColumnCount, "Column count");
             });
             if tab.sort != before {
-                tab.rebuild();
+                tab.rebuild(None);
             }
             if widgets::secondary_button(ui, "Rearrange").on_hover_text("Reload the schema and lay the tables out again").clicked() {
                 actions.push(DiagramAction::Rearrange);
@@ -243,6 +273,9 @@ pub fn show(ui: &mut Ui, tab: &mut DiagramTab) -> Vec<DiagramAction> {
         tab.jump_to(i, canvas);
     }
     handle_input(ui, tab, &resp, origin, &mut actions);
+    if std::mem::take(&mut tab.save_pending) {
+        actions.push(DiagramAction::Save(tab.positions_by_name()));
+    }
     paint_diagram(&painter.with_clip_rect(canvas), tab, origin, resp.hover_pos());
     actions
 }
@@ -276,8 +309,8 @@ fn handle_input(ui: &Ui, tab: &mut DiagramTab, resp: &egui::Response, origin: Po
             None => tab.pan += resp.drag_delta(),
         }
     }
-    if resp.drag_stopped() {
-        tab.dragging = None;
+    if resp.drag_stopped() && tab.dragging.take().is_some() {
+        tab.save_pending = true;
     }
     if resp.clicked() {
         tab.selected = resp.interact_pointer_pos().and_then(|p| hit(p, tab));

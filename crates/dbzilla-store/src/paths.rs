@@ -35,6 +35,11 @@ impl AppPaths {
         self.root.join("connections.json")
     }
 
+    /// `diagrams.json` (table positions of the ER diagrams).
+    pub fn diagrams_file(&self) -> PathBuf {
+        self.root.join("diagrams.json")
+    }
+
     /// `tags.json`.
     pub fn tags_file(&self) -> PathBuf {
         self.root.join("tags.json")

@@ -2,6 +2,7 @@
 //! Pure data and geometry, no UI and no I/O.
 
 use crate::model::TableStructure;
+use std::collections::BTreeMap;
 
 /// Gap between two tables in the automatic layout.
 const GAP_X: f32 = 80.0;
@@ -162,6 +163,34 @@ impl Diagram {
             row_height = row_height.max(block.height);
         }
         out
+    }
+
+    /// Puts the saved position on every table that has one. The other tables keep the position
+    /// they have and are moved below everything else, in a row, when they would sit on a saved table.
+    pub fn apply_saved(&self, positions: &mut [(f32, f32)], sizes: &[(f32, f32)], saved: &BTreeMap<String, (f32, f32)>) {
+        if positions.len() != self.tables.len() || sizes.len() != positions.len() || saved.is_empty() {
+            return;
+        }
+        let mut placed = vec![false; positions.len()];
+        for (i, t) in self.tables.iter().enumerate() {
+            if let Some(p) = saved.get(&t.name) {
+                positions[i] = *p;
+                placed[i] = true;
+            }
+        }
+        let overlaps = |a: usize, b: usize, pos: &[(f32, f32)]| pos[a].0 < pos[b].0 + sizes[b].0 && pos[b].0 < pos[a].0 + sizes[a].0 && pos[a].1 < pos[b].1 + sizes[b].1 && pos[b].1 < pos[a].1 + sizes[a].1;
+        let mut bottom = (0..positions.len()).filter(|&i| placed[i]).map(|i| positions[i].1 + sizes[i].1).fold(0.0, f32::max);
+        let left = (0..positions.len()).filter(|&i| placed[i]).map(|i| positions[i].0).fold(f32::MAX, f32::min);
+        let mut x = left;
+        let clash: Vec<usize> = (0..positions.len()).filter(|&i| !placed[i] && (0..positions.len()).any(|j| placed[j] && overlaps(i, j, positions))).collect();
+        if clash.is_empty() {
+            return;
+        }
+        bottom += GAP_Y;
+        for i in clash {
+            positions[i] = (x, bottom);
+            x += sizes[i].0 + GAP_X;
+        }
     }
 
     /// Layered layout of the tables of one linked group.
@@ -363,6 +392,42 @@ mod tests {
         let p = d.layout(&[(100.0, 50.0), (100.0, 50.0)]);
         assert_eq!(p.len(), 2);
         assert_ne!(p[0], p[1]);
+    }
+
+    #[test]
+    fn saved_positions_win_and_new_tables_do_not_land_on_them() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        let sizes = vec![(100.0, 50.0); 4];
+        let mut p = d.layout(&sizes);
+        // audit, customers and items were saved; orders is new and its auto position is on top of customers
+        let saved: BTreeMap<String, (f32, f32)> = [("audit".to_owned(), (0.0, 0.0)), ("customers".to_owned(), (500.0, 500.0)), ("items".to_owned(), (700.0, 100.0))].into();
+        p[3] = (510.0, 510.0);
+        d.apply_saved(&mut p, &sizes, &saved);
+        assert_eq!(p[0], (0.0, 0.0));
+        assert_eq!(p[1], (500.0, 500.0));
+        assert_eq!(p[2], (700.0, 100.0));
+        assert!(p[3].1 >= 550.0, "the new table moves below the saved ones: {:?}", p[3]);
+    }
+
+    #[test]
+    fn a_new_table_that_does_not_clash_keeps_its_auto_position() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        let sizes = vec![(100.0, 50.0); 4];
+        let mut p = d.layout(&sizes);
+        let auto = p[3];
+        let saved: BTreeMap<String, (f32, f32)> = [("audit".to_owned(), (5000.0, 5000.0))].into();
+        d.apply_saved(&mut p, &sizes, &saved);
+        assert_eq!(p[3], auto);
+    }
+
+    #[test]
+    fn apply_saved_with_nothing_saved_changes_nothing() {
+        let d = Diagram::build(&shop(), DiagramSort::Name);
+        let sizes = vec![(100.0, 50.0); 4];
+        let mut p = d.layout(&sizes);
+        let before = p.clone();
+        d.apply_saved(&mut p, &sizes, &BTreeMap::new());
+        assert_eq!(p, before);
     }
 
     #[test]

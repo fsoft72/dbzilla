@@ -34,6 +34,7 @@ use dbzilla_drivers::DatabaseInfo;
 use dbzilla_session::gate::{gate_check, verify_password, GateDecision};
 use dbzilla_session::{Command, Event, PageRequest, RequestId, SessionHandle};
 use dbzilla_store::connections::StoredConnection;
+use dbzilla_store::diagrams::DiagramStore;
 use dbzilla_store::history::{HistoryEntry, HistoryKind, HistoryStore};
 use dbzilla_store::queries::{QueryEntry, QuerySort, QueryStore};
 use dbzilla_store::settings::Settings;
@@ -161,6 +162,7 @@ const FK_ACTIONS: [&str; 5] = ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "
 /// The persistent stores a workspace writes to.
 pub struct Stores {
     pub history: HistoryStore,
+    pub diagrams: DiagramStore,
     pub queries: QueryStore,
 }
 
@@ -316,6 +318,7 @@ pub struct Workspace {
     pub keywords: HashSet<String>,
     pub schema_loaded: bool,
     history: HistoryStore,
+    diagrams: DiagramStore,
     queries: QueryStore,
     history_cache: Vec<HistoryEntry>,
     history_for: Option<String>,
@@ -395,6 +398,7 @@ impl Workspace {
             keywords: sqlhl::keyword_set(dialect_for(conn_driver).keywords()),
             schema_loaded: false,
             history: stores.history,
+            diagrams: stores.diagrams,
             queries: stores.queries,
             history_cache: Vec::new(),
             history_for: None,
@@ -559,8 +563,10 @@ impl Workspace {
             }
             Event::Structure(st) => self.apply_structure(*st),
             Event::Diagram { tables, skipped, .. } => {
-                if let Some(d) = self.diagram_tab_mut() {
-                    d.set_tables(tables, skipped);
+                let saved = self.diagrams.load(&self.diagram_key());
+                let fresh = self.diagram_tab_mut().and_then(|d| d.set_tables(tables, skipped, &saved));
+                if let Some(positions) = fresh {
+                    self.save_diagram_positions(positions);
                 }
             }
             Event::StatementStarted { req, index, sql } => self.on_statement_started(req, index, sql),
@@ -1003,6 +1009,21 @@ impl Workspace {
         })
     }
 
+    /// Key under which the positions of the current diagram are saved.
+    fn diagram_key(&self) -> String {
+        let schema = if self.caps.schemas { Some(self.current_schema.as_deref().unwrap_or("public")) } else { None };
+        let c = &self.conn;
+        let server = format!("{:?}://{}@{}:{}/{}", c.driver, c.user, c.host, c.port.map(|p| p.to_string()).unwrap_or_default(), c.database);
+        DiagramStore::key(&server, &self.current_db, schema)
+    }
+
+    /// Keeps the table positions of the current diagram; a failure becomes a notice.
+    fn save_diagram_positions(&mut self, positions: dbzilla_store::diagrams::Positions) {
+        if let Err(e) = self.diagrams.save(&self.diagram_key(), positions) {
+            self.notices.push((true, format!("cannot save the diagram positions: {e}")));
+        }
+    }
+
     /// Asks the session for every table of the current schema.
     fn request_diagram(&mut self) {
         let schema = if self.caps.schemas { Some(self.current_schema.clone().unwrap_or_else(|| "public".into())) } else { None };
@@ -1035,10 +1056,11 @@ impl Workspace {
             DiagramAction::Close => self.retain_tabs(|t| t.id != id),
             DiagramAction::Rearrange => {
                 if let Some(d) = self.diagram_tab_mut() {
-                    d.start_loading();
+                    d.start_rearrange();
                 }
                 self.request_diagram();
             }
+            DiagramAction::Save(positions) => self.save_diagram_positions(positions),
             DiagramAction::OpenTable(name) => {
                 let table = self.objects.iter().find(|o| o.table.name == name).map(|o| o.table.clone());
                 if let Some(t) = table {
@@ -2910,7 +2932,7 @@ mod tests {
         conn.database = path.to_string_lossy().into_owned();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(ConnectConfig { driver: DriverId::Sqlite, host: String::new(), port: None, user: String::new(), password: None, database: conn.database.clone(), ssl: SslMode::Disabled, bootstrap: vec![] }));
-        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), queries: QueryStore::new(dir.path().join("queries")) };
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), queries: QueryStore::new(dir.path().join("queries")) };
         let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && !w.objects.is_empty());
         (dir, path, ws)
@@ -3342,6 +3364,33 @@ mod tests {
         assert!(ws.diagram_tab_mut().is_none());
     }
 
+    /// Moved tables come back where they were; Rearrange forgets them.
+    #[test]
+    fn diagram_positions_are_kept_between_openings() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (_dir, path, mut ws) = connected(&rt);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE p (id INTEGER PRIMARY KEY);").unwrap();
+        ws.load_schema();
+        wait(&mut ws, |w| w.objects.iter().any(|o| o.table.name == "p"));
+        let diagram_id = |w: &Workspace| w.tab_metas().iter().find(|t| t.target == TabTarget::Diagram).map(|t| t.id).unwrap();
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        let auto = ws.diagram_tab_mut().unwrap().position_of("p").unwrap();
+        assert!(!ws.diagrams.load(&ws.diagram_key()).is_empty(), "the first layout is saved");
+        let moved: dbzilla_store::diagrams::Positions = [("p".to_owned(), (1234.0, 567.0)), ("t".to_owned(), (0.0, 0.0))].into();
+        let id = diagram_id(&ws);
+        ws.diagram_action(id, DiagramAction::Save(moved));
+        ws.diagram_action(id, DiagramAction::Close);
+        ws.open_diagram();
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert_eq!(ws.diagram_tab_mut().unwrap().position_of("p"), Some((1234.0, 567.0)));
+        let id = diagram_id(&ws);
+        ws.diagram_action(id, DiagramAction::Rearrange);
+        wait(&mut ws, |w| w.diagram_tab_mut().is_some_and(|d| !d.loading));
+        assert_eq!(ws.diagram_tab_mut().unwrap().position_of("p"), Some(auto));
+        assert_eq!(ws.diagrams.load(&ws.diagram_key()).get("p"), Some(&auto));
+    }
+
     /// Search in Database scans every table and lists the ones with matches.
     #[test]
     fn search_in_database_finds_tables() {
@@ -3425,7 +3474,7 @@ mod tests {
         conn.database = cfg.database.clone();
         let session = spawn(rt.handle(), SessionConfig { query_timeout: None, keep_alive: None }, default_factory(), Arc::new(|| {}));
         session.send(Command::Connect(cfg));
-        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), queries: QueryStore::new(dir.path().join("queries")) };
+        let stores = Stores { history: HistoryStore::new(dir.path().join("history"), true), diagrams: DiagramStore::new(dir.path().join("diagrams.json")), queries: QueryStore::new(dir.path().join("queries")) };
         let mut ws = Workspace::new(conn, session, 1000, 300, None, stores);
         wait(&mut ws, |w| matches!(w.status, WsStatus::Connected(_)) && w.schema_loaded);
         (dir, ws)
