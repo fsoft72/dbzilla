@@ -11,6 +11,7 @@ pub mod dbsearch;
 pub mod details;
 pub mod diagram;
 pub mod metrics;
+pub mod process;
 pub mod filters;
 pub mod palette;
 pub mod pending;
