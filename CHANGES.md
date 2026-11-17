@@ -66,3 +66,6 @@
 ## 2026-11-17
 - Keymap editor (SPEC 14.5): Keymap tab in Settings, custom shortcuts saved in `settings.json` (only the differences from the defaults), validation (needs `Mod` or `Ctrl` unless a function key), conflict check where a global action overlaps every context, global shortcuts paused while a shortcut is being typed.
 - Start screen shows the application version, the author and license credits and clickable links to the author and the project page.
+
+## 2026-11-17 SQL Server driver
+- Task 1: `mssql` Cargo feature with `tiberius` 0.13 (rustls only, one rustls in the tree, no OpenSSL), TLS spike against a Docker SQL Server (`DBZILLA_TEST_MSSQL=1`).

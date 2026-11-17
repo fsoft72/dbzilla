@@ -13,6 +13,9 @@ pub mod postgres;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
+#[cfg(feature = "mssql")]
+pub mod mssql;
+
 pub use traits::*;
 
 use dbzilla_core::dialect::DriverId;

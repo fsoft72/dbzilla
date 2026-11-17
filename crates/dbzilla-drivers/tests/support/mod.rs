@@ -50,6 +50,11 @@ pub fn start(label: &str, image: &str, env: &[(&str, &str)], inner_port: u16, ar
     Some(Container { id, port })
 }
 
+/// True when SQL Server tests are switched on (`DBZILLA_TEST_MSSQL=1`): the container is slow and big.
+pub fn mssql_enabled() -> bool {
+    std::env::var("DBZILLA_TEST_MSSQL").map(|v| v == "1").unwrap_or(false) && docker_available()
+}
+
 /// Default options for tests.
 pub fn opts() -> QueryOpts {
     QueryOpts { limit: None, timeout: Duration::from_secs(60), batch_size: 200 }
