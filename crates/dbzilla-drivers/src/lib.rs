@@ -43,6 +43,8 @@ pub fn driver_for(id: DriverId) -> DriverResult<Box<dyn Driver>> {
         DriverId::Postgres => Ok(Box::new(postgres::PostgresDriver::new())),
         #[cfg(feature = "mysql")]
         DriverId::MySql => Ok(Box::new(mysql::MySqlDriver::new())),
+        #[cfg(feature = "mssql")]
+        DriverId::SqlServer => Ok(Box::new(mssql::MsSqlDriver::new())),
         #[allow(unreachable_patterns)]
         other => Err(DriverError::Unsupported(format!("driver {other:?} is not compiled into this build"))),
     }
