@@ -40,6 +40,14 @@ pub enum CompleteKey {
     TabOnly,
 }
 
+/// Key bindings of the SQL editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum KeyBinding {
+    #[default]
+    Default,
+    Vim,
+}
+
 /// Indentation character.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum IndentWith {
@@ -132,6 +140,7 @@ pub struct Settings {
     pub indent_with: IndentWith,
     pub indent_width: u8,
     pub indent_type: IndentType,
+    pub key_binding: KeyBinding,
     pub query_params: QueryParamSettings,
     pub editor_font_size: f32,
     pub table_row_padding: f32,
@@ -165,6 +174,7 @@ impl Default for Settings {
             indent_with: IndentWith::default(),
             indent_width: 4,
             indent_type: IndentType::default(),
+            key_binding: KeyBinding::default(),
             query_params: QueryParamSettings::default(),
             editor_font_size: DEFAULT_FONT_SIZE,
             table_row_padding: 12.0,

@@ -1182,6 +1182,7 @@ dependencies = [
  "dbzilla-mcp",
  "dbzilla-session",
  "dbzilla-store",
+ "dbzilla-vim",
  "dtor",
  "eframe",
  "egui_dock",

@@ -591,7 +591,7 @@ Toolbar **SQL File**, `Mod+E`, or `Mod+T`. When no SQL editor is focused, `Mod+R
 - Transformations: upper/lower/capitalize.
 - Font size `Mod+=` / `Mod+-`.
 - Show invisible characters (off by default), Wrap lines (on by default).
-- Key binding: **Sublime (default)** or **Vim** (Vim mode optional/stretch).
+- Key binding: **Sublime (default)** or **Vim** .
 - **Auto-save tabs** on close/reopen: *Do not save* | *Only first SQL tab (default)* | *Save all tabs*; saved on run/format/close.
 
 ### 10.5 Autocomplete **[DOC]**
@@ -920,7 +920,7 @@ Built-in MCP server so external agents can use the app's connections.
 | **M3** | SQL editor v1: highlight, run current/all, row limit, streaming results, result tabs, messages, history, saved queries, autocomplete (keywords/tables/columns), format, comments, find | Run multi-statement script, named tabs, history persisted |
 | **M4** | Structure/Index tabs (columns, constraints, PK/FK, defaults, indexes), create/rename/clone/truncate/drop table, views, copy-script-as, filters (all operators, multi-filter AND/OR, quick filters, column filter), Search in Database | Create table from GUI; filtered grid; DDL snapshots pass |
 | **M5** | PostgreSQL + MySQL/MariaDB drivers, TLS, URL import/export/Copy-as-URL, safe-mode levels, keychain, password modes, bootstrap commands, keep-alive/timeout, database list (new/rename/drop), cancel via side connection | Parity of M1–M4 on PG/MySQL; safe-mode prompts work |
-| **M6** | SSH tunnel; query parameters; Vim key binding (stretch); workspaces/database stack; session restore; connection import/export files | Connect through SSH container |
+| **M6** | SSH tunnel; query parameters; workspaces/database stack; session restore; connection import/export files | Connect through SSH container |
 | **M7** | Import wizards (CSV/JSON/SQL) and Export (CSV/JSON/SQL/XLSX, gzip, filename patterns, column selection, background jobs + notifications); backup/restore via external tools | Round-trip export→import equal data |
 | **M8** | Tier-2 drivers (DuckDB, MSSQL, CockroachDB/Redshift/Greenplum via PG, ClickHouse); process list; user management; encoding menu; foreign-key navigation | Feature matrix of §5.2 enforced via capabilities |
 | **M9** | ER diagram, Metrics Board, charts from results/comments; Redis/Mongo (optional) | Edit FK in diagram → commit |

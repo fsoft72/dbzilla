@@ -46,5 +46,5 @@ available. Always run `cargo clippy --all-targets -- -D warnings` before committ
 | `dbzilla-mcp` | MCP server, tokens, permissions, stdio bridge |
 | `dbzilla-app` | The egui application |
 
-Not included yet: ER diagram, metrics, AI assistant, SSH tunnels, multi-window, Vim mode,
-other databases, light theme, packaging. See `SPEC.md` and `CHANGES.md`.
+Not included yet: ER diagram, metrics, AI assistant, SSH tunnels,
+other databases, packaging. See `SPEC.md` and `CHANGES.md`.

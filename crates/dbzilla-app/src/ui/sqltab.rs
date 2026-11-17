@@ -15,6 +15,9 @@ use dbzilla_core::splitter::{split_statements, Statement};
 use dbzilla_store::settings::CompleteKey;
 use dbzilla_session::RequestId;
 use eframe::egui::text::{CCursor, CCursorRange, LayoutJob};
+use super::vimed::{self, VimEditor};
+use dbzilla_vim::editing::EditSettings;
+use dbzilla_vim::VimEffect;
 use eframe::egui::{self, Align, Align2, FontId, Key, Layout, Modifiers, Order, RichText, Sense, Shape, Stroke, TextEdit, Ui};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -129,6 +132,8 @@ pub struct SqlTab {
     pub saved_text: String,
     pub last_edit: Option<Instant>,
     pub complete: Completion,
+    /// Vim state, present while the vim key binding is on.
+    vim: Option<Box<super::vimed::VimEditor>>,
     last_key: u64,
     edit_id: egui::Id,
     hl: Option<(u64, LayoutJob)>,
@@ -159,6 +164,7 @@ impl SqlTab {
             saved_text: String::new(),
             last_edit: None,
             complete: Completion::default(),
+            vim: None,
             last_key: 0,
             edit_id: egui::Id::new(("sql_editor", no)),
             hl: None,
@@ -223,6 +229,10 @@ pub struct SqlEnv<'a> {
     pub complete_key: CompleteKey,
     pub quote: &'a dyn Fn(&str) -> String,
     pub completion: bool,
+    /// The vim key binding is on.
+    pub vim: bool,
+    pub tab_width: usize,
+    pub insert_spaces: bool,
     /// Changes whenever the schema knowledge changes, so suggestions are recomputed.
     pub schema_rev: usize,
 }
@@ -264,6 +274,17 @@ pub fn show(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv) -> Vec<SqlAction> {
     let mut actions = Vec::new();
     egui::TopBottomPanel::top(ui.id().with("sql_bar")).exact_height(40.0).frame(egui::Frame::new().fill(theme::DEEP_DARK).inner_margin(egui::Margin::symmetric(8, 4))).show_inside(ui, |ui| run_bar(ui, tab, &mut actions));
     egui::TopBottomPanel::bottom(ui.id().with("sql_results")).resizable(true).default_height(260.0).height_range(80.0..=700.0).frame(egui::Frame::new().fill(theme::DEEP_DARK)).show_inside(ui, |ui| results(ui, tab, env, &mut actions));
+    if let (true, Some(v)) = (env.vim, tab.vim.as_ref()) {
+        egui::TopBottomPanel::bottom(ui.id().with("sql_vim")).exact_height(22.0).frame(egui::Frame::new().fill(theme::DEEP_DARK).inner_margin(egui::Margin::symmetric(8, 2))).show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(v.status()).monospace().color(theme::SECONDARY));
+                if let Some((is_error, m)) = &v.message {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(m).monospace().color(if *is_error { theme::ERROR } else { theme::MUTED }));
+                }
+            });
+        });
+    }
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::INPUT_FILL)).show_inside(ui, |ui| {
         if tab.find.is_some() {
             find_bar(ui, tab);
@@ -386,9 +407,11 @@ fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv, actions: &mut Vec<SqlActi
             let band = ui.painter().add(Shape::Noop);
             let focused = ui.memory(|m| m.has_focus(tab.edit_id));
             let mut accept = false;
-            if env.completion && focused {
+            let completion_on = env.completion && tab.vim.as_ref().is_none_or(|v| v.mode() == dbzilla_vim::Mode::Insert);
+            if completion_on && focused {
                 intercept_keys(ui, tab, env.complete_key, &mut accept);
             }
+            let vim_block = vim_keys(ui, tab, env, focused, actions);
             let before = hl_key(&tab.text, 0.0);
             let SqlTab { text, hl, edit_id, .. } = tab;
             let mut layouter = |ui: &Ui, t: &str, wrap: f32| {
@@ -400,7 +423,12 @@ fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv, actions: &mut Vec<SqlActi
                 job.wrap.max_width = wrap;
                 ui.fonts(|f| f.layout_job(job))
             };
+            let saved_cursor = ui.visuals().text_cursor.clone();
+            if vim_block {
+                ui.visuals_mut().text_cursor.stroke.width = 0.0;
+            }
             let mut out = TextEdit::multiline(text).id(*edit_id).font(font.clone()).frame(false).lock_focus(true).desired_width(f32::INFINITY).desired_rows(rows_wanted).layouter(&mut layouter).show(ui);
+            ui.visuals_mut().text_cursor = saved_cursor;
             if let Some(sel) = tab.pending_selection.take() {
                 let (a, b) = (char_index(&tab.text, sel.0), char_index(&tab.text, sel.1));
                 out.state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
@@ -410,16 +438,76 @@ fn editor(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv, actions: &mut Vec<SqlActi
             if let Some(range) = out.cursor_range {
                 tab.selection = (byte_index(&tab.text, range.secondary.ccursor.index), byte_index(&tab.text, range.primary.ccursor.index));
             }
+            vim_after_show(ui, tab, &out, vim_block);
             paint_band(ui, tab, env, &out, band);
             paint_gutter(ui, &out, env.font_size, gutter_rect.right());
             if hl_key(&tab.text, 0.0) != before {
                 tab.last_edit = Some(Instant::now());
             }
-            if env.completion {
+            if completion_on {
                 completion(ui, tab, env, &out, focused, accept, actions);
             }
         });
     });
+}
+
+/// Runs the vim keys of this frame. Returns true when the block cursor must be drawn
+/// (Normal, Visual and command-line modes).
+fn vim_keys(ui: &mut Ui, tab: &mut SqlTab, env: &SqlEnv, focused: bool, actions: &mut Vec<SqlAction>) -> bool {
+    if !env.vim {
+        tab.vim = None;
+        return false;
+    }
+    let text_chars = tab.text.chars().count();
+    let caret = char_index(&tab.text, tab.selection.1).min(text_chars);
+    let vim = tab.vim.get_or_insert_with(|| Box::new(VimEditor::new(&tab.text)));
+    vim.sync_text(&tab.text, caret);
+    if focused {
+        let keys = vimed::take_keys(ui, vim.mode());
+        if !keys.is_empty() {
+            vim.message = None;
+            let es = EditSettings { tab_width: env.tab_width, insert_spaces: env.insert_spaces };
+            let (changed, effects) = vim.handle_keys(keys, &es);
+            if let Some(t) = changed {
+                tab.text = t;
+            }
+            for e in effects {
+                match e {
+                    VimEffect::SetClipboard(t) => ui.ctx().copy_text(t),
+                    VimEffect::Write(_) | VimEffect::ForceWrite(_) | VimEffect::WriteQuit => actions.push(SqlAction::SaveQuery),
+                    VimEffect::Quit { .. } | VimEffect::Edit(_) => actions.push(SqlAction::Toast("Not available here, use the tab menu".into())),
+                    VimEffect::GotoLine(_) | VimEffect::Message(_) | VimEffect::Error(_) => {}
+                }
+            }
+            let (a, b) = vim.display_selection();
+            tab.pending_selection = Some((byte_index(&tab.text, a), byte_index(&tab.text, b)));
+            ui.ctx().request_repaint();
+        }
+    }
+    vim.mode() != dbzilla_vim::Mode::Insert
+}
+
+/// After the editor was drawn: lets a mouse selection reach vim and paints the block cursor.
+fn vim_after_show(ui: &Ui, tab: &mut SqlTab, out: &egui::text_edit::TextEditOutput, block: bool) {
+    let Some(vim) = tab.vim.as_mut() else { return };
+    if out.response.clicked() || out.response.dragged() {
+        if let Some(range) = out.cursor_range {
+            vim.mouse_selection(range.secondary.ccursor.index, range.primary.ccursor.index);
+        }
+    }
+    if !block {
+        return;
+    }
+    let caret = vim.caret();
+    let rect = out.galley.pos_from_ccursor(CCursor::new(caret));
+    let next = out.galley.pos_from_ccursor(CCursor::new(caret + 1));
+    let width = if (next.min.y - rect.min.y).abs() < 1.0 && next.min.x > rect.min.x { next.min.x - rect.min.x } else { rect.height() * 0.5 };
+    let block = egui::Rect::from_min_size(out.galley_pos + rect.min.to_vec2(), egui::vec2(width, rect.height()));
+    if ui.memory(|m| m.has_focus(out.response.id)) {
+        ui.painter().rect_filled(block, 0.0, theme::SECONDARY.gamma_multiply(0.55));
+    } else {
+        ui.painter().rect_stroke(block, 0.0, Stroke::new(1.0_f32, theme::SECONDARY), egui::StrokeKind::Inside);
+    }
 }
 
 /// Handles the navigation keys of the popup before the editor sees them.

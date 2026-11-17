@@ -2080,7 +2080,7 @@ impl Workspace {
             style.tab.hovered.bg_fill = theme::FIELD_ROW_BG;
             style.tab.hovered.text_color = theme::TEXT;
             style.tab.hovered.outline_color = theme::FIELD_ROW_BORDER;
-            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key };
+            let mut viewer = Viewer { requests: &mut requests, data_actions: &mut data_actions, dialect: self.dialect.as_ref(), csv: &csv, alternating, row_height, structures: &self.structures, sql_actions: &mut sql_actions, struct_actions: &mut struct_actions, caps: &self.caps, keywords: &self.keywords, driver: self.conn.driver, font_size: env.settings.editor_font_size, objects: &self.objects, saved: &self.saved_keywords, uppercase_keywords: env.settings.uppercase_keywords, complete_key: env.settings.complete_key, vim: env.settings.key_binding == dbzilla_store::settings::KeyBinding::Vim, indent_width: env.settings.indent_width, indent_spaces: env.settings.indent_with == dbzilla_store::settings::IndentWith::Spaces };
             DockArea::new(&mut self.dock).style(style).show_add_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
         });
         for r in requests {
@@ -2685,6 +2685,9 @@ struct Viewer<'a> {
     saved: &'a HashMap<String, String>,
     uppercase_keywords: bool,
     complete_key: dbzilla_store::settings::CompleteKey,
+    vim: bool,
+    indent_width: u8,
+    indent_spaces: bool,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -2726,6 +2729,9 @@ impl TabViewer for Viewer<'_> {
                     complete_key: self.complete_key,
                     quote: &quote,
                     completion: true,
+                    vim: self.vim,
+                    tab_width: usize::from(self.indent_width),
+                    insert_spaces: self.indent_spaces,
                     schema_rev: self.structures.len() * 1000 + self.objects.len() + self.saved.len(),
                 };
                 for a in sqltab::show(ui, sq, &env) {

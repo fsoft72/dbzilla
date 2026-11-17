@@ -136,6 +136,13 @@ fn editor(ui: &mut Ui, s: &mut Settings) {
         });
     });
     widgets::card(ui, |ui| {
+        field_label(ui, "Key binding");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut s.key_binding, dbzilla_store::settings::KeyBinding::Default, "Default");
+            ui.selectable_value(&mut s.key_binding, dbzilla_store::settings::KeyBinding::Vim, "Vim");
+        });
+    });
+    widgets::card(ui, |ui| {
         ui.checkbox(&mut s.query_params.enabled, "Enable query parameters");
         ui.add_enabled_ui(s.query_params.enabled, |ui| {
             ui.checkbox(&mut s.query_params.allow_in_quotes, "Allow searching for variables in quoted strings");
