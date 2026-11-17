@@ -2447,7 +2447,15 @@ impl Workspace {
                 d.literal(&dbzilla_core::value::Value::Text(table.name.clone()))
             ),
             DriverId::MySql => format!("SHOW CREATE {} {}.{}", if kind == ObjectKind::Procedure { "PROCEDURE" } else { "FUNCTION" }, d.quote_ident(table.database.as_deref().unwrap_or(&self.current_db)), d.quote_ident(&table.name)),
-            DriverId::SqlServer => format!("SELECT OBJECT_DEFINITION(OBJECT_ID({})) AS definition", d.literal(&dbzilla_core::value::Value::Text(d.quote_table(&TableRef { database: None, schema: table.schema.clone(), name: table.name.clone() })))),
+            DriverId::SqlServer => {
+                let full = TableRef { database: Some(table.database.clone().unwrap_or_else(|| self.current_db.clone())), schema: table.schema.clone(), name: table.name.clone() };
+                // OBJECT_DEFINITION only sees the current database, sys.sql_modules of the named one does not.
+                format!(
+                    "SELECT definition FROM {}.sys.sql_modules WHERE object_id = OBJECT_ID({})",
+                    d.quote_ident(full.database.as_deref().unwrap_or_default()),
+                    d.literal(&dbzilla_core::value::Value::Text(d.quote_table(&full)))
+                )
+            }
             DriverId::Sqlite => return self.notices.push((true, "SQLite has no stored functions".into())),
         };
         self.open_sql(sql);

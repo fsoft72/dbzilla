@@ -162,3 +162,82 @@ async fn ping_and_set_database() {
     let mut other = connect(c.port, "t4_ping").await;
     assert!(other.list_schemas("t4_ping").await.unwrap().contains(&"dbo".to_owned()));
 }
+
+static STRUCTURE: OnceCell<()> = OnceCell::const_new();
+
+/// Creates the database and tables of the structure tests once, even when tests run in parallel.
+async fn structure_fixture(port: u16) {
+    STRUCTURE.get_or_init(|| create_structure_fixture(port)).await;
+}
+
+async fn create_structure_fixture(port: u16) {
+    raw_exec(port, &["IF DB_ID('t5_struct') IS NULL CREATE DATABASE t5_struct"]).await;
+    raw_exec(
+        port,
+        &[
+            "USE t5_struct; IF OBJECT_ID('dbo.parent') IS NULL CREATE TABLE dbo.parent (id int PRIMARY KEY)",
+            "USE t5_struct; IF OBJECT_ID('dbo.child') IS NULL CREATE TABLE dbo.child (
+                id int IDENTITY(1,1) NOT NULL,
+                parent_id int NOT NULL,
+                name nvarchar(50) NULL CONSTRAINT df_child_name DEFAULT (N'x'),
+                price decimal(10,2) NOT NULL,
+                code varchar(20) NULL,
+                CONSTRAINT pk_child PRIMARY KEY (id),
+                CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES dbo.parent (id) ON DELETE CASCADE,
+                CONSTRAINT uq_child UNIQUE (parent_id, code))",
+            "USE t5_struct; IF OBJECT_ID('dbo.trg_child') IS NULL EXEC('CREATE TRIGGER dbo.trg_child ON dbo.child AFTER INSERT, UPDATE AS SELECT 1')",
+            "USE t5_struct; IF OBJECT_ID('dbo.child_v') IS NULL EXEC('CREATE VIEW dbo.child_v AS SELECT id, name FROM dbo.child')",
+            "USE t5_struct; IF NOT EXISTS (SELECT 1 FROM dbo.parent) INSERT INTO dbo.parent VALUES (1),(2),(3),(4),(5)",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn table_structure_reads_columns_keys_indexes_triggers() {
+    let Some(c) = container().await else { return };
+    structure_fixture(c.port).await;
+    let mut conn = connect(c.port, "").await;
+    let st = conn.table_structure(&TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "child".into() }).await.unwrap();
+    assert_eq!(st.table, TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "child".into() });
+    let col = |n: &str| st.columns.iter().find(|c| c.name == n).unwrap_or_else(|| panic!("no column {n}"));
+    assert_eq!(st.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "parent_id", "name", "price", "code"]);
+    assert_eq!((col("id").type_name.as_str(), col("id").nullable, col("id").is_pk), ("int", false, true));
+    assert_eq!(col("id").extra.get("identity").map(String::as_str), Some("true"));
+    assert_eq!((col("name").type_name.as_str(), col("name").nullable, col("name").default.as_deref()), ("nvarchar(50)", true, Some("N'x'")));
+    assert_eq!(col("price").type_name, "decimal(10,2)");
+    assert_eq!(col("code").type_name, "varchar(20)");
+    assert_eq!(st.primary_key, ["id"]);
+    let fk = col("parent_id").fk.clone().expect("foreign key");
+    assert_eq!(fk.table, TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "parent".into() });
+    assert_eq!((fk.columns.as_slice(), fk.on_delete.as_str(), fk.on_update.as_str(), fk.name.as_deref()), (["id".to_owned()].as_slice(), "CASCADE", "NO ACTION", Some("fk_child_parent")));
+    let uq = st.indexes.iter().find(|i| i.name == "uq_child").expect("unique index");
+    assert!(uq.unique);
+    assert_eq!(uq.columns, ["parent_id", "code"]);
+    assert!(st.indexes.iter().any(|i| i.name == "pk_child" && i.unique));
+    let tr = st.triggers.iter().find(|t| t.name == "trg_child").expect("trigger");
+    assert_eq!((tr.timing.as_str(), tr.event.as_str()), ("AFTER", "INSERT, UPDATE"));
+    assert!(tr.statement.contains("CREATE TRIGGER"));
+    assert!(st.ddl.starts_with("CREATE TABLE [t5_struct].[dbo].[child]"), "{}", st.ddl);
+}
+
+#[tokio::test]
+async fn table_structure_of_a_view_carries_its_definition() {
+    let Some(c) = container().await else { return };
+    structure_fixture(c.port).await;
+    let mut conn = connect(c.port, "").await;
+    let st = conn.table_structure(&TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "child_v".into() }).await.unwrap();
+    assert_eq!(st.columns.len(), 2);
+    assert!(st.ddl.contains("CREATE VIEW"), "{}", st.ddl);
+}
+
+#[tokio::test]
+async fn estimate_count_uses_partition_rows() {
+    let Some(c) = container().await else { return };
+    structure_fixture(c.port).await;
+    let mut conn = connect(c.port, "").await;
+    let parent = TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "parent".into() };
+    assert_eq!(conn.estimate_count(&parent).await.unwrap(), Some(5));
+    let missing = TableRef { database: Some("t5_struct".into()), schema: Some("dbo".into()), name: "nope".into() };
+    assert_eq!(conn.estimate_count(&missing).await.unwrap(), None);
+}
