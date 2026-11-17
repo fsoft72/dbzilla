@@ -74,12 +74,21 @@ pub struct IndexInfo {
 }
 
 /// Trigger description.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TriggerInfo {
     pub name: String,
     pub timing: String,
     pub event: String,
     pub statement: String,
+    /// `ROW` or `STATEMENT`; empty when the driver does not report it.
+    #[serde(default)]
+    pub level: String,
+    /// PostgreSQL: the function the trigger calls.
+    #[serde(default)]
+    pub function: Option<TableRef>,
+    /// True when the editor can rewrite the trigger without losing anything.
+    #[serde(default)]
+    pub editable: bool,
 }
 
 /// Table structure: columns, keys, indexes, triggers and DDL.

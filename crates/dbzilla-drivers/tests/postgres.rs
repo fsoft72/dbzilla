@@ -111,6 +111,7 @@ async fn schemas_objects_and_structure() {
         "CREATE FUNCTION shop.f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
         "CREATE FUNCTION shop.trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
         "CREATE TRIGGER trg_orders BEFORE INSERT ON shop.orders FOR EACH ROW EXECUTE FUNCTION shop.trg()",
+        "CREATE TRIGGER trg_zmulti AFTER INSERT OR UPDATE ON shop.orders FOR EACH ROW EXECUTE FUNCTION shop.trg()",
     ]
     .iter()
     .map(|s| (*s).to_owned())
@@ -139,6 +140,13 @@ async fn schemas_objects_and_structure() {
     assert_eq!(st.indexes.len(), 1);
     assert_eq!((st.indexes[0].name.as_str(), st.indexes[0].columns.clone()), ("ix_orders_customer", vec!["customer_id".to_owned(), "total".to_owned()]));
     assert_eq!((st.triggers[0].name.as_str(), st.triggers[0].timing.as_str(), st.triggers[0].event.as_str()), ("trg_orders", "BEFORE", "INSERT"));
+    let simple = &st.triggers[0];
+    assert_eq!(simple.level, "ROW");
+    assert_eq!(simple.function, Some(TableRef { database: None, schema: Some("shop".into()), name: "trg".into() }));
+    assert!(simple.editable);
+    assert!(!st.triggers.iter().find(|t| t.name == "trg_zmulti").unwrap().editable, "several events cannot be edited structurally");
+    let functions = c.trigger_functions(Some("shop")).await.unwrap();
+    assert_eq!(functions, vec![TableRef { database: None, schema: Some("shop".into()), name: "trg".into() }], "only functions returning trigger");
     assert!(st.ddl.contains("CREATE TABLE \"shop\".\"orders\""), "{}", st.ddl);
     let v = TableRef { database: None, schema: Some("shop".into()), name: "v_orders".into() };
     assert!(c.table_structure(&v).await.unwrap().ddl.starts_with("CREATE OR REPLACE VIEW"));

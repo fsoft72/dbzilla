@@ -268,6 +268,14 @@ impl Conn for PgConn {
         Ok(out)
     }
 
+    async fn trigger_functions(&mut self, schema: Option<&str>) -> DriverResult<Vec<TableRef>> {
+        let sql = "SELECT n.nspname::text, p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                   WHERE p.prorettype = 'trigger'::regtype AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND ($1::text IS NULL OR n.nspname = $1::text) ORDER BY n.nspname, p.proname";
+        let rows = self.client.query(sql, &[&schema]).await.map_err(map_query_err)?;
+        Ok(rows.iter().map(|r| TableRef { database: None, schema: Some(r.get(0)), name: r.get(1) }).collect())
+    }
+
     async fn table_structure(&mut self, t: &TableRef) -> DriverResult<TableStructure> {
         let reg = Self::regclass(t);
         let schema = t.schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_owned());
@@ -314,13 +322,19 @@ impl Conn for PgConn {
         for r in self.client.query(ix_sql, &[&reg]).await.map_err(map_query_err)? {
             st.indexes.push(IndexInfo { name: r.get(0), unique: r.get(1), condition: r.get(2), columns: r.get::<_, Vec<String>>(3) });
         }
-        let tr_sql = "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t WHERE t.tgrelid = $1::text::regclass AND NOT t.tgisinternal ORDER BY t.tgname";
+        let tr_sql = "SELECT t.tgname, pg_get_triggerdef(t.oid), (t.tgtype & 1) <> 0, fn.nspname::text, p.proname::text, \
+                      (((t.tgtype & 4) > 0)::int + ((t.tgtype & 8) > 0)::int + ((t.tgtype & 16) > 0)::int = 1 AND (t.tgtype & 96) = 0 \
+                       AND t.tgqual IS NULL AND t.tgattr::text = '' AND t.tgnargs = 0 AND t.tgconstraint = 0) \
+                      FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid JOIN pg_namespace fn ON fn.oid = p.pronamespace \
+                      WHERE t.tgrelid = $1::text::regclass AND NOT t.tgisinternal ORDER BY t.tgname";
         for r in self.client.query(tr_sql, &[&reg]).await.map_err(map_query_err)? {
             let def: String = r.get(1);
             let upper = def.to_ascii_uppercase();
             let (pos, timing) = first_keyword(&upper, &["INSTEAD OF", "BEFORE", "AFTER"], 0).unwrap_or((0, ""));
             let event = first_keyword(&upper, &["INSERT", "UPDATE", "DELETE", "TRUNCATE"], pos).map_or("", |(_, e)| e);
-            st.triggers.push(TriggerInfo { name: r.get(0), timing: timing.to_owned(), event: event.to_owned(), statement: def });
+            let level = if r.get::<_, bool>(2) { "ROW" } else { "STATEMENT" };
+            let function = TableRef { database: None, schema: Some(r.get(3)), name: r.get(4) };
+            st.triggers.push(TriggerInfo { name: r.get(0), timing: timing.to_owned(), event: event.to_owned(), statement: def, level: level.to_owned(), function: Some(function), editable: r.get(5) });
         }
         let kind: String = self.client.query_one("SELECT relkind::text FROM pg_class WHERE oid = $1::text::regclass", &[&reg]).await.map_err(map_query_err)?.get(0);
         let d = dialect_for(DriverId::Postgres);

@@ -140,6 +140,8 @@ async fn suite(srv: &Container, db: &str, prefix: &str) {
     assert!(["NO ACTION", "RESTRICT"].contains(&fk.on_update.as_str()), "{}", fk.on_update);
     assert_eq!(st.indexes.iter().find(|i| i.name == "ix_orders_customer").unwrap().columns, vec!["customer_id", "total"]);
     assert_eq!((st.triggers[0].timing.as_str(), st.triggers[0].event.as_str()), ("BEFORE", "INSERT"));
+    assert_eq!(st.triggers[0].level, "ROW");
+    assert!(st.triggers[0].editable);
     assert!(st.ddl.starts_with("CREATE TABLE"), "{}", st.ddl);
     let cust = c.table_structure(&TableRef { database: Some(db.into()), schema: None, name: "customers".into() }).await.unwrap();
     assert!(!cust.columns[1].nullable);
