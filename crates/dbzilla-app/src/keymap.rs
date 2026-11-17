@@ -39,11 +39,12 @@ pub enum Action {
     FocusSidebarSearch,
     SearchInDatabase,
     ShowDiagram,
+    ShowMetrics,
 }
 
 impl Action {
     /// Every action, for the command palette and the keymap editor.
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 34] = [
         Action::OpenAnything,
         Action::OpenDatabase,
         Action::OpenConnection,
@@ -77,6 +78,7 @@ impl Action {
         Action::FocusSidebarSearch,
         Action::SearchInDatabase,
         Action::ShowDiagram,
+        Action::ShowMetrics,
     ];
 
     /// Name shown in menus, tooltips and the palette.
@@ -115,6 +117,7 @@ impl Action {
             Action::FocusSidebarSearch => "Find Items in Sidebar",
             Action::SearchInDatabase => "Search in Database",
             Action::ShowDiagram => "Show Diagram",
+            Action::ShowMetrics => "Show Metrics Board",
         }
     }
 }
