@@ -111,6 +111,11 @@ async fn schemas_objects_and_structure() {
         "CREATE FUNCTION shop.f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
         "CREATE FUNCTION shop.trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
         "CREATE TRIGGER trg_orders BEFORE INSERT ON shop.orders FOR EACH ROW EXECUTE FUNCTION shop.trg()",
+        "CREATE TRIGGER trg_zmulti AFTER INSERT OR UPDATE ON shop.orders FOR EACH ROW EXECUTE FUNCTION shop.trg()",
+        "CREATE TRIGGER trg_after_insert BEFORE UPDATE ON shop.orders FOR EACH ROW EXECUTE FUNCTION shop.trg()",
+        "CREATE TRIGGER trg_ref AFTER INSERT ON shop.orders REFERENCING NEW TABLE AS n FOR EACH STATEMENT EXECUTE FUNCTION shop.trg()",
+        "CREATE TRIGGER trg_off AFTER DELETE ON shop.orders FOR EACH ROW EXECUTE FUNCTION shop.trg()",
+        "ALTER TABLE shop.orders DISABLE TRIGGER trg_off",
     ]
     .iter()
     .map(|s| (*s).to_owned())
@@ -138,7 +143,21 @@ async fn schemas_objects_and_structure() {
     assert_eq!((fk.on_delete.as_str(), fk.on_update.as_str()), ("CASCADE", "NO ACTION"));
     assert_eq!(st.indexes.len(), 1);
     assert_eq!((st.indexes[0].name.as_str(), st.indexes[0].columns.clone()), ("ix_orders_customer", vec!["customer_id".to_owned(), "total".to_owned()]));
-    assert_eq!((st.triggers[0].name.as_str(), st.triggers[0].timing.as_str(), st.triggers[0].event.as_str()), ("trg_orders", "BEFORE", "INSERT"));
+    let by = |n: &str| st.triggers.iter().find(|t| t.name == n).unwrap_or_else(|| panic!("trigger {n}"));
+    assert_eq!((by("trg_orders").timing.as_str(), by("trg_orders").event.as_str()), ("BEFORE", "INSERT"));
+    // the timing and the event come from the catalog, not from words inside the name
+    assert_eq!((by("trg_after_insert").timing.as_str(), by("trg_after_insert").event.as_str()), ("BEFORE", "UPDATE"));
+    assert!(by("trg_after_insert").editable);
+    assert!(!by("trg_ref").editable, "transition tables cannot be kept by the editor");
+    assert!(!by("trg_off").editable, "a disabled trigger would come back enabled");
+    let simple = by("trg_orders");
+    assert_eq!(simple.level, "ROW");
+    assert_eq!(simple.function, Some(TableRef { database: None, schema: Some("shop".into()), name: "trg".into() }));
+    assert!(simple.editable);
+    assert!(!st.triggers.iter().find(|t| t.name == "trg_zmulti").unwrap().editable, "several events cannot be edited structurally");
+    assert!(c.trigger_functions(None).await.unwrap().contains(&TableRef { database: None, schema: Some("shop".into()), name: "trg".into() }), "no schema lists every schema");
+    let functions = c.trigger_functions(Some("shop")).await.unwrap();
+    assert_eq!(functions, vec![TableRef { database: None, schema: Some("shop".into()), name: "trg".into() }], "only functions returning trigger");
     assert!(st.ddl.contains("CREATE TABLE \"shop\".\"orders\""), "{}", st.ddl);
     let v = TableRef { database: None, schema: Some("shop".into()), name: "v_orders".into() };
     assert!(c.table_structure(&v).await.unwrap().ddl.starts_with("CREATE OR REPLACE VIEW"));

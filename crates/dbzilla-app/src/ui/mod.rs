@@ -24,6 +24,7 @@ pub mod sqltab;
 pub mod vimed;
 pub mod structdraft;
 pub mod structure;
+pub mod triggers;
 pub mod tabs;
 pub mod workspace;
 pub mod widgets;

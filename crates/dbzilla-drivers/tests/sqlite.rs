@@ -94,6 +94,7 @@ async fn structure_objects_fk_index_trigger() {
     assert_eq!(st.triggers.len(), 1);
     assert_eq!(st.triggers[0].timing, "AFTER");
     assert_eq!(st.triggers[0].event, "INSERT");
+    assert!(!st.triggers[0].editable, "SQLite triggers are read only");
     assert!(st.ddl.starts_with("CREATE TABLE orders"));
     let cs = c.table_structure(&TableRef::simple("customers")).await.unwrap();
     assert!(!cs.columns[1].nullable);

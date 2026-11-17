@@ -52,6 +52,8 @@ pub enum Command {
     LoadStructure(TableRef),
     /// Structure of every table of a schema, for the ER diagram.
     LoadDiagram { db: String, schema: Option<String> },
+    /// Functions that return `trigger`, for the trigger editor.
+    LoadTriggerFunctions { schema: Option<String> },
     EstimateCount { req: RequestId, table: TableRef },
     UseDatabase(String),
     FetchPage(Box<PageRequest>),
@@ -75,6 +77,8 @@ pub enum Event {
     Structure(Box<TableStructure>),
     /// Every table of a schema; `skipped` lists the tables that could not be read.
     Diagram { schema: Option<String>, tables: Vec<TableStructure>, skipped: Vec<String> },
+    /// The functions a trigger can call.
+    TriggerFunctions { schema: Option<String>, functions: Vec<TableRef> },
     DatabaseChanged(String),
     StatementStarted { req: RequestId, index: usize, sql: String },
     RowBatch { req: RequestId, index: usize, columns: Option<Vec<ColumnMeta>>, rows: Vec<Row> },

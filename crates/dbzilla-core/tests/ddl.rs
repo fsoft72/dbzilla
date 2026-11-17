@@ -1,6 +1,6 @@
 //! DDL generation and copy-script tests (SPEC 8.6-8.10, appendix A).
 
-use dbzilla_core::ddl::{generate_ddl, ColumnDef, DdlError, ForeignKeyDef, IndexDef, StructuralOp};
+use dbzilla_core::ddl::{generate_ddl, ColumnDef, DdlError, ForeignKeyDef, IndexDef, StructuralOp, TriggerDef, TriggerLevel};
 use dbzilla_core::dialect::{dialect_for, DriverId};
 use dbzilla_core::model::{ColumnMeta, IndexInfo, TableRef, TableStructure};
 
@@ -230,4 +230,97 @@ fn sqlite_foreign_key_rebuild_needs_the_structure_and_refuses_referenced_tables(
     assert!(stmts[1].starts_with("INSERT INTO") && stmts[2].starts_with("DROP TABLE") && stmts[3].contains("RENAME TO"), "{stmts:?}");
     st.referenced_by = vec!["child".into()];
     assert!(matches!(ddl(DriverId::Sqlite, StructuralOp::AddForeignKey { table: t("a"), fk: fk(), current: Some(Box::new(st)) }), Err(DdlError::Unsupported(_))));
+}
+
+fn pg_table(schema: &str, name: &str) -> TableRef {
+    TableRef { database: None, schema: Some(schema.into()), name: name.into() }
+}
+
+fn pg_trigger(name: &str, function: Option<TableRef>) -> TriggerDef {
+    TriggerDef { name: name.into(), timing: "BEFORE".into(), event: "INSERT".into(), level: TriggerLevel::Row, function, body: String::new() }
+}
+
+fn mysql_trigger(name: &str, body: &str) -> TriggerDef {
+    TriggerDef { name: name.into(), timing: "AFTER".into(), event: "UPDATE".into(), level: TriggerLevel::Row, function: None, body: body.into() }
+}
+
+#[test]
+fn create_trigger_postgres_calls_the_function() {
+    let op = StructuralOp::CreateTrigger { table: pg_table("shop", "orders"), trigger: pg_trigger("trg_orders", Some(pg_table("shop", "trg"))) };
+    assert_eq!(
+        ddl(DriverId::Postgres, op).unwrap(),
+        vec![r#"CREATE TRIGGER "trg_orders" BEFORE INSERT ON "shop"."orders" FOR EACH ROW EXECUTE FUNCTION "shop"."trg"()"#]
+    );
+}
+
+#[test]
+fn create_trigger_postgres_function_in_other_schema_and_statement_level() {
+    let mut trigger = pg_trigger("t1", Some(pg_table("b", "f")));
+    trigger.level = TriggerLevel::Statement;
+    let op = StructuralOp::CreateTrigger { table: pg_table("a", "orders"), trigger };
+    assert_eq!(ddl(DriverId::Postgres, op).unwrap(), vec![r#"CREATE TRIGGER "t1" BEFORE INSERT ON "a"."orders" FOR EACH STATEMENT EXECUTE FUNCTION "b"."f"()"#]);
+}
+
+#[test]
+fn create_trigger_mysql_keeps_a_multi_statement_body_whole() {
+    let body = "BEGIN SET NEW.a = 1; SET NEW.b = 2; END";
+    let op = StructuralOp::CreateTrigger { table: t("orders"), trigger: mysql_trigger("t1", body) };
+    assert_eq!(ddl(DriverId::MySql, op).unwrap(), vec!["CREATE TRIGGER `t1` AFTER UPDATE ON `orders` FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END".to_owned()]);
+}
+
+#[test]
+fn trigger_names_are_quoted() {
+    let pg = StructuralOp::CreateTrigger { table: t("o"), trigger: pg_trigger("we\"ird name", Some(t("f"))) };
+    assert!(ddl(DriverId::Postgres, pg).unwrap()[0].starts_with(r#"CREATE TRIGGER "we""ird name" "#));
+    let my = StructuralOp::CreateTrigger { table: t("o"), trigger: mysql_trigger("we`ird name", "SET NEW.a = 1") };
+    assert!(ddl(DriverId::MySql, my).unwrap()[0].starts_with("CREATE TRIGGER `we``ird name` "));
+}
+
+#[test]
+fn drop_trigger_per_dialect() {
+    let pg = StructuralOp::DropTrigger { table: pg_table("shop", "orders"), name: "trg_orders".into(), if_exists: false };
+    assert_eq!(ddl(DriverId::Postgres, pg).unwrap(), vec![r#"DROP TRIGGER "trg_orders" ON "shop"."orders""#]);
+    let plain = StructuralOp::DropTrigger { table: t("orders"), name: "trg_orders".into(), if_exists: false };
+    assert_eq!(ddl(DriverId::MySql, plain).unwrap(), vec!["DROP TRIGGER `trg_orders`"]);
+    let qualified = StructuralOp::DropTrigger { table: TableRef { database: Some("shop".into()), schema: None, name: "orders".into() }, name: "trg_orders".into(), if_exists: false };
+    assert_eq!(ddl(DriverId::MySql, qualified).unwrap(), vec!["DROP TRIGGER `shop`.`trg_orders`"]);
+}
+
+#[test]
+fn trigger_ops_are_refused_on_sqlite() {
+    let create = StructuralOp::CreateTrigger { table: t("o"), trigger: mysql_trigger("t1", "SELECT 1") };
+    assert!(matches!(ddl(DriverId::Sqlite, create), Err(DdlError::Unsupported(_))));
+    let drop = StructuralOp::DropTrigger { table: t("o"), name: "t1".into(), if_exists: false };
+    assert!(matches!(ddl(DriverId::Sqlite, drop), Err(DdlError::Unsupported(_))));
+}
+
+#[test]
+fn create_trigger_validates() {
+    let invalid = |id: DriverId, trigger: TriggerDef| matches!(ddl(id, StructuralOp::CreateTrigger { table: t("o"), trigger }), Err(DdlError::Invalid(_)));
+    assert!(invalid(DriverId::MySql, mysql_trigger("", "SELECT 1")), "empty name");
+    assert!(invalid(DriverId::MySql, mysql_trigger("t1", "  ")), "empty MySQL body");
+    assert!(invalid(DriverId::Postgres, pg_trigger("t1", None)), "missing PostgreSQL function");
+    let mut bad_timing = mysql_trigger("t1", "SELECT 1");
+    bad_timing.timing = "DURING".into();
+    assert!(invalid(DriverId::MySql, bad_timing), "timing");
+    let mut bad_event = mysql_trigger("t1", "SELECT 1");
+    bad_event.event = "TRUNCATE".into();
+    assert!(invalid(DriverId::MySql, bad_event), "event");
+}
+
+#[test]
+fn drop_trigger_if_exists_per_dialect() {
+    let pg = StructuralOp::DropTrigger { table: pg_table("shop", "orders"), name: "trg".into(), if_exists: true };
+    assert_eq!(ddl(DriverId::Postgres, pg).unwrap(), vec![r#"DROP TRIGGER IF EXISTS "trg" ON "shop"."orders""#]);
+    let my = StructuralOp::DropTrigger { table: TableRef { database: Some("shop".into()), schema: None, name: "orders".into() }, name: "trg".into(), if_exists: true };
+    assert_eq!(ddl(DriverId::MySql, my).unwrap(), vec!["DROP TRIGGER IF EXISTS `shop`.`trg`"]);
+}
+
+/// MySQL runs a second statement of a multi-statement body on its own, so a body with several statements needs BEGIN ... END.
+#[test]
+fn create_trigger_mysql_refuses_extra_statements_outside_begin_end() {
+    let create = |body: &str| ddl(DriverId::MySql, StructuralOp::CreateTrigger { table: t("orders"), trigger: mysql_trigger("t1", body) });
+    assert!(matches!(create("UPDATE stats SET n = n + 1; DELETE FROM audit"), Err(DdlError::Invalid(m)) if m.contains("BEGIN")));
+    assert!(create("SET NEW.a = 1;").is_ok(), "a trailing semicolon is one statement");
+    assert!(create("BEGIN UPDATE stats SET n = n + 1; DELETE FROM audit; END").is_ok());
 }

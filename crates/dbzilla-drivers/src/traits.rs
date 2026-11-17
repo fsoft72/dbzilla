@@ -137,6 +137,10 @@ pub trait Conn: Send {
     async fn list_schemas(&mut self, db: &str) -> DriverResult<Vec<String>>;
     async fn list_objects(&mut self, db: &str, schema: Option<&str>) -> DriverResult<Vec<ObjectInfo>>;
     async fn table_structure(&mut self, t: &TableRef) -> DriverResult<TableStructure>;
+    /// Functions that return `trigger`, for the trigger editor. Only PostgreSQL has them.
+    async fn trigger_functions(&mut self, _schema: Option<&str>) -> DriverResult<Vec<TableRef>> {
+        Ok(Vec::new())
+    }
     /// Structure of every table of a schema (views excluded), for the ER diagram.
     /// A table that cannot be read is skipped and reported in the second element.
     async fn schema_structures(&mut self, db: &str, schema: Option<&str>) -> DriverResult<(Vec<TableStructure>, Vec<String>)> {

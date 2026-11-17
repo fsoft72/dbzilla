@@ -54,6 +54,8 @@ pub struct DiagramEdge {
     pub to_table: usize,
     pub to_column: Option<usize>,
     pub kind: EdgeKind,
+    /// Name of the foreign key constraint, for a real edge that has one.
+    pub constraint: Option<String>,
 }
 
 /// Order of the tables in the diagram.
@@ -94,7 +96,7 @@ impl Diagram {
                 let target = ordered[to_table];
                 let wanted = fk.columns.first().cloned().or_else(|| target.primary_key.first().cloned());
                 let to_column = wanted.and_then(|w| target.columns.iter().position(|c| c.name == w));
-                edges.push(DiagramEdge { from_table, from_column, to_table, to_column, kind: EdgeKind::Real });
+                edges.push(DiagramEdge { from_table, from_column, to_table, to_column, kind: EdgeKind::Real, constraint: fk.name.clone() });
             }
         }
         let mut diagram = Diagram { tables, edges };
@@ -115,7 +117,7 @@ impl Diagram {
                 continue;
             }
             self.edges.retain(|e| !(same(e) && e.kind == EdgeKind::Inferred));
-            self.edges.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), kind: EdgeKind::Manual });
+            self.edges.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), kind: EdgeKind::Manual, constraint: None });
         }
     }
 
@@ -141,7 +143,7 @@ impl Diagram {
                 if type_family(&col.type_name) != type_family(&target.columns[to_column].type_name) {
                     continue;
                 }
-                found.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), kind: EdgeKind::Inferred });
+                found.push(DiagramEdge { from_table, from_column, to_table, to_column: Some(to_column), kind: EdgeKind::Inferred, constraint: None });
             }
         }
         self.edges.extend(found);
@@ -398,14 +400,31 @@ mod tests {
         ]
     }
 
+    /// A real edge keeps the constraint name, so it can be dropped; a foreign key without a name, a drawn link and a guess have none.
+    #[test]
+    fn real_edge_carries_the_constraint_name() {
+        let mut named = table("orders", vec![col("id", true, None), col("customer_id", false, Some(("customers", "id")))]);
+        named.columns[1].fk.as_mut().unwrap().name = Some("fk_c".into());
+        let customers = table("customers", vec![col("id", true, None)]);
+        let d = Diagram::build(&[named.clone(), customers.clone()], DiagramSort::Name);
+        assert_eq!(d.edges.iter().filter(|e| e.kind == EdgeKind::Real).map(|e| e.constraint.clone()).collect::<Vec<_>>(), vec![Some("fk_c".to_owned())]);
+        named.columns[1].fk.as_mut().unwrap().name = None;
+        let d = Diagram::build(&[named, customers], DiagramSort::Name);
+        assert_eq!(d.edges.iter().find(|e| e.kind == EdgeKind::Real).unwrap().constraint, None);
+        let mut d = Diagram::build(&[table("a", vec![col("id", true, None)]), table("b", vec![col("id", true, None), col("a_id", false, None)])], DiagramSort::Name);
+        d.add_manual(&[DocLink { from_table: "b".into(), from_column: "id".into(), to_table: "a".into(), to_column: "id".into() }]);
+        assert!(d.edges.iter().filter(|e| e.kind != EdgeKind::Real).all(|e| e.constraint.is_none()));
+        assert!(d.edges.iter().any(|e| e.kind == EdgeKind::Manual));
+    }
+
     #[test]
     fn build_sorts_by_name_and_resolves_edges() {
         let d = Diagram::build(&shop(), DiagramSort::Name);
         let names: Vec<_> = d.tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["audit", "customers", "items", "orders"]);
         assert_eq!(d.edges.len(), 2);
-        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Real }));
-        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0), kind: EdgeKind::Real }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 3, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Real, constraint: None }));
+        assert!(d.edges.contains(&DiagramEdge { from_table: 2, from_column: 1, to_table: 3, to_column: Some(0), kind: EdgeKind::Real, constraint: None }));
     }
 
     #[test]
@@ -558,7 +577,7 @@ mod tests {
     fn id_user_points_to_the_key_of_users() {
         let d = Diagram::build(&users_and_notifications("id_user", "text(64)"), DiagramSort::Name);
         // sorted: notifications, users
-        assert_eq!(inferred(&d), vec![&DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Inferred }]);
+        assert_eq!(inferred(&d), vec![&DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Inferred, constraint: None }]);
     }
 
     #[test]
@@ -634,7 +653,7 @@ mod tests {
     fn manual_links_are_added_by_name() {
         let mut d = Diagram::build(&users_and_notifications("owner", "text(64)"), DiagramSort::Name);
         d.add_manual(&[link("notifications", "owner", "users", "id")]);
-        assert_eq!(d.edges, vec![DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Manual }]);
+        assert_eq!(d.edges, vec![DiagramEdge { from_table: 0, from_column: 1, to_table: 1, to_column: Some(0), kind: EdgeKind::Manual, constraint: None }]);
         assert_eq!(d.groups(), vec![None, None], "a manual link does not make a group");
     }
 

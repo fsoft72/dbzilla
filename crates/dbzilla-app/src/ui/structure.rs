@@ -184,7 +184,8 @@ pub fn show_columns(ui: &mut Ui, d: &mut StructDraft, env: &StructEnv) -> Vec<St
                 d.cols.push(ColDraft::blank(env.types.first().copied().unwrap_or("text")));
             }
         });
-        if !d.original.triggers.is_empty() && ui.small_button(format!("Triggers ({})", d.original.triggers.len())).clicked() {
+        let has_triggers = !d.original.triggers.is_empty();
+        if (has_triggers || (env.caps.triggers && env.editable)) && ui.small_button(format!("Triggers ({})", d.original.triggers.len())).clicked() {
             actions.push(StructAction::ShowTriggers);
         }
         if !env.editable {

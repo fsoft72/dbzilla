@@ -399,7 +399,7 @@ impl Conn for MyConn {
                  WHERE event_object_schema = {sdb} AND event_object_table = {stable} ORDER BY trigger_name"
             ))
             .await?;
-        st.triggers = trs.iter().map(|r| TriggerInfo { name: text(r, 0), timing: text(r, 1), event: text(r, 2), statement: text(r, 3) }).collect();
+        st.triggers = trs.iter().map(|r| TriggerInfo { name: text(r, 0), timing: text(r, 1), event: text(r, 2), statement: text(r, 3), level: "ROW".into(), function: None, editable: true }).collect();
         let kind = self.rows(&format!("SELECT table_type FROM information_schema.tables WHERE table_schema = {sdb} AND table_name = {stable}")).await?;
         let is_view = kind.first().is_some_and(|r| text(r, 0) == "VIEW");
         let show = format!("SHOW CREATE {} {}.{}", if is_view { "VIEW" } else { "TABLE" }, q(&db), q(&t.name));

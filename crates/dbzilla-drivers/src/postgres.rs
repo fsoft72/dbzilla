@@ -222,11 +222,6 @@ fn fk_action(code: &str) -> &'static str {
     }
 }
 
-/// Position-based search for the first keyword of `words` in `upper` at or after `from`.
-fn first_keyword<'a>(upper: &str, words: &[&'a str], from: usize) -> Option<(usize, &'a str)> {
-    words.iter().filter_map(|w| upper[from..].find(w).map(|p| (p + from, *w))).min_by_key(|(p, _)| *p)
-}
-
 #[async_trait]
 impl Conn for PgConn {
     async fn server_version(&mut self) -> DriverResult<String> {
@@ -266,6 +261,14 @@ impl Conn for PgConn {
             out.push(ObjectInfo { kind, table: TableRef { database: None, schema: Some(schema.clone()), name: r.get(1) } });
         }
         Ok(out)
+    }
+
+    async fn trigger_functions(&mut self, schema: Option<&str>) -> DriverResult<Vec<TableRef>> {
+        let sql = "SELECT n.nspname::text, p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                   WHERE p.prorettype = 'trigger'::regtype AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND ($1::text IS NULL OR n.nspname = $1::text) ORDER BY n.nspname, p.proname";
+        let rows = self.client.query(sql, &[&schema]).await.map_err(map_query_err)?;
+        Ok(rows.iter().map(|r| TableRef { database: None, schema: Some(r.get(0)), name: r.get(1) }).collect())
     }
 
     async fn table_structure(&mut self, t: &TableRef) -> DriverResult<TableStructure> {
@@ -314,13 +317,18 @@ impl Conn for PgConn {
         for r in self.client.query(ix_sql, &[&reg]).await.map_err(map_query_err)? {
             st.indexes.push(IndexInfo { name: r.get(0), unique: r.get(1), condition: r.get(2), columns: r.get::<_, Vec<String>>(3) });
         }
-        let tr_sql = "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t WHERE t.tgrelid = $1::text::regclass AND NOT t.tgisinternal ORDER BY t.tgname";
+        let tr_sql = "SELECT t.tgname, pg_get_triggerdef(t.oid), (t.tgtype & 1) <> 0, fn.nspname::text, p.proname::text, \
+                      (((t.tgtype & 4) > 0)::int + ((t.tgtype & 8) > 0)::int + ((t.tgtype & 16) > 0)::int = 1 AND (t.tgtype & 96) = 0 \
+                       AND t.tgqual IS NULL AND t.tgattr::text = '' AND t.tgnargs = 0 AND t.tgconstraint = 0 \
+                       AND t.tgoldtable IS NULL AND t.tgnewtable IS NULL AND t.tgenabled = 'O'), \
+                      CASE WHEN (t.tgtype & 64) <> 0 THEN 'INSTEAD OF' WHEN (t.tgtype & 2) <> 0 THEN 'BEFORE' ELSE 'AFTER' END, \
+                      CASE WHEN (t.tgtype & 4) <> 0 THEN 'INSERT' WHEN (t.tgtype & 8) <> 0 THEN 'DELETE' WHEN (t.tgtype & 16) <> 0 THEN 'UPDATE' ELSE 'TRUNCATE' END \
+                      FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid JOIN pg_namespace fn ON fn.oid = p.pronamespace \
+                      WHERE t.tgrelid = $1::text::regclass AND NOT t.tgisinternal ORDER BY t.tgname";
         for r in self.client.query(tr_sql, &[&reg]).await.map_err(map_query_err)? {
-            let def: String = r.get(1);
-            let upper = def.to_ascii_uppercase();
-            let (pos, timing) = first_keyword(&upper, &["INSTEAD OF", "BEFORE", "AFTER"], 0).unwrap_or((0, ""));
-            let event = first_keyword(&upper, &["INSERT", "UPDATE", "DELETE", "TRUNCATE"], pos).map_or("", |(_, e)| e);
-            st.triggers.push(TriggerInfo { name: r.get(0), timing: timing.to_owned(), event: event.to_owned(), statement: def });
+            let level = if r.get::<_, bool>(2) { "ROW" } else { "STATEMENT" };
+            let function = TableRef { database: None, schema: Some(r.get(3)), name: r.get(4) };
+            st.triggers.push(TriggerInfo { name: r.get(0), timing: r.get(6), event: r.get(7), statement: r.get(1), level: level.to_owned(), function: Some(function), editable: r.get(5) });
         }
         let kind: String = self.client.query_one("SELECT relkind::text FROM pg_class WHERE oid = $1::text::regclass", &[&reg]).await.map_err(map_query_err)?.get(0);
         let d = dialect_for(DriverId::Postgres);

@@ -252,7 +252,7 @@ fn read_structure(conn: &Connection, t: &TableRef) -> DriverResult<TableStructur
         let upper = sql.to_ascii_uppercase();
         let timing = ["INSTEAD OF", "BEFORE", "AFTER"].iter().find(|k| upper.contains(*k)).map_or("", |k| k);
         let event = ["INSERT", "UPDATE", "DELETE"].iter().find(|k| upper.contains(*k)).map_or("", |k| k);
-        st.triggers.push(TriggerInfo { name: tname, timing: timing.to_owned(), event: event.to_owned(), statement: sql });
+        st.triggers.push(TriggerInfo { name: tname, timing: timing.to_owned(), event: event.to_owned(), statement: sql, ..Default::default() });
     }
     Ok(st)
 }
