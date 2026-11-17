@@ -521,6 +521,24 @@ mod tests {
         }
     }
 
+    /// SQL Server is slow to start and big, so this one runs only with `DBZILLA_TEST_MSSQL=1`.
+    #[test]
+    fn sqlserver_lists_and_kills_a_running_query() {
+        const LABEL: &str = "dbzilla-test-process-mssql";
+        if std::env::var("DBZILLA_TEST_MSSQL").map(|v| v != "1").unwrap_or(true) {
+            return eprintln!("SKIPPED: set DBZILLA_TEST_MSSQL=1 to run the SQL Server tests");
+        }
+        let Some(c) = crate::testsupport::start(LABEL, "mcr.microsoft.com/mssql/server:2022-latest", &[("ACCEPT_EULA", "Y"), ("MSSQL_SA_PASSWORD", "Dbzilla_Pw1!")], 1433) else {
+            return eprintln!("SKIPPED: docker is not available");
+        };
+        let cfg = ConnectConfig { driver: DriverId::SqlServer, host: "127.0.0.1".into(), port: Some(c.port), user: "sa".into(), password: Some("Dbzilla_Pw1!".into()), database: String::new(), ssl: dbzilla_core::model::SslMode::Required, bootstrap: vec![] };
+        let result = std::panic::catch_unwind(|| exercise_server(cfg, "WAITFOR DELAY '00:01:00' -- marker_sleep", "marker_sleep"));
+        crate::testsupport::cleanup(LABEL);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
     /// The sheet draws with rows, a selection and an error, and asks to kill the selection.
     #[test]
     fn the_sheet_renders() {

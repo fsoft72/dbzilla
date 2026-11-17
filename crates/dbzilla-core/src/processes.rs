@@ -11,7 +11,7 @@ pub const ID_COLUMN: usize = 0;
 
 /// True when the driver can list and stop sessions.
 pub fn supported(driver: DriverId) -> bool {
-    matches!(driver, DriverId::Postgres | DriverId::MySql)
+    matches!(driver, DriverId::Postgres | DriverId::MySql | DriverId::SqlServer)
 }
 
 /// Statement that lists the running sessions, the session id first. The own session is left out.
@@ -23,12 +23,17 @@ pub fn list_sql(driver: DriverId) -> Option<&'static str> {
              FROM pg_stat_activity WHERE backend_type = 'client backend' AND state IS DISTINCT FROM 'idle' AND pid <> pg_backend_pid() ORDER BY query_start DESC NULLS LAST",
         ),
         DriverId::MySql => Some("SELECT id, user, host, db, command, time, state, info FROM information_schema.processlist WHERE id <> CONNECTION_ID() AND command <> 'Daemon' ORDER BY time"),
-        DriverId::Sqlite | DriverId::SqlServer => None,
+        DriverId::SqlServer => Some(
+            "SELECT r.session_id, DB_NAME(r.database_id) AS database_name, s.login_name, s.host_name, r.status, r.cpu_time, r.total_elapsed_time, t.text AS query \
+             FROM sys.dm_exec_requests r JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t \
+             WHERE s.is_user_process = 1 AND r.session_id <> @@SPID ORDER BY r.total_elapsed_time DESC",
+        ),
+        DriverId::Sqlite => None,
     }
 }
 
 /// Statement that stops what a session is running: PostgreSQL cancels the query and keeps the session,
-/// MySQL and MariaDB kill the query only. `id` must be a plain number, so nothing else can be injected.
+/// MySQL and MariaDB kill the query only, SQL Server ends the whole session. `id` must be a plain number, so nothing else can be injected.
 pub fn kill_sql(driver: DriverId, id: &str) -> Option<String> {
     let id = id.trim();
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
@@ -37,7 +42,9 @@ pub fn kill_sql(driver: DriverId, id: &str) -> Option<String> {
     match driver {
         DriverId::Postgres => Some(format!("SELECT pg_cancel_backend({id});")),
         DriverId::MySql => Some(format!("KILL QUERY {id};")),
-        DriverId::Sqlite | DriverId::SqlServer => None,
+        // Ends the session and rolls back its transaction (SPEC 5.3), unlike the other two.
+        DriverId::SqlServer => Some(format!("KILL {id};")),
+        DriverId::Sqlite => None,
     }
 }
 
@@ -90,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn only_postgres_and_mysql_list_processes() {
+    fn postgres_mysql_and_sqlserver_list_processes() {
         assert!(supported(DriverId::Postgres) && supported(DriverId::MySql) && !supported(DriverId::Sqlite));
         assert!(list_sql(DriverId::Sqlite).is_none());
         assert!(list_sql(DriverId::Postgres).unwrap().contains("pg_stat_activity"));
@@ -99,7 +106,18 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_lists_running_requests_without_the_own_session() {
+        assert!(supported(DriverId::SqlServer));
+        let sql = list_sql(DriverId::SqlServer).unwrap();
+        assert!(sql.starts_with("SELECT r.session_id"), "the session id must be the first column");
+        for needle in ["sys.dm_exec_requests", "sys.dm_exec_sql_text", "total_elapsed_time", "cpu_time", "is_user_process = 1", "<> @@SPID"] {
+            assert!(sql.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
     fn kill_statements_per_driver() {
+        assert_eq!(kill_sql(DriverId::SqlServer, "55").as_deref(), Some("KILL 55;"));
         assert_eq!(kill_sql(DriverId::Postgres, "42").as_deref(), Some("SELECT pg_cancel_backend(42);"));
         assert_eq!(kill_sql(DriverId::MySql, " 7 ").as_deref(), Some("KILL QUERY 7;"));
         assert_eq!(kill_sql(DriverId::Sqlite, "1"), None);
@@ -110,6 +128,7 @@ mod tests {
         for bad in ["", "1; DROP TABLE t", "-1", "1.5", "abc", "1 OR 1"] {
             assert_eq!(kill_sql(DriverId::Postgres, bad), None, "{bad}");
             assert_eq!(kill_sql(DriverId::MySql, bad), None, "{bad}");
+            assert_eq!(kill_sql(DriverId::SqlServer, bad), None, "{bad}");
         }
     }
 
