@@ -512,10 +512,32 @@ impl App {
             crate::glyphs::paint(ui.painter(), rect, Ico::Database, theme::SECONDARY);
             ui.add_space(10.0);
             widgets::heading(ui, "DBZilla");
+            widgets::muted(ui, concat!("Version ", env!("CARGO_PKG_VERSION")));
+            ui.add_space(6.0);
             widgets::muted(ui, "Select a connection to edit it, double-click to open it, or press New.");
             let n = self.store.list().len();
             widgets::muted(ui, &format!("{n} saved {}  ·  {} open", if n == 1 { "connection" } else { "connections" }, self.workspaces.len()));
+            ui.add_space(28.0);
+            Self::credits(ui);
         });
+    }
+
+    /// Author, license and project link of the start screen; the URLs are clickable.
+    fn credits(ui: &mut egui::Ui) {
+        const AUTHOR_URL: &str = "https://github.com/fsoft72";
+        const PROJECT_URL: &str = "https://github.com/fsoft72/dbzilla";
+        let link = |ui: &mut egui::Ui, url: &str| {
+            ui.hyperlink_to(egui::RichText::new(url).size(12.0).color(theme::SECONDARY), url).on_hover_text("Open in the browser");
+        };
+        ui.separator();
+        ui.add_space(8.0);
+        widgets::muted(ui, "Written by Fabio Rotondo");
+        link(ui, AUTHOR_URL);
+        ui.add_space(6.0);
+        widgets::muted(ui, "This is free software released under MIT license");
+        ui.add_space(14.0);
+        widgets::muted(ui, "Star the project here:");
+        link(ui, PROJECT_URL);
     }
 
     /// The workspace screen of an open connection.
